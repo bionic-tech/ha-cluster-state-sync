@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Local gate — run everything CI would, before pushing.
+#
+# GitHub Actions has not run since 2026-05-28 (billing), so for now this is the
+# only gate that actually fires. It is weaker than CI in one specific way: it
+# relies on someone remembering to run it. Install the hook to remove that:
+#
+#     ./check --install-hook
+#
+# Two checks CANNOT run here and are only ever done by CI: `hassfest` (Home
+# Assistant's own integration validator) and the HACS action (whether the repo
+# is genuinely installable). Both need a runner. This script says so at the end
+# rather than letting a green local run imply more than it covers.
+set -uo pipefail
+
+cd "$(dirname "$0")"
+PY=".venv/bin/python"
+[ -x "$PY" ] || PY="python3"
+
+BOLD=$'\e[1m'; RED=$'\e[31m'; GREEN=$'\e[32m'; DIM=$'\e[2m'; OFF=$'\e[0m'
+failed=0
+
+run() {
+  local name="$1"; shift
+  printf '%s› %s%s\n' "$BOLD" "$name" "$OFF"
+  if "$@"; then
+    printf '  %s✓ %s%s\n\n' "$GREEN" "$name" "$OFF"
+  else
+    printf '  %s✗ %s%s\n\n' "$RED" "$name" "$OFF"
+    failed=$((failed + 1))
+  fi
+}
+
+if [ "${1:-}" = "--install-hook" ]; then
+  hook=".git/hooks/pre-push"
+  printf '#!/usr/bin/env bash\nexec "$(git rev-parse --show-toplevel)/check"\n' > "$hook"
+  chmod +x "$hook"
+  echo "Installed $hook — every push now runs this first."
+  exit 0
+fi
+
+echo
+run "ruff (lint + import order)"        "$PY" -m ruff check .
+run "pytest + coverage floor"           "$PY" -m pytest -q --cov
+run "dependency audit"                  "$PY" scripts/audit_deps.py
+
+echo "${DIM}Not covered here — these need a GitHub runner:"
+echo "  · hassfest      Home Assistant's own integration validator"
+echo "  · HACS action   whether this repository is actually installable"
+echo "  · canary        the suite against the newest HA harness"
+echo "  · mutmut        scheduled mutation testing${OFF}"
+echo
+
+if [ "$failed" -eq 0 ]; then
+  printf '%s✓ all local gates passed%s\n' "$GREEN" "$OFF"
+  exit 0
+fi
+printf '%s✗ %d gate(s) failed%s\n' "$RED" "$failed" "$OFF"
+exit 1

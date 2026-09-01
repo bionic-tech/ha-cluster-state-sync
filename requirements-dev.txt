@@ -1,0 +1,47 @@
+# Development / CI dependencies for cluster_state_sync.
+#
+# pytest-homeassistant-custom-component pins an exact `homeassistant` version;
+# that pin is what we test against, so bumping this line is how we move the
+# tested HA target. It currently requires Python >= 3.14 (as does HA itself).
+#
+# Keep this in sync with the Python version in .github/workflows/ci.yml.
+#
+# Pinned to HA 2026.6.4 (0.13.340) because that is the series the cluster
+# actually runs. Testing against a newer core than production would be a false
+# green -- the suite would validate APIs the deployed nodes do not have.
+#
+# When production moves, bump this line and re-run; `test_integration_imports`
+# is the canary for an HA API that has shifted underneath us. Never pin to a
+# harness release tracking a beta core (0.13.349+ at time of writing track the
+# 2026.8 betas) -- a failover integration should not be validated against a
+# pre-release.
+pytest-homeassistant-custom-component==0.13.340
+
+# Runtime dependency of the integration — mirrored from manifest.json so tests
+# import the same client the integration will use at runtime.
+redis>=5.0.0,<7
+
+# Property-based testing for the restore parser (READINESS T1). That parser
+# sits between an attacker-controllable Valkey hash and `async_set`, and hand-
+# written cases only cover the inputs we thought of.
+hypothesis>=6.100
+
+# Minting a throwaway CA for the TLS handshake tests (H5). Declared because the
+# tests use it directly, but deliberately UNPINNED: Home Assistant pins it
+# exactly (==48.0.0 at 2026.6.4), so the version is not ours to choose. Pinning
+# it higher installs cleanly and then breaks the very version we test against.
+cryptography
+
+# Coverage floor (READINESS T9). Measured is not the same as enforced; without
+# a floor, coverage erodes quietly and nobody notices until it matters.
+pytest-cov>=5.0
+
+# Automated mutation testing (READINESS T10). This has been done by hand each
+# phase and has found a real defect nearly every time — an untested guard, a
+# test passing for the wrong reason. Systematising it is how that keeps
+# happening once nobody is doing it deliberately.
+mutmut>=3.0
+
+# Lint + supply-chain gate (AR-0033).
+ruff==0.14.4
+pip-audit==2.9.0

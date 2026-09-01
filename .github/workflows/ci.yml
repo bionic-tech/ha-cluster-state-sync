@@ -1,0 +1,199 @@
+# AR-0033 — lint + dependency audit + test gate.
+#
+# Python version is pinned to match requirements-dev.txt: the HA release we test
+# against (2026.6.4) requires Python >= 3.14.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly canary against the newest Home Assistant harness. Home Assistant
+    # ships monthly with breaking changes; without this the first sign of an API
+    # move is an upgrade that fails in production.
+    - cron: "0 6 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.14"
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install ruff
+        run: pip install "$(grep -E '^ruff==' requirements-dev.txt)"
+      - name: ruff check
+        run: ruff check --output-format=github .
+
+  test:
+    name: Tests (HA 2026.6.4)
+    runs-on: ubuntu-latest
+    # A real Valkey, matching the engine the fleet runs (READINESS T4). Without
+    # it the three Lua scripts in backend.py are exercised only by a double that
+    # records eval() calls and returns a canned answer — including the lease,
+    # which is the split-brain guard. The tests skip loudly rather than passing
+    # quietly when no server is reachable, so a broken service here shows up as
+    # skips in the `-rs` summary rather than a false green.
+    services:
+      valkey:
+        image: valkey/valkey:8.1
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      CLUSTER_SYNC_TEST_VALKEY: "127.0.0.1:6379"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      # The generated firewall rulesets are syntax-checked with nft's own
+      # parser. `nft -c` needs CAP_NET_ADMIN even though it changes nothing, so
+      # the check skips on unprivileged developer machines; the runner has the
+      # privileges, which makes CI the only place those rulesets get verified.
+      - name: Install nftables and shellcheck (generated-artifact gates)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables shellcheck
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: Run tests
+        run: pytest -q -rs --cov
+
+  mutation:
+    name: Mutation testing (advisory)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Deliberately NON-BLOCKING and scheduled rather than per-push: a full
+    # mutation run is slow, and its value is trend rather than gate. Done by
+    # hand each phase this has found a real defect nearly every time — an
+    # untested guard, or a test passing for the wrong reason. This is how that
+    # keeps happening once nobody is doing it deliberately.
+    continue-on-error: true
+    services:
+      valkey:
+        image: valkey/valkey:8.1
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      CLUSTER_SYNC_TEST_VALKEY: "127.0.0.1:6379"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install nftables and shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables shellcheck
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements-dev.txt
+      - name: Run mutmut
+        run: mutmut run --max-children 4 || true
+      - name: Report surviving mutants
+        run: mutmut results || true
+
+  audit:
+    name: Dependency audit (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install pip-audit
+        run: pip install "$(grep -E '^pip-audit==' requirements-dev.txt)"
+      # Scope: the requirements this integration actually installs into a user's
+      # Home Assistant, as declared in manifest.json. The dev/test tree (Home
+      # Assistant core itself and its ~200 transitive deps) is not shipped by us
+      # and is not this gate's business — auditing it would drown a real finding
+      # about our own dependency in noise we cannot action.
+      - name: Extract runtime requirements from manifest
+        run: |
+          python -c "import json; print('\n'.join(json.load(open('custom_components/cluster_state_sync/manifest.json'))['requirements']))" \
+            | tee runtime-requirements.txt
+      - name: Audit runtime requirements
+        run: pip-audit --requirement runtime-requirements.txt --strict --progress-spinner off
+
+  hassfest:
+    name: Validate (hassfest)
+    runs-on: ubuntu-latest
+    # Home Assistant's own integration validator, run against *current* HA
+    # rather than the version we pin. Catches manifest errors and declarations
+    # that have been deprecated out from under us.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: home-assistant/actions/hassfest@master
+
+  hacs:
+    name: Validate (HACS)
+    runs-on: ubuntu-latest
+    # Checks the repository is actually installable. This is the gate that
+    # would have caught the custom_components symlink, which left the suite
+    # entirely green while nobody could install the integration.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hacs/action@main
+        with:
+          category: integration
+
+  canary:
+    name: Canary (latest HA harness)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Deliberately NON-BLOCKING. The pinned job above is the gate; this one is
+    # early warning. A red canary means the next Home Assistant release will
+    # break us, which is worth knowing before production moves rather than
+    # after.
+    continue-on-error: true
+    services:
+      valkey:
+        image: valkey/valkey:8.1
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      CLUSTER_SYNC_TEST_VALKEY: "127.0.0.1:6379"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install nftables (for ruleset syntax checks)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables
+      - name: Install the NEWEST harness, not the pin
+        run: |
+          pip install --upgrade pip
+          grep -vE '^pytest-homeassistant-custom-component==' requirements-dev.txt > /tmp/reqs.txt
+          pip install -r /tmp/reqs.txt
+          pip install --upgrade pytest-homeassistant-custom-component
+      - name: Report which Home Assistant this is
+        run: python -c "import homeassistant.const as c; print('HA', c.__version__)"
+      - name: Run tests
+        run: pytest -q -rs

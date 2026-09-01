@@ -1,0 +1,57 @@
+# Tooling configuration only.
+#
+# cluster_state_sync is a Home Assistant custom integration, not a distributable
+# Python package — it is installed by copying the `cluster_state_sync/` directory
+# into `config/custom_components/`. There is deliberately no [project] table, so
+# neither pip nor uv tries to build this repo as a package.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# pytest-homeassistant-custom-component blocks real sockets by default; that is
+# the behaviour we want, so a test that quietly tries to reach a real Redis or a
+# real HA instance fails loudly instead of passing on someone's workstation.
+addopts = "--strict-markers"
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # import sorting
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+known-first-party = ["custom_components", "tools"]
+
+
+[tool.coverage.run]
+source = ["custom_components/cluster_state_sync"]
+branch = true
+
+[tool.coverage.report]
+# Measured 93.5% with branch coverage on 2026-08-26. The floor sits a point
+# below so ordinary churn does not break the build while real erosion does —
+# a gate that fires on a half-percent dip gets raised until it means nothing.
+# Raise it when it is comfortably exceeded; never lower it to make a red build
+# green.
+fail_under = 92
+show_missing = true
+skip_covered = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
+
+[tool.mutmut]
+paths_to_mutate = ["custom_components/cluster_state_sync/"]
+tests_dir = ["tests/"]

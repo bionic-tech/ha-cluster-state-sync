@@ -1,0 +1,198 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Cluster State Sync",
+        "description": "Choose how to connect to your shared state backend. Use Sentinel if you have a Valkey/Redis Sentinel HA cluster (recommended). Use Direct for a single host or a VIP.",
+        "menu_options": {
+          "direct": "Direct (single host / VIP)",
+          "sentinel": "Sentinel (HA cluster)"
+        }
+      },
+      "direct": {
+        "title": "Direct Redis / Valkey connection",
+        "data": {
+          "redis_host": "Host",
+          "redis_port": "Port",
+          "redis_password": "Password (leave blank if none)",
+          "redis_db": "Database number",
+          "cluster_namespace": "Cluster namespace (must match across nodes)",
+          "node_id": "This node's identifier",
+          "cluster_secret": "Cluster secret (must be identical on both nodes)",
+          "redis_use_tls": "Use TLS",
+          "redis_tls_ca_certs": "TLS CA certificate path (blank = system trust store)",
+          "leadership_source": "Leadership signal",
+          "leadership_entity": "Leadership entity (only for the 'entity' signal)",
+          "gate_recorder": "Stop recorder writes on the follower (needs a shared recorder database)",
+          "gate_automations": "Stop automations on the follower (warm standby only)",
+          "snapshot_interval": "Snapshot interval (seconds)",
+          "restore_max_age": "Maximum snapshot age to restore (seconds)"
+        },
+        "data_description": {
+          "cluster_secret": "Signs every snapshot entry so a node only accepts state written by its peer. Copy this exact value to the other node — a mismatch means neither will restore from the other. Without it, nothing is restored at all.",
+          "redis_use_tls": "Strongly recommended if you mirror person, device_tracker or alarm_control_panel entities, which otherwise cross the network in the clear.",
+          "leadership_source": "Only the leader writes to the shared snapshot. 'always' suits a single node or a cold standby whose HA is stopped. 'entity' follows a flag your Keepalived notify_master/notify_backup scripts toggle. 'lease' takes a TTL lease in Valkey and is the strongest option — it is the split-brain guard, since VRRP alone can dual-master under a partition."
+        }
+      },
+      "sentinel": {
+        "title": "Sentinel-backed Redis / Valkey",
+        "data": {
+          "redis_sentinel_hosts": "Sentinel hosts (comma-separated host:port)",
+          "redis_sentinel_service": "Sentinel master service name",
+          "redis_password": "Password (leave blank if none)",
+          "redis_db": "Database number",
+          "cluster_namespace": "Cluster namespace (must match across nodes)",
+          "node_id": "This node's identifier",
+          "cluster_secret": "Cluster secret (must be identical on both nodes)",
+          "redis_use_tls": "Use TLS",
+          "redis_tls_ca_certs": "TLS CA certificate path (blank = system trust store)",
+          "leadership_source": "Leadership signal",
+          "leadership_entity": "Leadership entity (only for the 'entity' signal)",
+          "gate_recorder": "Stop recorder writes on the follower (needs a shared recorder database)",
+          "gate_automations": "Stop automations on the follower (warm standby only)",
+          "snapshot_interval": "Snapshot interval (seconds)",
+          "restore_max_age": "Maximum snapshot age to restore (seconds)"
+        },
+        "data_description": {
+          "cluster_secret": "Signs every snapshot entry so a node only accepts state written by its peer. Copy this exact value to the other node — a mismatch means neither will restore from the other. Without it, nothing is restored at all.",
+          "redis_use_tls": "Strongly recommended if you mirror person, device_tracker or alarm_control_panel entities, which otherwise cross the network in the clear.",
+          "leadership_source": "Only the leader writes to the shared snapshot. 'always' suits a single node or a cold standby whose HA is stopped. 'entity' follows a flag your Keepalived notify_master/notify_backup scripts toggle. 'lease' takes a TTL lease in Valkey and is the strongest option — it is the split-brain guard, since VRRP alone can dual-master under a partition."
+        }
+      },
+      "topology": {
+        "title": "Standby model",
+        "description": "Cold is recommended: the standby's Home Assistant is stopped, so there are no side effects to suppress. Warm fails over in seconds but needs the firewall bundle.",
+        "data": {
+          "topology_model": "Standby model",
+          "leadership_source": "Leadership signal",
+          "leadership_entity": "Leadership entity (only for the 'entity' signal)",
+          "gate_recorder": "Stop recorder writes on the follower (needs a shared recorder database)",
+          "gate_automations": "Stop automations on the follower (warm standby only)",
+          "peer_host": "Peer host (rsync target, e.g. tiger2.lan)",
+          "ha_config_path": "Home Assistant config path ON THE HOST (not /config)",
+          "ha_container": "Home Assistant container name"
+        }
+      },
+      "warm": {
+        "title": "Warm standby — network gating",
+        "description": "Used to generate the nftables/iptables rules the follower loads. These rules are generated without access to your hosts and are not validated — read them before loading.",
+        "data": {
+          "iot_subnets": "IoT subnet(s), comma-separated CIDR",
+          "block_discovery": "Block mDNS (5353) and SSDP (1900) on the follower",
+          "docker_network": "Docker network mode",
+          "ha_uid": "UID Home Assistant runs as",
+          "ha_container_ip": "Container IP (macvlan/bridge only)",
+          "settle_delay": "Promotion settle delay (seconds)"
+        }
+      },
+      "fileset": {
+        "title": "Config replication",
+        "description": "Replicate .storage and the config bulk to the standby, so a promoted node keeps its refresh tokens and mobile app registrations. Encrypted with the cluster secret.",
+        "data": {
+          "fileset_enabled": "Replicate the config fileset to the standby",
+          "fileset_hot_interval": "How often to publish .storage (seconds)",
+          "fileset_exclusions": "Filename patterns to skip",
+          "fileset_max_bytes": "Refuse to publish above this many bytes",
+          "fileset_stale_after": "Warn if the standby's copy is older than (seconds)"
+        }
+      },
+      "bundle": {
+        "title": "Host bundle generated",
+        "description": "Written to:\n`{bundle_path}`\n\nModel: **{model}**\n\n{file_list}\n\nCopy these to `/etc/cluster-sync/` on **both** hosts and read `INSTALL.md` first. The firewall rules were generated without access to your machines and have not been tested — load them with `nft-safety-revert.sh` armed.",
+        "data": {}
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not reach the backend with these settings.",
+      "invalid_namespace": "Namespace must be lowercase letters, digits, '_' or '-' only.",
+      "fileset_needs_secret": "A cluster secret is required to encrypt the replicated fileset. Set one on the backend step before enabling this."
+    },
+    "abort": {
+      "already_configured": "This node is already configured for this cluster namespace."
+    }
+  },
+  "issues": {
+    "fileset_degraded": {
+      "title": "Standby config fileset is degraded",
+      "description": "The host-side swap could not put a fresh copy of the config fileset in place before this instance started (reason: {reason}). Decision D4 promotes anyway rather than refuse to boot, so Home Assistant is running, but integrations, devices, and the mobile app's login may be missing or out of date. Check the swap log on the host, and reload this integration once a fresh fileset has been staged and swapped in."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Cluster State Sync options",
+        "data": {
+          "redis_host": "Host",
+          "redis_port": "Port",
+          "redis_password": "Password (leave blank if none)",
+          "redis_db": "Database number",
+          "redis_sentinel_hosts": "Sentinel hosts (comma-separated host:port)",
+          "redis_sentinel_service": "Sentinel master service name",
+          "cluster_namespace": "Cluster namespace",
+          "node_id": "This node's identifier",
+          "cluster_secret": "Cluster secret (must be identical on both nodes)",
+          "redis_use_tls": "Use TLS",
+          "redis_tls_ca_certs": "TLS CA certificate path (blank = system trust store)",
+          "leadership_source": "Leadership signal",
+          "leadership_entity": "Leadership entity (only for the 'entity' signal)",
+          "gate_recorder": "Stop recorder writes on the follower (needs a shared recorder database)",
+          "gate_automations": "Stop automations on the follower (warm standby only)",
+          "snapshot_interval": "Snapshot interval (seconds)",
+          "restore_max_age": "Maximum snapshot age to restore (seconds)"
+        },
+        "data_description": {
+          "cluster_secret": "Signs every snapshot entry so a node only accepts state written by its peer. Copy this exact value to the other node — a mismatch means neither will restore from the other. Without it, nothing is restored at all.",
+          "redis_use_tls": "Strongly recommended if you mirror person, device_tracker or alarm_control_panel entities, which otherwise cross the network in the clear.",
+          "leadership_source": "Only the leader writes to the shared snapshot. 'always' suits a single node or a cold standby whose HA is stopped. 'entity' follows a flag your Keepalived notify_master/notify_backup scripts toggle. 'lease' takes a TTL lease in Valkey and is the strongest option — it is the split-brain guard, since VRRP alone can dual-master under a partition."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "entities_tracked": {
+        "name": "Entities tracked"
+      },
+      "last_snapshot_age": {
+        "name": "Last snapshot age"
+      },
+      "entities_restored": {
+        "name": "Entities restored"
+      },
+      "fileset_age": {
+        "name": "Fileset age"
+      }
+    },
+    "binary_sensor": {
+      "backend": {
+        "name": "Backend"
+      },
+      "fileset_degraded": {
+        "name": "Fileset degraded"
+      }
+    }
+  },
+  "selector": {
+    "leadership_source": {
+      "options": {
+        "always": "Always leader (single node / cold standby)",
+        "entity": "Follow a Home Assistant entity (Keepalived toggles it)",
+        "lease": "Valkey lease (strongest — guards against split-brain)"
+      }
+    },
+    "topology_model": {
+      "options": {
+        "cold": "Cold standby — recommended. HA stopped on the standby until promotion. Simplest and safest; costs cold-boot RTO.",
+        "warm": "Warm standby — HA running but neutered. Seconds-level failover; needs the firewall bundle and a real leadership signal."
+      }
+    },
+    "docker_network": {
+      "options": {
+        "host": "network_mode: host — best mDNS/HomeKit, filtered by uid",
+        "macvlan": "macvlan — container has its own LAN IP; needs the netdev/egress hook",
+        "bridge": "bridge — cleanest filtering via DOCKER-USER, needs an mDNS reflector",
+        "all": "Not sure — generate all three and choose at install time"
+      }
+    }
+  }
+}

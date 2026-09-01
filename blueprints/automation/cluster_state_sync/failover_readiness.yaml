@@ -1,0 +1,258 @@
+blueprint:
+  name: Cluster State Sync — failover readiness
+  description: >-
+    Alerts when the standby would not survive a promotion.
+
+
+    This integration is built to fail safe, and every one of those safe failures
+    is silent. The backend goes away and the flush loop just stops. The peer
+    stops writing and the snapshot quietly ages. A promotion restores nothing at
+    all and logs one INFO line about it. Nothing in the house changes, so nobody
+    looks — right up until the failover that was supposed to be uneventful.
+
+
+    A promotion can also come up on a stale or missing copy of the config
+    fileset (Decision D4 promotes anyway rather than refuse to start) — so
+    everything comes up green while the mobile app cannot log in and half the
+    integrations are missing.
+
+
+    Four failure conditions, one for each way it fails quietly -- watched by
+    five triggers between them, because the fileset one needs two to close a
+    boot-ordering race (see the trigger comments below). Point them at the
+    diagnostic entities the integration already exposes and give it somewhere to
+    shout.
+  domain: automation
+  author: cluster_state_sync
+  source_url: https://github.com/boywiz/ha-cluster-state-sync/blob/main/blueprints/automation/cluster_state_sync/failover_readiness.yaml
+  homeassistant:
+    min_version: "2024.10.0"
+  input:
+    backend_sensor:
+      name: Backend connectivity
+      description: >-
+        The integration's "Backend" binary sensor. Off means the shared Valkey
+        cannot be reached, so nothing is being written and a promotion right now
+        would restore whatever was last saved — or nothing.
+      selector:
+        entity:
+          filter:
+            - integration: cluster_state_sync
+              domain: binary_sensor
+
+    snapshot_age_sensor:
+      name: Last snapshot age
+      description: >-
+        The integration's "Last snapshot age" sensor, in seconds. This catches
+        the case the backend sensor cannot: Valkey is perfectly healthy and the
+        flush loop has stopped anyway.
+      selector:
+        entity:
+          filter:
+            - integration: cluster_state_sync
+              domain: sensor
+
+    entities_restored_sensor:
+      name: Entities restored
+      description: >-
+        The integration's "Entities restored" sensor. Zero after a restore means
+        the standby promoted with no state from its peer. This is the one worth
+        having; it was a real defect for the whole life of the project and its
+        only symptom was a log line nobody read.
+      selector:
+        entity:
+          filter:
+            - integration: cluster_state_sync
+              domain: sensor
+
+    fileset_degraded_sensor:
+      name: Fileset degraded
+      description: >-
+        The integration's "Fileset degraded" binary sensor. On means this node
+        promoted with a stale or missing copy of the config fileset — Decision
+        D4 promotes anyway rather than refuse to start, so this is the only
+        signal that the mobile app, integrations, or device registrations may
+        be missing or out of date. Every HTTP health check on a node in this
+        state is green.
+      selector:
+        entity:
+          filter:
+            - integration: cluster_state_sync
+              domain: binary_sensor
+
+    backend_grace:
+      name: Backend grace period
+      description: >-
+        How long the backend must stay unreachable before this is worth waking
+        someone for. A few seconds is a restart; a few minutes is an outage.
+        Keep it above your Valkey's own restart time or you will be paged for
+        routine maintenance and start ignoring it.
+      default:
+        minutes: 5
+      selector:
+        duration: {}
+
+    max_snapshot_age:
+      name: Snapshot age limit (seconds)
+      description: >-
+        Alert when the snapshot is older than this. A sensible starting point is
+        roughly half the integration's "restore max age", so the warning arrives
+        while the snapshot is still usable rather than once it has already
+        expired. The default suits the 30-minute default.
+      default: 900
+      selector:
+        number:
+          min: 30
+          max: 86400
+          unit_of_measurement: seconds
+          mode: box
+
+    notification_action:
+      name: How to tell you
+      description: >-
+        What to run when something is wrong — a notify action, a persistent
+        notification, a light, whatever you will actually notice. The message is
+        available as the variable `message`, and a shorter `title` is available
+        too.
+      selector:
+        action: {}
+
+mode: queued
+max_exceeded: silent
+
+triggers:
+  - trigger: state
+    id: backend_unreachable
+    entity_id: !input backend_sensor
+    to: "off"
+    for: !input backend_grace
+
+  - trigger: numeric_state
+    id: snapshot_stale
+    entity_id: !input snapshot_age_sensor
+    above: !input max_snapshot_age
+
+  # Fires on any change to the restored count, including a restore that landed
+  # on the same number as last time. The condition below is what decides
+  # whether it mattered.
+  - trigger: state
+    id: restore_was_empty
+    entity_id: !input entities_restored_sensor
+
+  # No `from`, so this also fires if the sensor is created already "on" --
+  # the marker is written before the container starts, so a node that comes
+  # up degraded may never see this entity transition into "on" any other way.
+  #
+  # That alone still races: `automation` and `cluster_state_sync` are both
+  # stage-2 bootstrap domains, set up *concurrently* (asyncio.gather), so
+  # there is no guarantee this trigger is even listening yet at the instant
+  # the degraded sensor is created. And there is no second chance after
+  # boot settles -- an unchanged state on a later poll fires
+  # EVENT_STATE_REPORTED, not EVENT_STATE_CHANGED, so this trigger would
+  # simply never fire for a sensor that came up "on" and stayed there. The
+  # `homeassistant` trigger below, sharing this same id, is what closes that
+  # window: it fires once Home Assistant has actually finished starting,
+  # after every integration -- including this automation's own listeners --
+  # has loaded.
+  - trigger: state
+    id: fileset_degraded
+    entity_id: !input fileset_degraded_sensor
+    to: "on"
+
+  - trigger: homeassistant
+    id: fileset_degraded
+    event: start
+
+variables:
+  entities_restored_entity: !input entities_restored_sensor
+  snapshot_age_entity: !input snapshot_age_sensor
+  max_age: !input max_snapshot_age
+  restored_count: "{{ states(entities_restored_entity) }}"
+  # `last_restore_at` is unset until a restore has actually run, which is how a
+  # freshly-added integration is told apart from one that restored nothing.
+  last_restore_at: "{{ state_attr(entities_restored_entity, 'last_restore_at') }}"
+
+conditions:
+  - condition: or
+    conditions:
+      - condition: trigger
+        id:
+          - backend_unreachable
+          - snapshot_stale
+      # backend_unreachable and snapshot_stale above fire only ON the
+      # transition into their bad state, so the trigger firing at all is
+      # already proof of it. fileset_degraded is different: its second
+      # trigger fires on every Home Assistant start regardless of whether
+      # anything is actually wrong, so it also has to check the sensor's
+      # *current* state rather than trusting the trigger alone.
+      - condition: and
+        conditions:
+          - condition: trigger
+            id: fileset_degraded
+          - condition: state
+            entity_id: !input fileset_degraded_sensor
+            state: "on"
+      - condition: and
+        conditions:
+          - condition: trigger
+            id: restore_was_empty
+          - "{{ restored_count == '0' }}"
+          - "{{ last_restore_at not in (none, 'None', 'unknown', '') }}"
+
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: backend_unreachable
+        sequence:
+          - variables:
+              title: "Cluster sync: backend unreachable"
+              message: >-
+                The shared Valkey has been unreachable for the grace period, so
+                this node has stopped publishing state. A promotion now would
+                restore whatever was last written, which is already
+                {{ states(snapshot_age_entity) | int(0) }} seconds old and no
+                longer moving. Check Valkey before relying on a failover.
+
+      - conditions:
+          - condition: trigger
+            id: snapshot_stale
+        sequence:
+          - variables:
+              title: "Cluster sync: snapshot going stale"
+              message: >-
+                The shared snapshot is
+                {{ states(snapshot_age_entity) | int(0) }} seconds old, past the
+                {{ max_age }} second limit. The backend is reachable, so this is
+                the leader's flush loop having stopped rather than a network
+                problem — which is the harder failure to notice. A promotion
+                would still work, with state this old.
+
+      - conditions:
+          - condition: trigger
+            id: restore_was_empty
+        sequence:
+          - variables:
+              title: "Cluster sync: promoted with NO state"
+              message: >-
+                This node restored zero entities from the shared snapshot at
+                {{ last_restore_at }}. It has promoted cold: nothing came across
+                from the peer. Check the Home Assistant log for the "Restored
+                NOTHING" warning, which lists why each entry was skipped.
+
+      - conditions:
+          - condition: trigger
+            id: fileset_degraded
+        sequence:
+          - variables:
+              title: "Cluster sync: promoted with a degraded fileset"
+              message: >-
+                This node promoted with a stale or missing copy of the config
+                fileset. Home Assistant started anyway rather than refuse to
+                boot (Decision D4 prefers availability over a hard stop), so
+                integrations, devices and the mobile app's login may be
+                missing or out of date. Check the "Fileset degraded" repair
+                issue in Settings for the reason, and the swap log on the host.
+
+  - alias: Tell somebody
+    sequence: !input notification_action

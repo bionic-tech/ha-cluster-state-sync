@@ -1,0 +1,259 @@
+"""Leadership tests (AR-0017).
+
+ADR-001 makes leadership the single source of truth for every gating layer.
+This covers the layer the integration can enforce from inside an unprivileged
+container: whether *this* node writes to the shared snapshot at all.
+
+The interim guard from Phase 1 (no `DEL`, so concurrent writers merge instead
+of erasing each other) stays in place underneath. These tests are about not
+having two writers in the first place.
+"""
+from __future__ import annotations
+
+from datetime import timedelta
+from unittest.mock import patch
+
+from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
+import pytest
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+)
+
+from custom_components.cluster_state_sync.const import (
+    CONF_CLUSTER_NAMESPACE,
+    CONF_CLUSTER_SECRET,
+    CONF_LEADERSHIP_ENTITY,
+    CONF_LEADERSHIP_SOURCE,
+    CONF_NODE_ID,
+    CONF_REDIS_HOST,
+    CONF_SNAPSHOT_INTERVAL,
+    DOMAIN,
+    LEADERSHIP_ALWAYS,
+    LEADERSHIP_ENTITY,
+    LEADERSHIP_LEASE,
+)
+
+from .fakes import FakeBackend
+
+INTERVAL = 5
+SECRET = "cluster-secret-under-test"
+NODE_ID = "node-a"
+LEADER_FLAG = "input_boolean.cluster_leader"
+
+
+@pytest.fixture
+def backend() -> FakeBackend:
+    return FakeBackend()
+
+
+async def setup_integration(
+    hass: HomeAssistant, backend: FakeBackend, **overrides: object
+) -> MockConfigEntry:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_REDIS_HOST: "valkey.invalid",
+            CONF_CLUSTER_NAMESPACE: "testns",
+            CONF_NODE_ID: NODE_ID,
+            CONF_CLUSTER_SECRET: SECRET,
+            CONF_SNAPSHOT_INTERVAL: INTERVAL,
+            **overrides,
+        },
+    )
+    entry.add_to_hass(hass)
+    with patch(
+        "custom_components.cluster_state_sync.RedisBackend", return_value=backend
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    return entry
+
+
+async def advance(hass: HomeAssistant) -> None:
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=INTERVAL + 1))
+    await hass.async_block_till_done()
+
+
+async def test_default_is_always_leader_for_backwards_compatibility(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """An entry with no leadership config keeps flushing, as it always did.
+
+    Silently making existing single-node installs stop writing would be a far
+    worse regression than the dual-writer race this guards against.
+    """
+    hass.states.async_set("input_boolean.one", "on")
+    await hass.async_block_till_done()
+
+    await setup_integration(hass, backend, **{CONF_LEADERSHIP_SOURCE: LEADERSHIP_ALWAYS})
+    await advance(hass)
+
+    assert backend.writes
+
+
+async def test_ar_0017_follower_does_not_write(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """AR-0017 — a node that is not leader must not touch the shared snapshot.
+
+    Production change that would make this fail: flushing without consulting
+    leadership.
+
+    Both nodes running the flush loop is the dual-writer condition. Phase 1
+    removed the `DEL` so concurrent writes merge rather than erase, but merging
+    two nodes' views of the world is damage control, not correctness -- the
+    follower's state is by definition the stale one.
+    """
+    hass.states.async_set("input_boolean.one", "on")
+    hass.states.async_set(LEADER_FLAG, "off")
+    await hass.async_block_till_done()
+
+    await setup_integration(
+        hass,
+        backend,
+        **{
+            CONF_LEADERSHIP_SOURCE: LEADERSHIP_ENTITY,
+            CONF_LEADERSHIP_ENTITY: LEADER_FLAG,
+        },
+    )
+    await advance(hass)
+
+    assert not backend.writes, "a follower must not write to the shared snapshot"
+
+
+async def test_promotion_starts_writing(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """Flipping the leadership signal promotes without a restart.
+
+    This is the failover path: Keepalived's notify_master flips the flag and
+    the newly-promoted node must start publishing.
+    """
+    hass.states.async_set("input_boolean.one", "on")
+    hass.states.async_set(LEADER_FLAG, "off")
+    await hass.async_block_till_done()
+
+    await setup_integration(
+        hass,
+        backend,
+        **{
+            CONF_LEADERSHIP_SOURCE: LEADERSHIP_ENTITY,
+            CONF_LEADERSHIP_ENTITY: LEADER_FLAG,
+        },
+    )
+    await advance(hass)
+    assert not backend.writes
+
+    hass.states.async_set(LEADER_FLAG, "on")
+    await hass.async_block_till_done()
+    await advance(hass)
+
+    assert backend.writes, "a promoted node must start publishing"
+
+
+async def test_demotion_stops_writing(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """A demoted node must go quiet immediately, not at the next restart."""
+    hass.states.async_set("input_boolean.one", "on")
+    hass.states.async_set(LEADER_FLAG, "on")
+    await hass.async_block_till_done()
+
+    await setup_integration(
+        hass,
+        backend,
+        **{
+            CONF_LEADERSHIP_SOURCE: LEADERSHIP_ENTITY,
+            CONF_LEADERSHIP_ENTITY: LEADER_FLAG,
+        },
+    )
+    await advance(hass)
+    writes_while_leader = len(backend.writes)
+    assert writes_while_leader
+
+    hass.states.async_set(LEADER_FLAG, "off")
+    hass.states.async_set("input_boolean.one", "off")
+    await hass.async_block_till_done()
+    await advance(hass)
+
+    assert len(backend.writes) == writes_while_leader
+
+
+async def test_missing_leadership_entity_is_treated_as_follower(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """An absent or unknown signal must fail closed.
+
+    Production change that would make this fail: defaulting to leader when the
+    entity is missing. If the flag has not been created yet, or a typo points
+    at nothing, the safe reading is "I am not the leader" -- assuming
+    leadership is how you get two of them.
+    """
+    hass.states.async_set("input_boolean.one", "on")
+    await hass.async_block_till_done()
+
+    await setup_integration(
+        hass,
+        backend,
+        **{
+            CONF_LEADERSHIP_SOURCE: LEADERSHIP_ENTITY,
+            CONF_LEADERSHIP_ENTITY: "input_boolean.does_not_exist",
+        },
+    )
+    await advance(hass)
+
+    assert not backend.writes
+
+
+async def test_lease_holder_writes(hass: HomeAssistant, backend: FakeBackend) -> None:
+    """With the Valkey lease, the node holding it writes."""
+    hass.states.async_set("input_boolean.one", "on")
+    await hass.async_block_till_done()
+    backend.lease_holder = NODE_ID
+
+    await setup_integration(hass, backend, **{CONF_LEADERSHIP_SOURCE: LEADERSHIP_LEASE})
+    await advance(hass)
+
+    assert backend.writes
+
+
+async def test_lease_lost_to_peer_stops_writes(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """Losing the lease to the peer must stop this node writing.
+
+    This is the split-brain guard ADR-001 leans on: VRRP alone can dual-master
+    under a partition, so the lease is the tiebreak that keeps a second writer
+    off the shared hash.
+    """
+    hass.states.async_set("input_boolean.one", "on")
+    await hass.async_block_till_done()
+    backend.lease_holder = NODE_ID
+
+    await setup_integration(hass, backend, **{CONF_LEADERSHIP_SOURCE: LEADERSHIP_LEASE})
+    await advance(hass)
+    writes_while_leader = len(backend.writes)
+    assert writes_while_leader
+
+    backend.lease_holder = "node-b"
+    hass.states.async_set("input_boolean.one", "off")
+    await hass.async_block_till_done()
+    await advance(hass)
+
+    assert len(backend.writes) == writes_while_leader
+
+
+async def test_lease_failure_is_treated_as_not_leader(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """A backend that cannot answer must not be read as a yes."""
+    hass.states.async_set("input_boolean.one", "on")
+    await hass.async_block_till_done()
+    backend.lease_raises = True
+
+    await setup_integration(hass, backend, **{CONF_LEADERSHIP_SOURCE: LEADERSHIP_LEASE})
+    await advance(hass)
+
+    assert not backend.writes
