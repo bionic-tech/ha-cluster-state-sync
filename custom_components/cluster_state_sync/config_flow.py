@@ -64,6 +64,7 @@ from .const import (
     CONF_LEADERSHIP_ENTITY,
     CONF_LEADERSHIP_SOURCE,
     CONF_NODE_ID,
+    CONF_RADIO_WATCH,
     CONF_REDIS_DB,
     CONF_REDIS_HOST,
     CONF_REDIS_PASSWORD,
@@ -499,6 +500,13 @@ def _container_schema(d: dict[str, Any]) -> vol.Schema:
             vol.Optional(CONF_COMPOSE_SERVICE, default=d.get(CONF_COMPOSE_SERVICE, "")): str,
             vol.Optional(CONF_COMPOSE_PROFILE, default=d.get(CONF_COMPOSE_PROFILE, "")): str,
             vol.Optional(CONF_COMPOSE_ENV_FILE, default=d.get(CONF_COMPOSE_ENV_FILE, "")): str,
+            # Radio liveness. Globs rather than a list, because what proves a
+            # radio is receiving is installation-specific -- on the fleet this
+            # was built for it is `sensor.*_rssi_numeric`, which updates on
+            # every packet received.
+            vol.Optional(CONF_RADIO_WATCH, default=d.get(CONF_RADIO_WATCH) or []): SelectSelector(
+                SelectSelectorConfig(options=[], multiple=True, custom_value=True)
+            ),
         }
     )
 

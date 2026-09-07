@@ -78,6 +78,25 @@ CONF_COMPOSE_PROFILE: Final = "compose_profile"
 #: running from systemd has none of the operator's shell environment, so
 #: without this compose mode fails at exactly the moment it is needed.
 CONF_COMPOSE_ENV_FILE: Final = "compose_env_file"
+
+
+# -- radio liveness (GOTCHAS §18) ------------------------------------------
+#
+# The D3 promotion probe asks Home Assistant whether it is alive, and Home
+# Assistant can be perfectly alive while every radio behind it is dead. On this
+# fleet a Zigbee daemon livelocked -- 78% CPU, no output for 32 minutes, its
+# healthcheck reporting `healthy` -- and the whole house lost Zigbee with
+# nothing anywhere marking the cluster degraded.
+#
+# This does NOT gate promotion, deliberately: promoting because a radio died
+# would move a house onto a node whose radios may be no better. It makes the
+# silence VISIBLE, which is the part that was missing.
+#
+# Entity globs rather than a fixed list: what proves a radio is receiving is
+# installation-specific. On this fleet it is `sensor.*_rssi_numeric`, which
+# updates on every packet received; elsewhere it is a link-quality sensor, a
+# last-seen timestamp, or a coordinator's own diagnostic.
+CONF_RADIO_WATCH: Final = "radio_watch"
 CONF_SETTLE_DELAY: Final = "settle_delay"
 CONF_LEADERSHIP_ENTITY: Final = "leadership_entity"
 CONF_SNAPSHOT_INTERVAL: Final = "snapshot_interval"

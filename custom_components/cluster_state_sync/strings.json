@@ -132,20 +132,22 @@
         }
       },
       "container": {
-        "title": "How this node starts Home Assistant",
-        "description": "**`docker` — the default, and right for most installs.** The promoter runs `docker start` / `docker stop` on one container. Fast, needs no project file, and nothing else in your estate can break it.\n\n**`compose` — when nobody starts the container by hand.** Home Assistant is one service in a compose project, possibly behind a profile. The promoter acts on that service alone (`up -d --no-deps`), never the whole estate, and stops it with `stop` — never `down`, which would remove the container a demoted node needs in order to be promoted again.\n\n🚨 **Compose mode needs an env file.** Compose interpolates the *entire* project file before it filters by profile or service, so one unset variable in a service you are not touching aborts the command. The promoter runs from systemd with none of your shell environment — without an env file it fails at exactly the moment it is needed.",
+        "title": "This node's runtime and radios",
+        "description": "**`docker` — the default, and right for most installs.** The promoter runs `docker start` / `docker stop` on one container. Fast, needs no project file, and nothing else in your estate can break it.\n\n**`compose` — when nobody starts the container by hand.** Home Assistant is one service in a compose project, possibly behind a profile. The promoter acts on that service alone (`up -d --no-deps`), never the whole estate, and stops it with `stop` — never `down`, which would remove the container a demoted node needs in order to be promoted again.\n\n🚨 **Compose mode needs an env file.** Compose interpolates the *entire* project file before it filters by profile or service, so one unset variable in a service you are not touching aborts the command. The promoter runs from systemd with none of your shell environment — without an env file it fails at exactly the moment it is needed.\n\n**Radio liveness.** The promotion probe asks Home Assistant whether it is alive, and Home Assistant can be alive while every radio behind it is dead — that happened here, with a Zigbee daemon livelocked for 32 minutes while its healthcheck said `healthy`. Naming entities that update on reception makes the silence visible. It does **not** trigger failover: promoting because a radio died would move your house to a node whose radios may be no better.",
         "data": {
           "ha_start_mode": "Start method",
           "compose_file": "Compose file",
           "compose_service": "Service name",
           "compose_profile": "Profile (if the service is behind one)",
-          "compose_env_file": "Env file to source before every compose call"
+          "compose_env_file": "Env file to source before every compose call",
+          "radio_watch": "Entities that prove a radio is receiving"
         },
         "data_description": {
           "compose_file": "Full path on the host, e.g. /srv/docker/compose.yml",
           "compose_service": "The service name in the file, not the container name.",
           "compose_profile": "Leave empty if you do not use profiles.",
-          "compose_env_file": "Strongly recommended. Sourced and exported before compose runs."
+          "compose_env_file": "Strongly recommended. Sourced and exported before compose runs.",
+          "radio_watch": "Globs, e.g. sensor.*_rssi_numeric. Creates a 'radio silence' sensor showing seconds since any of them was last heard from. ⚠ Watch ONE radio's signals — the sensor reports the FRESHEST match, so mixing a Wi-Fi RSSI in with your Zigbee or RF sensors means the Wi-Fi masks the dead radio. Check the sensor's 'status' attribute, not just its value: 'no_reports' means the entities exist but no radio has ever been heard from, and that reads as unknown rather than a big number. Leave empty to skip."
         }
       }
     },
@@ -225,6 +227,9 @@
       },
       "unreplicated_references": {
         "name": "Unreplicated config references"
+      },
+      "radio_silence": {
+        "name": "Radio silence"
       }
     },
     "binary_sensor": {

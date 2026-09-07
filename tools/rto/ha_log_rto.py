@@ -194,9 +194,7 @@ def format_report(runs: list[StartupRun], *, budget_seconds: float, top: int = 1
 
         if run.domain_seconds:
             lines.append(f"  slowest domains (top {top}):")
-            lines.extend(
-                f"    {seconds:8.2f}s  {domain}" for domain, seconds in run.slowest(top)
-            )
+            lines.extend(f"    {seconds:8.2f}s  {domain}" for domain, seconds in run.slowest(top))
         lines.append("")
 
     completed = [r.initialized_seconds for r in runs if r.initialized_seconds is not None]

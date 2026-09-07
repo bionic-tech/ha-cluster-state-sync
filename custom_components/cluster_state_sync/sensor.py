@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
+import fnmatch
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -14,11 +16,13 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import dt as dt_util
 
 from . import StateMirror
 from .const import (
     CLOCK_SKEW_CRITICAL_SECONDS,
     CLOCK_SKEW_WARN_SECONDS,
+    CONF_RADIO_WATCH,
     DATA_CLUSTER_VIEW,
     DATA_COORDINATOR,
     DATA_DEGRADED_MARKER,
@@ -32,6 +36,18 @@ from .fileset import REPLICATED_DIRS, REPLICATED_FILES, FilesetPublisher
 from .includes import scan as scan_includes
 
 
+def watch_patterns(data: Mapping[str, Any]) -> list[str]:
+    """The radio-liveness globs, with the blanks removed.
+
+    The wizard field accepts free text, so a stray empty entry is ordinary. An
+    empty glob matches nothing, and a watch list of nothing but blanks would
+    create a sensor that reports `unknown` forever while looking configured --
+    so blanks are dropped here, and a list that is only blanks turns the
+    feature off rather than half-on.
+    """
+    return [p.strip() for p in (data.get(CONF_RADIO_WATCH) or []) if p and p.strip()]
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -39,6 +55,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up the diagnostic sensors."""
     runtime = entry.runtime_data
+    radio_watch = watch_patterns(entry.data)
     coordinator: BackendHealthCoordinator = runtime[DATA_COORDINATOR]
     mirror: StateMirror = runtime[DATA_MIRROR]
     stats: SyncStats = runtime[DATA_STATS]
@@ -57,6 +74,10 @@ async def async_setup_entry(
             ClusterMembersSensor(cluster_view, entry),
             ClockSkewSensor(cluster_view, entry),
             UnreplicatedReferencesSensor(coordinator, entry, hass.config.path()),
+            # Only when the operator has said what a radio looks like
+            # here. An entity that watches nothing is worse than absent:
+            # it reads as a working check.
+            *([RadioSilenceSensor(coordinator, entry, radio_watch)] if radio_watch else []),
         ]
     )
 
@@ -457,3 +478,125 @@ class UnreplicatedReferencesSensor(ClusterSyncDiagnosticEntity, SensorEntity):
 def _is_replicated(rel: str) -> bool:
     """Would the go-bag already carry this path?"""
     return rel.split("/")[0] in REPLICATED_DIRS or rel in REPLICATED_FILES
+
+
+class RadioSilenceSensor(ClusterSyncDiagnosticEntity, SensorEntity):
+    """Seconds since anything the operator called a radio was last heard from.
+
+    The blind spot this closes: the D3 probe asks Home Assistant whether it is
+    alive, and Home Assistant is perfectly capable of being alive while every
+    radio behind it is dead. On this fleet a Zigbee daemon livelocked -- 78%
+    CPU, no log output for 32 minutes, its healthcheck still reporting
+    `healthy` -- and the only trace anywhere was one reconnect line. No
+    failover fires for that, correctly, and nothing marked the cluster
+    degraded either.
+
+    So: the age of the freshest update across the watched set. Rising steadily
+    means nothing has been heard.
+
+    **Silence is not a fault on its own**, and this sensor does not pretend
+    otherwise. A quiet house at 4am legitimately produces no RF for a long
+    while. What it gives an operator is a number they can put a threshold on
+    themselves, knowing their own traffic -- and a value that has stopped
+    moving when it always used to is the signal worth chasing.
+
+    Unknown, not zero, when nothing matches the configured globs: zero would
+    read as "heard something just now", which is the opposite of the truth.
+
+    🚨 **An `unknown` entity is not evidence of reception, and counting one is
+    the bug this sensor shipped with.** Home Assistant stamps `last_reported`
+    on an entity whose state is `unknown` exactly as it does on a real reading,
+    so the first version reported a confident 60 s, 120 s, 191 s on this fleet
+    while all 37 watched entities sat at `unknown` and the RFXtrx receivers had
+    heard nothing for **thirty hours**. The number was Home Assistant's own
+    state writes keeping time with themselves, and it read exactly like a
+    healthy radio.
+
+    So entities without a usable value are excluded, and the three cases an
+    operator has to tell apart are separated in the `status` attribute:
+
+    | `status`     | means                                                 |
+    |--------------|-------------------------------------------------------|
+    | `ok`         | at least one radio has reported; the number is real   |
+    | `no_matches` | the globs match nothing -- a configuration problem    |
+    | `no_reports` | entities matched, none has ever reported -- **deaf**  |
+
+    `no_reports` is the loudest of the three and still reads `unknown` rather
+    than a large number, because "never" has no age. Alert on the attribute,
+    not only on the value.
+
+    🚨 **The watch set must be ONE radio's signals.** Freshest-wins is right
+    within a radio and wrong across radios: on the fleet this was built for,
+    `sensor.*_rssi` would have swept in a WLED and two Sonoff Wi-Fi RSSI
+    sensors alongside 39 RFXtrx ones, and a chatty Wi-Fi chip would have held
+    the number at zero through a completely dead RFXtrx. Watching more looks
+    safer and is the opposite. One radio per watch list.
+    """
+
+    _attr_translation_key = "radio_silence"
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "s"
+
+    def __init__(
+        self,
+        coordinator: BackendHealthCoordinator,
+        entry: ConfigEntry,
+        patterns: list[str],
+    ) -> None:
+        super().__init__(coordinator, entry, "radio_silence")
+        self._patterns = patterns
+
+    #: States that mean "this entity has no reading", not "this radio is
+    #: quiet". Home Assistant stamps `last_reported` on these exactly as it
+    #: does on a real value, so they must be excluded by state rather than
+    #: trusted by timestamp.
+    _NOT_A_READING = ("unknown", "unavailable")
+
+    def _watched(self) -> tuple[int, list[float]]:
+        """(entities matched, timestamps of those carrying a usable reading)."""
+        matched = 0
+        stamps: list[float] = []
+        for state in self.hass.states.async_all():
+            if not any(fnmatch.fnmatch(state.entity_id, p) for p in self._patterns):
+                continue
+            matched += 1
+            if state.state in self._NOT_A_READING:
+                continue
+            # `last_reported`, not `last_changed`. The question is "did we
+            # hear a packet", and a radio re-reporting the same RSSI is a
+            # packet received -- `last_changed` does not move for it, so a
+            # radio in continuous, healthy reception can look silent. On this
+            # fleet the two happen to agree today (checked: 0 of 37 diverge,
+            # 2026-09-07), which is exactly why it needed checking rather than
+            # assuming. `getattr` because the field arrived in HA 2024.11.
+            stamps.append((getattr(state, "last_reported", None) or state.last_changed).timestamp())
+        return matched, stamps
+
+    @property
+    def native_value(self) -> int | None:
+        if not self._patterns:
+            return None
+        _, stamps = self._watched()
+        if not stamps:
+            # Either the globs match nothing, or they match entities that have
+            # never reported. Both are `unknown`: the value is an age, and
+            # neither case has one. `status` tells them apart.
+            return None
+        return max(0, int(dt_util.utcnow().timestamp() - max(stamps)))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        matched, stamps = self._watched()
+        if stamps:
+            status = "ok"
+        elif matched:
+            status = "no_reports"
+        else:
+            status = "no_matches"
+        return {
+            "watching": self._patterns,
+            "entities_matched": matched,
+            "entities_reporting": len(stamps),
+            "status": status,
+        }

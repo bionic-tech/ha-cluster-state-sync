@@ -65,9 +65,7 @@ def main() -> int:
     vulnerable = [d for d in deps if d.get("vulns")]
 
     ours = sorted((d for d in vulnerable if d["name"] in OURS), key=lambda d: d["name"])
-    upstream = sorted(
-        (d for d in vulnerable if d["name"] not in OURS), key=lambda d: d["name"]
-    )
+    upstream = sorted((d for d in vulnerable if d["name"] not in OURS), key=lambda d: d["name"])
 
     if upstream:
         total = sum(len(d["vulns"]) for d in upstream)

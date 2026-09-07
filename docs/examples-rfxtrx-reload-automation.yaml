@@ -1,0 +1,106 @@
+# A working replacement for the `RFXtrx reload on failure` automation.
+#
+# 🚨 NOT INSTALLED, DELIBERATELY. As of 2026-09-07 the RFXtrx receivers on this
+# fleet have received nothing for at least seven days (GOTCHAS 18a), so the
+# sensor reads `unknown` / status `no_reports`. Installing this now would
+# reload the three entries every thirty minutes, forever, and fix nothing.
+# Install it once the radios receive again.
+#
+# Note the trigger below is numeric_state, which never fires while the state is
+# `unknown` -- that is correct for "the radio went quiet" and WRONG for "the
+# radio has never been heard from". The second trigger covers that case, which
+# is the one a value threshold alone sits quietly through.
+- id: '1683318306054'
+  alias: RFXtrx reload on failure
+  description: Reload the RFXtrx entries when no RF packet has arrived for 20 minutes.
+  # HISTORY. Two defects, both fixed, both worth keeping in view:
+  #
+  # 1. DISABLED 2026-09-05: a `homeassistant / start` trigger fired on every
+  #    Home Assistant start, and the first action was an unconditional
+  #    homeassistant.restart -- so every start caused another restart.
+  #    Measured: 127 core starts in 62 minutes, one every ~35s. Nothing could
+  #    stay connected, including the RFXtrx radios this exists to protect.
+  #
+  # 2. INERT until 2026-09-07: every trigger and condition referenced
+  #    `sensor.rfxtrx_status`, WHICH HAS NEVER EXISTED IN THIS INSTANCE. The
+  #    condition was therefore never true and this automation had never fired
+  #    for any failure, ever. It was protection believed in and never held.
+  #
+  # It now watches a signal that exists and moves: seconds since any RFXtrx
+  # RSSI sensor was last heard from. See docs/GOTCHAS.md 18 in the
+  # cluster_state_sync repo, including the outage it caught within twenty
+  # minutes of being switched on.
+  trigger:
+  # The radio went quiet: a real number that has climbed past 20 minutes.
+  - platform: numeric_state
+    entity_id: sensor.system_cluster_sync_node-a_f5d04f_radio_silence
+    above: 1200
+  # The radio has NEVER been heard from. This reads `unknown`, so no value
+  # threshold can ever catch it -- and it is the louder of the two conditions.
+  - platform: state
+    entity_id: sensor.system_cluster_sync_node-a_f5d04f_radio_silence
+    attribute: status
+    to: no_reports
+    for: '00:10:00'
+  condition:
+  # Two guards, because the last version of this automation restarted the
+  # house 127 times.
+  #
+  # a) Never act on a number the sensor cannot justify. `unknown` means its
+  #    globs matched nothing -- a configuration problem, not a radio problem,
+  #    and reloading radios will not fix it.
+  # Never act on `no_matches` -- the globs match nothing, which is a
+  # configuration problem that reloading radios cannot fix.
+  - condition: not
+    conditions:
+    - condition: state
+      entity_id: sensor.system_cluster_sync_node-a_f5d04f_radio_silence
+      attribute: status
+      state: no_matches
+  # b) At most one reload per half hour. If the reload does not fix it, this
+  #    tries again on a slow cadence instead of hammering the radios; the
+  #    notification below is what escalates to a person.
+  - condition: template
+    value_template: >-
+      {{ as_timestamp(now()) - as_timestamp(state_attr(
+           'automation.rfxtrx_reload_on_failure', 'last_triggered') or 0) > 1800 }}
+  action:
+  # Reload the three RFXtrx entries, not the entire instance. A process
+  # restart cannot rebuild the container /dev anyway (GOTCHAS 17), so it was
+  # never the right remedy for a re-enumerated USB-over-IP radio. Proven on
+  # 2026-09-07: this recovered a radio that had received nothing for 12.5
+  # minutes, and the transceiver answered its status query on the first try.
+  - service: homeassistant.reload_config_entry
+    target:
+      entity_id:
+      - switch.kitchen_cabinet_left
+      - switch.window_sensor
+      - switch.cable_modem
+  # Long enough for a packet to arrive from a working radio, short enough that
+  # the notification is still about the event that caused it.
+  - delay:
+      hours: 0
+      minutes: 3
+      seconds: 0
+      milliseconds: 0
+  # Only shout if the reload did NOT help. A reload that worked is not news.
+  # Still broken? Either a value still above the threshold, or still
+  # `no_reports`. Checking only the number would stay silent on the worse case.
+  - condition: or
+    conditions:
+    - condition: numeric_state
+      entity_id: sensor.system_cluster_sync_node-a_f5d04f_radio_silence
+      above: 1200
+    - condition: state
+      entity_id: sensor.system_cluster_sync_node-a_f5d04f_radio_silence
+      attribute: status
+      state: no_reports
+  - service: notify.mobile_app_mo_s_20
+    data:
+      title: RFXtrx still silent after a reload
+      message: >-
+        No RF packet received for {{
+        (states('sensor.system_cluster_sync_node-a_f5d04f_radio_silence')
+        | int(0) / 60) | round }} minutes. The three RFXtrx entries were
+        reloaded and it did not help -- check VirtualHere and the radios.
+  mode: single

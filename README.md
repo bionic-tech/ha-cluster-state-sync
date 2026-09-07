@@ -1,7 +1,9 @@
 # Cluster State Sync — a shared-state mirror for active-passive Home Assistant
 
-> **Status**: alpha skeleton — boots, listens, snapshots, restores. Not yet battle-tested.
-> Built for a 2.5-minute failover budget against a Valkey/Redis Sentinel cluster.
+> **Status**: alpha — boots, listens, snapshots, restores, and has survived
+> measured failovers on a live two-node cluster. Not yet battle-tested by anyone
+> but its author. Built for a 2.5-minute failover budget against a Valkey/Redis
+> Sentinel cluster.
 
 > ## ⚠ No warranty — read before installing
 >
@@ -23,11 +25,24 @@
 > state, would matter to you, do not run this on a system you rely on until you
 > have proven it on one you do not.
 
+## Where to start
 
-> **Before changing the restore, the swap, or the bundle, read
-> [`docs/GOTCHAS.md`](docs/GOTCHAS.md).** Fourteen traps this project has
-> actually fallen into, nearly all of which reported success while doing
-> nothing.
+Pick the row that matches what you are trying to do. Everything below this table
+is reference — you do not need to read the README front to back.
+
+| I want to… | Go to |
+|---|---|
+| **Install it** | [RUNBOOK-installation.md](docs/RUNBOOK-installation.md) — requirements, which HA install types can run the failover half at all, and the order things must be done in |
+| **Use the dashboard** | [GUIDE-dashboard.md](docs/GUIDE-dashboard.md) — every row and button, what the colours mean, and **when not to press each one** |
+| **Fix something that is broken** | [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — symptom-first, from real failures on a live cluster |
+| **Change the restore, the swap, or the bundle** | 🚨 [GOTCHAS.md](docs/GOTCHAS.md) **first** — 24 traps this project actually fell into, nearly all of which reported success while doing nothing |
+| **Understand what it does at runtime** | [REFERENCE-behaviour.md](docs/REFERENCE-behaviour.md) — restore semantics, leadership, sizing, actions |
+| **Keep the mobile app working through a failover** | GUIDE-ingress.md — the cluster can promote in 15 seconds and still leave the app dead |
+| **Bring a standby up from cold** | [RUNBOOK-standby-bringup.md](docs/RUNBOOK-standby-bringup.md) |
+| **Know why it is built this way** | [the ADRs](docs/adr/README.md), with a suggested reading order |
+| **Work on the code** | CONTRIBUTING.md |
+| **Re-litigate a closed decision** | [DECISIONS-SETTLED.md](docs/DECISIONS-SETTLED.md) — check here first; several of these keep being rediscovered as blockers |
+| **See what changed** | v0.3.1 · v0.3.0 |
 
 ## What this is
 
@@ -99,39 +114,39 @@ Leadership is the single source of truth, applied to every gating layer by the `
 `notify_backup` scripts on each host. Those began life as Keepalived hooks. They are now run by
 `cluster-promoter`, a timer that reads the Valkey lease every ten seconds and invokes them when
 leadership actually changes — so there is no VIP, no VRRP, and no second election to disagree with
-the first. A built-in setup **wizard** (planned) picks the model and generates the host-side
-bundle. See
+the first. The setup **wizard** picks the model and generates the host-side bundle. See
 **[ADR-001 — Active-passive topology](docs/adr/ADR-001-active-passive-topology.md)** for the full
 decision, the Docker firewall recipe, and the trade-offs.
 
 ## Installation
 
-**Start here: [the installation runbook](docs/RUNBOOK-installation.md)** — requirements
-(including which Home Assistant installation types can run the failover half at
-all), the two setup scenarios, and the order things must be done in.
+**Read [the installation runbook](docs/RUNBOOK-installation.md) first.** It
+covers the requirements, the two setup scenarios, and the order things must be
+done in. The short version:
 
-> **Installation is a file copy, not HACS.** This repository is private, and
-> HACS fetches `manifest.json` and `hacs.json` from `raw.githubusercontent.com`
-> without authentication — which 404s on a private repo, so it cannot install
-> from one. Copy `custom_components/cluster_state_sync/` into your Home
-> Assistant `config/custom_components/` and restart. The `hacs.json` here is
-> kept accurate so that nothing needs doing on the day this goes public.
+1. **Copy `custom_components/cluster_state_sync/` into `config/custom_components/`
+   on both instances**, then restart both.
+2. **Settings → Devices & Services → Add Integration → Cluster State Sync**, on
+   each node.
+3. Pick **Sentinel** mode against a Valkey Sentinel cluster, or **Direct** for a
+   single host.
+4. **Keep the cluster namespace identical across nodes.** Make the node ID
+   different on each — the default, the container hostname, does that for you.
+5. **Copy the cluster secret from the first node to the second, exactly.** A
+   mismatch means neither node will accept the other's state, and the symptom is
+   a restore that quietly does nothing.
 
-**Via HACS** (once this repository is added as a custom repository, category
-*Integration*): install it on **both** HA instances, then restart both.
-
-**Manually:** copy `custom_components/cluster_state_sync/` into your
-`config/custom_components/` on **both** instances, then restart both.
+> **Installation is a file copy, not HACS — for now.** This repository is
+> private, and HACS fetches `manifest.json` and `hacs.json` from
+> `raw.githubusercontent.com` without authentication, which 404s on a private
+> repo. The `hacs.json` here is kept accurate so nothing needs doing on the day
+> this goes public; then it installs as a custom repository, category
+> *Integration*, on **both** instances.
 
 > The integration lives at `custom_components/cluster_state_sync/` rather than
 > the repository root. It used to sit at the top level with a symlink here, and
 > that made the repository un-installable through HACS — a symlink does not
 > survive being copied out of a repository. Moved 2026-08-26.
-3. **Settings → Devices & Services → Add Integration → Cluster State Sync**
-4. Pick **Sentinel** mode if you're using the Manning Madness Valkey cluster,
-   or **Direct** for a single host.
-5. Keep the cluster namespace identical across nodes. Make the node ID
-   different on each (the default — container hostname — does this for you).
 
 ## Configuration
 
@@ -142,59 +157,155 @@ all), the two setup scenarios, and the order things must be done in.
 | Snapshot interval | 5s | How often the buffer flushes to Redis. Lower = less data loss on failover, more write pressure. |
 | Restore max age | 1800s (30m) | Snapshots older than this are ignored on startup. Stops a node coming back after a week from restoring ancient garbage. |
 | Include domains | see `const.py` | Entity domains we mirror. Defaults to `input_*`, `counter`, `timer`, `vacuum`, `climate`, `humidifier`, `water_heater`. **`person`, `device_tracker` and `alarm_control_panel` are opt-in** — see `SENSITIVE_DOMAINS`. Edit `DEFAULT_INCLUDE_DOMAINS` to extend. |
+| Entities that prove a radio is receiving | *(empty — off)* | Globs, e.g. `sensor.*_rssi_numeric`. Creates a **Radio silence** sensor: seconds since the freshest of them last changed. See [Diagnostics](#diagnostics). |
 
-## Sizing & performance
+## What you get in Home Assistant
 
-* Each state takes roughly 200–500 bytes serialised.
-* A typical home with 200 tracked entities → ~80KB snapshot.
-* Write cost: one Redis `HSET` + `SET` per flush, and the flush is skipped
-  entirely when nothing changed since the last one. Even on a Pi with a few
-  hundred entities, this is sub-10ms.
-* There is deliberately **no** `DEL` before the `HSET`. The write merges, so
-  two nodes flushing concurrently cannot erase each other's entries — the
-  interim guard until leader election lands.
-* Read cost (restore): one `HGETALL` + `GET`. Single round-trip.
+Nothing to paste and no entity names to look up: the panel registers itself and
+the entities land in an auto-created **Cluster** area.
 
-## What gets restored, what doesn't
+### The Cluster panel
 
-On startup, after backend connection but before the automation engine
-starts, the integration:
+A **Cluster** item appears in your sidebar after install. It discovers the
+entities rather than being told their names, so it works on both nodes without
+per-node editing, and it shows both nodes side by side.
 
-1. Reads the full snapshot.
-2. Refuses the whole thing if it holds more entries than the cap — a
-   legitimate snapshot is hundreds of entries, not thousands.
-3. For each entity, checks: is it in our include filter? Was the snapshot
-   written by *another* node? Is its timestamp readable, and not stamped
-   implausibly far in the future? Is it within the max-age window? Are its
-   attributes within the size budget? Is it newer than the local state?
-4. If yes to all, calls `hass.states.async_set()` to seed it — with a single
-   shared context, so the whole restore is one identifiable operation rather
-   than a scatter of unattributable state changes.
+**[GUIDE-dashboard.md](docs/GUIDE-dashboard.md) is the manual** — what each row
+means, what each button does, when *not* to press it, and what the colours are
+saying:
 
-A bad entry costs that entry and nothing else: an unreadable timestamp, an
-oversized payload or a corrupt stored value is logged and skipped, never
-allowed to abort the restore and leave the node cold.
+| Colour | Meaning |
+|---|---|
+| plain | safe — reads state, changes nothing |
+| amber | changes how the cluster behaves |
+| red | **moves the house to the other machine** |
 
-**Restore only happens at startup.** If you add the integration to an
-already-running Home Assistant, it deliberately does *not* restore — seeding
-dozens of entities into a live system would fire every automation watching
-them. The snapshot is applied on the next restart instead.
+### Two switches, because both were once files you had to SSH in to touch
 
-**At boot, the peer's snapshot wins.** This used to say the opposite — that
-integrations restoring their own state via `RestoreEntity` take priority, and we
-only fill gaps — and that turned out to mean the restore did nothing at all.
+| Switch | What it does | Why it exists |
+|---|---|---|
+| **Maintenance hold** | Suspends automatic failover on this node | Restarting Home Assistant on the leader *is* a full failover. The flag that prevents it lived only in a host script the person pressing **Restart** was not looking at. It has cost this fleet a real outage. |
+| **Handover request** | Asks this node to hand leadership to its peer | The supported way to move the house deliberately. It is a *request*: the peer still has to take the lease, so this cannot produce two leaders. |
 
-Every domain in the default list is a `RestoreEntity`. Home Assistant replays
-their values from *this* node's disk at boot and stamps `last_updated` with the
-boot time, so local state was always "newer" than any snapshot and every entry
-was skipped. On a real two-node test an 18-second-old snapshot restored **zero**
-entities. The comparison had no information in it.
+Both read their state from disk on every update rather than caching it, because
+the host scripts write the same files and the two views must never disagree.
 
-So at boot the snapshot is the authority for tracked entities, still bounded by
-max-age, the signature, the size cap and the include filter. A device-backed
-entity that genuinely polled fresher state corrects itself on its next poll; a
-helper never does. Off the boot path — a manual restore against a running
-system — local state wins again, because there the timestamps mean something.
+There is **no force-promote button**, on purpose — see
+[Actions](docs/REFERENCE-behaviour.md#actions).
+
+## Diagnostics
+
+Every way this integration fails is quiet by design, so it exposes its own
+health as entities. Backend errors are deliberately swallowed — a Redis outage
+must never crash Home Assistant — which makes these the *only* place that
+failure becomes visible.
+
+**Replication health**
+
+| Entity | What it tells you |
+|---|---|
+| **Entities tracked** | How many entities this node is mirroring. Compare against what you expect; this is the number that makes a broken filter obvious. |
+| **Last snapshot age** | Seconds since this node's last *successful* write. Climbs and never resets if the flush loop stalls. Reads *unknown*, never zero, if nothing has ever been written. |
+| **Shared snapshot age** | Age of what is actually in the store — the peer's writes included. This is what a promotion would restore *from*. |
+| **Entities restored** | How many entities the last restore actually seeded. **A promotion that restored zero is the failure this integration exists to prevent.** |
+| **Backend** | Connectivity to Valkey/Redis, polled every 60s. |
+
+**Cluster shape**
+
+| Entity | What it tells you |
+|---|---|
+| **Is leader** | Whether this node currently holds the lease. |
+| **Cluster leader** | Which node does — by name, from the store, so both nodes agree or visibly do not. |
+| **Cluster members** | How many nodes have checked in recently. |
+| **Clock skew** | The spread between members' clocks. The restore's max-age window is meaningless once this is large, so it warns well before that cliff. |
+| **Maintenance hold** | Whether failover is currently suspended here. |
+
+**Go-bag (config replication)**
+
+| Entity | What it tells you |
+|---|---|
+| **Fileset age** | How stale the replicated config is. |
+| **Fileset degraded** | The go-bag was stale or missing at promotion. It marks degraded and **never blocks the promotion** (D4) — a standby with old config still beats no standby. |
+| **Unreplicated config references** | Files your `configuration.yaml` includes that would *not* cross to the peer. This exists because a promoted node once came up in recovery mode behind a promotion that reported success at every step. |
+
+**Radios**
+
+| Entity | What it tells you |
+|---|---|
+| **Radio silence** | Seconds since anything you called a radio was last heard from. Off until you configure the globs. |
+
+🚨 **Read the `status` attribute, not only the value.** It has three states, and
+two of them read `unknown`:
+
+| `status` | means |
+|---|---|
+| `ok` | at least one radio has reported — the number is real |
+| `no_matches` | the globs match nothing — a configuration problem |
+| `no_reports` | entities matched, none has ever reported — **the radio is deaf** |
+
+`no_reports` is the loudest condition the sensor can find and it is deliberately
+not a large number, because "never" has no age. On this fleet an alert
+thresholded on the value alone would have sat quietly through **thirty hours**
+of completely deaf RFXtrx receivers.
+
+🚨 **Watch one radio's signals per list.** The sensor reports the *freshest*
+match, which is right within a radio and wrong across radios: a Wi-Fi RSSI
+sensor reporting every 60 seconds will hold the number near zero through a
+completely dead Zigbee or RF radio. Watching more entities looks safer and is
+the exact opposite.
+
+It also reads near-zero for the first few minutes after a Home Assistant
+restart — Home Assistant writes every entity's state as it starts, so a low
+value there says nothing about whether a packet has actually arrived. Set any
+alert threshold longer than your instance's boot time.
+
+Radio silence is the answer to a gap the failover design does not close and
+still will not: Home Assistant can be perfectly healthy while every radio behind
+it is dead. On this fleet a Zigbee daemon livelocked — 78% CPU, no output for 32
+minutes, its healthcheck reporting `healthy` — and the whole house lost Zigbee
+with every signal the cluster watches staying green.
+
+It **does not trigger failover**. Promoting because a radio died would move the
+house onto a node whose radios may be no better. And it does not pick your
+threshold: only you know your own traffic, and a quiet house at 4am legitimately
+produces no RF for a long while. What is diagnostic is a number that *used* to
+move and has stopped. Full treatment in
+[GOTCHAS §18](docs/GOTCHAS.md#18-a-docker-healthcheck-says-healthy-while-the-process-is-livelocked).
+
+### Alerting — install the blueprint
+
+Exposing the sensors is only half the job. Every way this integration fails is
+quiet by design: the backend goes away and the flush loop just stops, the peer
+stops writing and the snapshot ages, a promotion restores nothing at all and
+logs one line about it. Nothing in the house changes, so nobody looks.
+
+A blueprint ships with the repository to close that:
+
+[![Open your Home Assistant instance and show the blueprint import dialog with a specific blueprint pre-filled.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fboywiz%2Fha-cluster-state-sync%2Fblob%2Fmain%2Fblueprints%2Fautomation%2Fcluster_state_sync%2Ffailover_readiness.yaml)
+
+Or **Settings → Automations & scenes → Blueprints → Import blueprint** and paste:
+
+```
+https://github.com/boywiz/ha-cluster-state-sync/blob/main/blueprints/automation/cluster_state_sync/failover_readiness.yaml
+```
+
+It watches three things, because they fail differently:
+
+| Trigger | What it means |
+|---|---|
+| **Backend unreachable** (past a grace period) | Nothing is being written. A promotion now restores whatever was last saved, or nothing. |
+| **Snapshot age above a limit** | The backend is *up* and the flush loop stopped anyway — the harder failure to spot, and the one the Backend sensor cannot see. |
+| **Restored zero entities** | This node promoted cold. Nothing came across from the peer. |
+
+That third one is the reason the blueprint exists rather than a line in the
+docs saying "alert on snapshot age". Restoring nothing was a real defect for the
+entire life of this project, it was found by running the thing rather than by
+testing it, and its only symptom was an INFO line nobody read. Install the
+alerting with the thing it alerts on.
+
+You supply the notification action, so it can be a phone push, a persistent
+notification, or a light — whatever you will actually notice. Only the three
+entities and that action are required; the thresholds have defaults.
 
 ## Security
 
@@ -327,145 +438,6 @@ If you don't know your Docker network mode, pick "Not sure" and all three
 variants are generated; the notify scripts then call a dispatcher with a single
 `NETWORK_MODE=` setting for you to fill in once, rather than guessing.
 
-## Leadership — who writes
-
-Only the leader writes to the shared snapshot. Choose the signal at setup:
-
-| Signal | Use when | How it works |
-|---|---|---|
-| **Always leader** (default) | Single node, or a **cold standby** whose Home Assistant is stopped until promotion | This node always writes. The pre-v0.2 behaviour. |
-| **Follow an entity** | **Warm standby**, or an external promoter you already trust | Point it at an `input_boolean` your `notify_master` / `notify_backup` scripts toggle. |
-| **Valkey lease** | Warm standby, strongest option | The node takes a TTL lease in Valkey itself, renewed on every flush. |
-
-The lease is the **split-brain guard** ADR-001 depends on, and since the promoter
-replaced Keepalived it is the election as well. Take-or-renew is evaluated
-atomically inside Valkey rather than as a read-then-write race, so two nodes
-asking at the same instant get different answers. A heartbeat on the wire cannot
-promise that: under a partition both halves can reasonably conclude they are the
-survivor.
-
-Every path **fails closed**. A missing entity, a typo'd entity ID, an
-unreachable backend — all resolve to *follower*. Assuming leadership when you
-cannot establish it is exactly how you end up with two leaders.
-
-On a clean shutdown the leader hands its lease back, so the standby promotes
-immediately instead of waiting out the TTL.
-
-> This gates layer 2 of ADR-001's four. Layer 1 (nftables), layer 3 (recorder)
-> and layer 4 (automations) are host-side or not yet implemented — see
-> [ADR-001](docs/adr/ADR-001-active-passive-topology.md).
-
-## Diagnostics
-
-The integration exposes four diagnostic entities on its own device, so a
-degraded sync is visible instead of silent:
-
-| Entity | What it tells you |
-|---|---|
-| **Entities tracked** | How many entities this node is mirroring. Compare against what you expect — this is the number that makes a broken snapshot obvious. |
-| **Last snapshot age** | Seconds since the last *successful* write. Climbs and never resets if the flush loop stalls or the backend is unreachable. Reads *unknown*, never zero, if nothing has ever been written. |
-| **Entities restored** | How many entities the last restore actually seeded. A promotion that restored zero is the failure this integration exists to prevent. |
-| **Backend** | Connectivity to Valkey/Redis, polled every 60s. |
-
-Backend errors are deliberately swallowed so a Redis outage can never crash
-Home Assistant — which means these entities are the only place that failure
-becomes visible.
-
-### Alerting — install the blueprint
-
-Exposing the sensors is only half the job. Every way this integration fails is
-quiet by design: the backend goes away and the flush loop just stops, the peer
-stops writing and the snapshot ages, a promotion restores nothing at all and
-logs one line about it. Nothing in the house changes, so nobody looks.
-
-A blueprint ships with the repository to close that:
-
-[![Open your Home Assistant instance and show the blueprint import dialog with a specific blueprint pre-filled.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fboywiz%2Fha-cluster-state-sync%2Fblob%2Fmain%2Fblueprints%2Fautomation%2Fcluster_state_sync%2Ffailover_readiness.yaml)
-
-Or **Settings → Automations & scenes → Blueprints → Import blueprint** and paste:
-
-```
-https://github.com/boywiz/ha-cluster-state-sync/blob/main/blueprints/automation/cluster_state_sync/failover_readiness.yaml
-```
-
-It watches three things, because they fail differently:
-
-| Trigger | What it means |
-|---|---|
-| **Backend unreachable** (past a grace period) | Nothing is being written. A promotion now restores whatever was last saved, or nothing. |
-| **Snapshot age above a limit** | The backend is *up* and the flush loop stopped anyway — the harder failure to spot, and the one the Backend sensor cannot see. |
-| **Restored zero entities** | This node promoted cold. Nothing came across from the peer. |
-
-That third one is the reason the blueprint exists rather than a line in the
-docs saying "alert on snapshot age". Restoring nothing was a real defect for the
-entire life of this project, it was found by running the thing rather than by
-testing it, and its only symptom was an INFO line nobody read. Install the
-alerting with the thing it alerts on.
-
-You supply the notification action, so it can be a phone push, a persistent
-notification, or a light — whatever you will actually notice. Only the three
-entities and that action are required; the thresholds have defaults.
-
-## What's intentionally left for v0.2+
-
-Two items that used to sit here have shipped, and the list said otherwise for
-longer than it should have:
-
-* ~~**Leader election**~~ — **done.** A TTL lease taken and renewed atomically
-  inside Valkey, plus `always` and `entity` signals. The flush loop runs only on
-  the leader. See [Leadership](#leadership--who-writes).
-* ~~**Automation gating**~~ — **done**, though not as the
-  `cluster.exec_if_leader` service imagined here. Wrapping every automation
-  would have needed every user to edit every automation; gating the engine
-  needs one checkbox. Both recorder and automation gating are opt-in and off by
-  default.
-
-Still outstanding:
-
-* **Postgres backend** for users who already have Patroni and don't want
-  to introduce Redis just for this.
-* **A better liveness signal.** The promoter asks Home Assistant's own HTTP API
-  whether it is answering before renewing the lease, which catches a wedged
-  event loop that a process check would miss. It still says nothing about
-  partial degradation — an instance returning 500 to every request looks alive.
-* **Tombstones** so deleted entities propagate.
-* **Per-node identity.** The signature proves a writer is *a* cluster node, not
-  *which* one. `source_node` is signed, so an outsider cannot forge it — but a
-  compromised node can write as itself and the peer will restore it. Inherent to
-  a shared-secret design; fixing it means per-node keys.
-
-## Upstream-PR path
-
-The maintainers have been clear (see the 2022 WTH thread on HA clustering)
-that they're not going to merge a full clustering subsystem. They have
-shown willingness to merge *focused* extensibility points.
-
-The realistic upstream contribution from this integration is a small core
-PR adding a `state_snapshot_backend` hook to the `restore_state` helper —
-something like `async_get_last_state` but pluggable to remote backends.
-This integration then ships as the reference consumer. Drafting that PR
-is a v0.3 task once the integration has been running in anger for a
-month or two.
-
-## Development notes
-
-* **Single-threaded asyncio.** Everything runs on the HA event loop. Any
-  blocking call (filesystem, sync DB, sync HTTP) must be wrapped in
-  `hass.async_add_executor_job`.
-* **Backend failures must never raise.** HA being briefly without state
-  sync is a degradation; HA crashing because Redis is down is unacceptable.
-  Every backend call is in a try/except that logs and returns a failure
-  value.
-* **State is immutable in HA.** `hass.states.get()` returns a frozen
-  snapshot; mutations happen via `async_set`. Don't try to be clever.
-* **Don't listen to events that don't matter.** `EVENT_STATE_CHANGED` is
-  the only firehose worth tapping, and it is the only bus subscription the
-  integration makes. What gets mirrored is decided by `_should_track`, not by
-  any event filter. (Earlier versions of this note described a
-  `NOISY_EVENTS_TO_IGNORE` set as the active filter; no such filtering ever
-  existed — only `EVENT_STATE_CHANGED` is subscribed, so those events never
-  reached a callback in the first place. The constant has been deleted.)
-
 ## Known limitations
 
 * Two HA instances both running automations will double-fire during the
@@ -482,69 +454,22 @@ Several design questions are closed and keep getting rediscovered. Before raisin
 blocker, check **[DECISIONS-SETTLED.md](docs/DECISIONS-SETTLED.md)** — it covers the standby
 rebuild, Sentinel, the Valkey placement, the cold-standby default and secret storage.
 
-## Remote access during a failover
-
-**GUIDE-ingress.md** — the
-cluster can promote in 15 seconds and still leave the mobile app dead, because
-nothing about the ingress path follows the lease. Traefik `failover` services,
-the `trusted_proxies` trap, and why the same rule belongs on two hosts.
-
-## The Cluster dashboard
-
-**[docs/GUIDE-dashboard.md](docs/GUIDE-dashboard.md)** — the panel appears in your
-sidebar on its own after install: nothing to paste, no entity names to look up. The
-guide covers what each row means, what each button does, **when not to press it**, and
-what the colours are telling you (plain = safe, amber = changes cluster behaviour,
-red = moves the house to the other machine).
-
-## Something not working?
-
-**[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** — symptom-first, from
-real failures on a live cluster. Start there; two commands at the top catch
-the majority of confusing cases (a Home Assistant restart loop, and two
-integrations claiming one domain).
-
 ## Design documentation
 
 | Document | Covers |
 |---|---|
-| [ADR index](docs/adr/README.md) | All five architecture decisions, with a suggested reading order |
+| [ADR index](docs/adr/README.md) | All seven architecture decisions, with a suggested reading order |
 | [ADR-001 — Active-passive topology](docs/adr/ADR-001-active-passive-topology.md) | Cold vs warm standby, the four gating layers, three replication tiers |
 | [ADR-002 — Snapshot integrity](docs/adr/ADR-002-snapshot-integrity.md) | Why entries are signed, what is signed, and why no secret means no restore |
 | [ADR-003 — Leadership resolution](docs/adr/ADR-003-leadership-resolution.md) | The three signals, the atomic lease, and failing closed |
 | [ADR-004 — Snapshot write semantics](docs/adr/ADR-004-snapshot-write-semantics.md) | Full map, merge not replace, and the tombstone trade |
 | [ADR-005 — Generate, don't control](docs/adr/ADR-005-generate-not-control.md) | Why the integration emits host config instead of applying it |
+| [ADR-006 — Lease promoter](docs/adr/ADR-006-lease-promoter.md) | Why Keepalived went, and why one election beats two |
+| [ADR-007 — Operator surface](docs/adr/ADR-007-operator-surface.md) | The panel, the switches, and what is deliberately not a button |
 
 The adversarial review that drove most of this
 is kept in the repo, along with the closure record
 for all 35 findings.
-
-## Actions
-
-Two, and deliberately no more.
-
-| Action | What it does |
-|---|---|
-| `cluster_state_sync.flush_snapshot` | Writes this node's entity state to the shared store immediately, rather than waiting for the next interval. **Refuses on a node that does not hold cluster leadership** — a follower writing would overwrite the leader's snapshot. Does nothing if nothing has changed since the last flush. |
-| `cluster_state_sync.clear_degraded` | Acknowledges the "go-bag was stale or missing at promotion" marker and removes the repair issue it raised. It fixes nothing on its own: the next promotion is what proves the go-bag is healthy, and the marker returns if the condition persists. |
-
-There is **no force-promote action**, on purpose. Forcing a promotion bypasses
-the split-brain guard, so it stays a file you have to be on the host to create —
-`touch /run/cluster-sync/force-master` — and it records the bypass in
-`force-master.used`. A button for it would make "both nodes believe they lead"
-something you could cause by accident from a phone.
-
-Both are also wired to buttons on the generated dashboard
-(`cluster-dashboard.yaml` in the bundle).
-
-> **The promoter ships inside the integration, and is inert there.**
-> `scripts/cluster_promoter.py`, `scripts/resp.py` and `lease.py` live in the
-> package you copy into `custom_components/`, which reads as though installing
-> the integration installs the promoter. It does not. `bundle.py` reads those
-> files with `.read_text()` and emits them as *text* for the operator to install
-> deliberately (ADR-005). The only `import subprocess` in the package is inside
-> scripts the runtime modules never import, so nothing in a running Home
-> Assistant can execute them. Verified independently by homelab, 2026-09-02.
 
 ## Removing it
 

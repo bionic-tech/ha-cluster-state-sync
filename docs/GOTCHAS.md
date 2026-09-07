@@ -439,6 +439,162 @@ last 2000 log lines came from `0x70AC08FFFE6900A1` (cluster `0x0102`, window
 covering), reporting roughly once per second, indefinitely. Two other devices
 managed 36 and 11 between them.
 
+**Since v0.3.1 the integration measures this.** The wizard's *Entities that
+prove a radio is receiving* field takes globs — on this fleet
+`sensor.*_rssi_numeric`, 39 entities that update on every RFXtrx packet
+received — and produces **`sensor.<node>_radio_silence`**: seconds since the
+freshest of them last changed. Freshest, not oldest, deliberately: one still
+reporting means the path is alive, and taking the oldest would alarm on the one
+dead battery sensor in a working house.
+
+Three things it deliberately does **not** do:
+
+- **It does not gate promotion.** Failing over because a radio died would move
+  the house onto a node whose radios may be no better — and on this fleet, whose
+  deCONZ is not running at all. It makes the silence visible; the operator
+  decides.
+- **It does not decide what "too long" is.** Only the operator knows their own
+  traffic. A quiet house at 4am legitimately produces no RF for a long while.
+  What is diagnostic is a number that *used* to move and has stopped.
+- **It does not report `0` when it matches nothing.** A typo in the glob, a
+  renamed entity, an integration that failed to load — each leaves it watching
+  nothing, and `0` would render as "heard something just now". It reports
+  `unknown`, and `entities_matched` in the attributes is the number that catches
+  the silent misconfiguration.
+
+🚨 **Watch ONE radio's signals per list.** Freshest-wins is right within a radio
+and wrong across radios. On this fleet the tempting wider glob `sensor.*_rssi`
+sweeps in a WLED, two Sonoffs and a Konnected — **Wi-Fi** RSSI sensors — beside
+the 39 RFXtrx ones:
+
+| glob | matches | what it measures |
+|---|---|---|
+| `sensor.*_rssi_numeric` | 39, all `rfxtrx` | the RF radio |
+| `sensor.*_rssi` | 4 — `wled`, `sonoff`×2, `esphome` | Wi-Fi, i.e. nothing about RF |
+
+A Wi-Fi chip reporting every 60 seconds holds the number near zero through a
+completely dead RFXtrx. **Watching more entities looks safer and is the exact
+opposite.** Nothing in the code can catch this — only the operator knows which
+entity belongs to which radio — so it is pinned by a test
+(`test_a_chatty_wifi_chip_would_mask_a_dead_rf_radio`) rather than a guard.
+
+**And it keys on `last_reported`, not `last_changed`.** The question is "did we
+hear a packet", and a radio re-reporting the same RSSI *has* been heard from —
+`last_changed` does not move for an identical value, so a radio in continuous,
+healthy reception would show a steadily rising silence. A false alarm costs the
+sensor exactly the trust it exists to earn.
+
+On this fleet the two agree — **0 of 37 entities diverge**, checked
+2026-09-07 — which is a property of one integration on one installation and not
+of Home Assistant. That is the reason to check rather than to assume, and it is
+pinned by `test_a_radio_repeating_itself_is_not_a_silent_radio`, verified to
+fail against `last_changed`.
+
+**It reads ~0 for a while after every Home Assistant restart, and that number
+means nothing.** Home Assistant writes every entity's state as it starts, so
+`last_reported` for all 37 is the boot time and the sensor reports near-zero
+silence whether or not a single packet has been received since. Observed
+directly: 0 s at 22 seconds after a restart, on a node whose radios had not yet
+sent anything.
+
+Consequence for any alerting built on this: **the sensor is blind for the first
+few minutes of an instance's life**, and an alert with a threshold shorter than
+that window will never fire during it. Do not read a low value straight after a
+restart as evidence the radios came back — that is §9 again. Use the fd count
+instead, which is a fact rather than an inference:
+
+```bash
+PID=$(docker exec homeassistant sh -c 'pgrep -f "python.*homeassistant" | head -1')
+docker exec homeassistant sh -c "ls -l /proc/$PID/fd" | grep -c ttyUSB   # expect 3 here
+```
+
+(and §19: `docker inspect .State.Pid` gives you the container's init, not this.)
+
+### 18a. It found a real one, then lied about the size of it
+
+Not a drill. Deploying the sensor needed one Home Assistant restart on the
+leader. Afterwards, every check this fleet has ever used said the radios were
+fine — ports open, devices claimed in VirtualHere, container healthy,
+integration loaded, nothing logged — and the new sensor reported a plausible,
+steadily-rising silence:
+
+```
+sensor reads              : 60 s ... 120 s ... 191 s ... 360 s
+distinct ages across 37   : 2          <- one batch write, no organic traffic
+RFXtrx debug, 150 s       : 0 lines
+serial fds held by HA     : 3 (ttyUSB0, ttyUSB1, ttyUSB4)
+```
+
+`reload_config_entry` on the three rfxtrx entries produced an immediate,
+successful handshake — `Status [subtype=433.92MHz, firmware=28,
+output_power=28]` — so the hardware was fine and the read loop came back.
+**At that point I wrote that the sensor had caught an outage and the reload
+had fixed it. Both halves were wrong, in opposite directions.**
+
+The reload fixed nothing, because nothing had broken at 13:11. And the outage
+was far bigger than a Home Assistant restart:
+
+```
+history, 30 hours, sensor.radiator_aircon_rssi_numeric:
+    1 recorded state -> "unknown", set 2026-09-06 06:33 UTC
+
+current states of the 37 watched entities : {'unknown': 37}
+current states of the 59 rfxtrx event.*   : {'unknown': 57, 'unavailable': 2}
+every Recv line in 28 hours of log        : a status/handshake packet
+air packets received, ever, in that log   : zero
+```
+
+**The RFXtrx receivers had been deaf for at least thirty hours.** Not since my
+restart — since the previous morning. That is the outage behind the kitchen
+switch that "stopped working", and behind the light that appeared to come on by
+itself: the wall switch transmits, nothing receives it, so the automation it
+should trigger never runs.
+
+#### And the sensor reported a healthy-looking number throughout
+
+This is the part to keep. **Home Assistant stamps `last_reported` on an entity
+whose state is `unknown` exactly as it does on a real reading.** All 37 watched
+entities were `unknown`; every time Home Assistant rewrote them — a restore, a
+reload, a restart — their timestamps advanced, and the sensor faithfully
+reported the age of Home Assistant's own bookkeeping. 60 s. 120 s. 191 s.
+Numbers indistinguishable from a working radio.
+
+A sensor built specifically to stop "green everywhere, and the house did
+nothing" reproduced it on its first day, inside itself.
+
+**Fixed by excluding entities that carry no reading**, and by separating the
+two cases that both have to read `unknown`:
+
+| `status`     | means                                                |
+|--------------|------------------------------------------------------|
+| `ok`         | at least one radio has reported; the number is real  |
+| `no_matches` | the globs match nothing — a configuration problem    |
+| `no_reports` | entities matched, none has ever reported — **deaf**  |
+
+`no_reports` is the loudest state this sensor has and it is deliberately *not*
+a big number, because "never" has no age. **Alert on the attribute, not only on
+the value** — a threshold on the value alone would have sat quietly through all
+thirty hours of this.
+
+Pinned by `test_an_unknown_entity_is_not_evidence_of_reception`, verified to
+fail against the shipped behaviour.
+
+#### The remediation automation is written and deliberately not installed
+
+[`docs/examples-rfxtrx-reload-automation.yaml`](examples-rfxtrx-reload-automation.yaml)
+replaces the inert `RFXtrx reload on failure`. It is **not** installed, because
+while the receivers are actually deaf it would reload the three entries every
+thirty minutes forever and fix nothing. Install it once the radios receive
+again.
+
+Two things in it are worth copying into any alert built on this sensor:
+
+- **A `numeric_state` trigger cannot fire on `no_reports`**, because that state
+  is `unknown`. A threshold on the value alone is exactly what sat quietly
+  through seven days here. It needs a second trigger on the attribute.
+- **Never remediate on `no_matches`.** The globs match nothing; reloading
+  radios cannot fix a typo.
+
 ## 19. `docker inspect .State.Pid` is the container's init, not your application
 
 **Looked like:** Home Assistant holding no serial ports at all, which would have
