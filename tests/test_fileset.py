@@ -705,3 +705,51 @@ async def test_no_secret_means_no_publisher_and_no_publish(
     async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=6))
     await hass.async_block_till_done(wait_background_tasks=True)
     assert backend.fileset_manifest is None
+
+
+def test_the_publisher_carries_files_the_config_includes(tmp_path) -> None:
+    """Production change that would make this fail: going back to a fixed list.
+
+    node-b promoted into recovery mode on 2026-09-04 because
+    `configs/customize.yaml` was referenced by `configuration.yaml` and was not
+    in the replicated set. The promotion, the swap and the identity graft all
+    reported success.
+    """
+    from custom_components.cluster_state_sync.fileset import _candidates
+
+    (tmp_path / "configuration.yaml").write_text(
+        "homeassistant:\n  customize: !include configs/customize.yaml\n"
+        "themes: !include_dir_merge_named themes\n"
+    )
+    (tmp_path / "configs").mkdir()
+    (tmp_path / "configs/customize.yaml").write_text("a: 1\n")
+    (tmp_path / "themes").mkdir()
+    (tmp_path / "themes/dark.yaml").write_text("b: 2\n")
+
+    names = {rel for rel, _ in _candidates(tmp_path)}
+    assert "configs/customize.yaml" in names
+    assert "themes/dark.yaml" in names
+
+
+def test_a_file_is_never_published_twice(tmp_path) -> None:
+    """The floor and the include scan overlap — `configuration.yaml` is in both
+    — and a duplicate entry would be published twice and counted twice."""
+    from custom_components.cluster_state_sync.fileset import _candidates
+
+    (tmp_path / "configuration.yaml").write_text("a: !include automations.yaml\n")
+    (tmp_path / "automations.yaml").write_text("[]\n")
+
+    names = [rel for rel, _ in _candidates(tmp_path)]
+    assert len(names) == len(set(names)), f"duplicates: {names}"
+
+
+def test_an_unparseable_config_still_publishes_the_floor(tmp_path) -> None:
+    """A degraded go-bag beats no go-bag. A configuration too broken to scan
+    must not stop the leader publishing what it can."""
+    from custom_components.cluster_state_sync.fileset import _candidates
+
+    (tmp_path / "configuration.yaml").write_text("this: [is: not: valid\n")
+    (tmp_path / "automations.yaml").write_text("[]\n")
+
+    names = {rel for rel, _ in _candidates(tmp_path)}
+    assert "automations.yaml" in names

@@ -9,6 +9,7 @@ lifecycle wiring) runs as real code against a real `hass`.
 from __future__ import annotations
 
 from collections.abc import Collection, Mapping, Sequence
+from datetime import UTC, datetime
 from typing import Any
 
 from custom_components.cluster_state_sync.backend import ClusterBackend, SnapshotEntry
@@ -31,6 +32,11 @@ class FakeBackend(ClusterBackend):
         self.fail_writes = False
         self.lease_holder: str | None = None
         self.lease_raises = False
+        # Cluster registry (node_key). `offset_s` is this fake node's clock
+        # offset against the store; tests that care about skew set it
+        # per-node, and the default of 0.0 means "agrees with the store".
+        self.offset_s: float | None = 0.0
+        self.members: dict[str, dict] = {}
         self.read_result: tuple[dict[str, SnapshotEntry], dict[str, Any]] | None = None
         self.fileset_manifest: bytes | None = None
         self.blobs: dict[str, bytes] = {}
@@ -46,13 +52,29 @@ class FakeBackend(ClusterBackend):
             return False
         self.writes.append(dict(entries))
         self.stored.update(entries)
-        self.meta = {"source_node": source_node, "entry_count": len(self.stored)}
+        # `last_snapshot_at` too, exactly as the real backend writes it. Its
+        # absence here made the fake unfaithful in the one way that
+        # mattered: the restore gates the whole snapshot on this
+        # timestamp, so a fake that omitted it exercised the gate as a
+        # no-op and every test passed regardless of the rule.
+        self.meta = {
+            "source_node": source_node,
+            "entry_count": len(self.stored),
+            "last_snapshot_at": datetime.now(tz=UTC).isoformat(),
+        }
         return True
 
     async def read_snapshot(self) -> tuple[dict[str, SnapshotEntry], dict[str, Any]]:
         if self.read_result is not None:
             return self.read_result
         return dict(self.stored), dict(self.meta)
+
+    async def read_cluster_view(self) -> tuple[str | None, dict[str, Any]]:
+        # Mirrors the real backend's degradation: a disconnected one publishes
+        # "nothing known", not stale values it can no longer vouch for.
+        if not self.connected:
+            return None, {}
+        return self.lease_holder, dict(self.meta)
 
     async def health(self) -> bool:
         return self.connected
@@ -62,6 +84,26 @@ class FakeBackend(ClusterBackend):
             raise ConnectionError("valkey is unreachable")
         if self.lease_holder is None:
             self.lease_holder = node_id
+        return self.lease_holder == node_id
+
+    async def register_node(self, node_id: str) -> float | None:
+        self.members[node_id] = {"node_id": node_id, "offset_s": self.offset_s}
+        return self.offset_s
+
+    async def read_members(self) -> dict[str, dict]:
+        return dict(self.members)
+
+    async def renew_leadership(self, node_id: str) -> bool:
+        """Renew only -- never take a free lease.
+
+        The asymmetry with `acquire_leadership` above is the whole point of the
+        maintenance hold, so the fake has to model it faithfully: a fake that
+        claimed a free lease here would let a test pass while the real hold
+        failed open, which is the class of unfaithful stub this project has
+        already been bitten by.
+        """
+        if self.lease_raises:
+            raise ConnectionError("valkey is unreachable")
         return self.lease_holder == node_id
 
     async def release_leadership(self, node_id: str) -> None:

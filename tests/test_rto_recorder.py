@@ -187,7 +187,7 @@ def test_reports_no_gaps_for_a_single_run(conn: sqlite3.Connection) -> None:
 
 
 def test_measures_time_until_a_quorum_of_entities_reports(conn: sqlite3.Connection) -> None:
-    """"Usable" is a quorum of the entities that were there before, not a log line."""
+    """ "Usable" is a quorum of the entities that were there before, not a log line."""
     run_start = BASE + timedelta(minutes=11)
     for name in ("light.a", "light.b", "light.c", "light.d"):
         _add_state(conn, name, "on", BASE + timedelta(minutes=5))

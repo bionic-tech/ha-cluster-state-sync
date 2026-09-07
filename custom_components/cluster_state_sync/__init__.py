@@ -19,6 +19,15 @@ Design constraints — read these before changing anything:
   still win, because there the timestamps mean something.
 * Automation double-firing during failover is *not* solved here. That
   needs leader election, which is a v0.2 problem.
+
+
+Copyright (C) 2026 Maurice Manning.
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. It is distributed WITHOUT ANY WARRANTY; see the LICENSE file
+and sections 15 and 16 of that licence.
 """
 
 from __future__ import annotations
@@ -28,6 +37,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 import json
 import logging
+import pathlib
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -42,13 +52,16 @@ from homeassistant.core import (
     CoreState,
     Event,
     HomeAssistant,
+    ServiceCall,
     State,
     callback,
 )
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.typing import ConfigType
 
+from .area import async_assign_area
 from .backend import ClusterBackend, RedisBackend, SnapshotEntry, default_node_id
 from .const import (
     CLOCK_SKEW_TOLERANCE,
@@ -57,6 +70,8 @@ from .const import (
     CONF_EXCLUDE_ENTITIES,
     CONF_FILESET_ENABLED,
     CONF_FILESET_EXCLUSIONS,
+    CONF_FILESET_EXTRA_CUSTOM,
+    CONF_FILESET_EXTRA_PATHS,
     CONF_FILESET_HOT_INTERVAL,
     CONF_FILESET_MAX_BYTES,
     CONF_GATE_AUTOMATIONS,
@@ -79,6 +94,7 @@ from .const import (
     CONF_RESTORE_MAX_AGE,
     CONF_SNAPSHOT_INTERVAL,
     DATA_BACKEND,
+    DATA_CLUSTER_VIEW,
     DATA_CONFIG,
     DATA_COORDINATOR,
     DATA_DEGRADED_MARKER,
@@ -91,6 +107,8 @@ from .const import (
     DEFAULT_CLUSTER_NAMESPACE,
     DEFAULT_FILESET_ENABLED,
     DEFAULT_FILESET_EXCLUSIONS,
+    DEFAULT_FILESET_EXTRA_CUSTOM,
+    DEFAULT_FILESET_EXTRA_PATHS,
     DEFAULT_FILESET_HOT_INTERVAL,
     DEFAULT_FILESET_MAX_BYTES,
     DEFAULT_INCLUDE_DOMAINS,
@@ -103,17 +121,93 @@ from .const import (
     MAX_ATTRIBUTE_BYTES,
     MAX_RESTORE_ENTRIES,
     SENSITIVE_DOMAINS,
+    SERVICE_CLEAR_DEGRADED,
+    SERVICE_FLUSH_SNAPSHOT,
     STALE_SNAPSHOT_FRACTION,
 )
-from .coordinator import BackendHealthCoordinator, SyncStats
+from .coordinator import BackendHealthCoordinator, ClusterViewCoordinator, SyncStats
 from .fileset import FilesetPublisher
 from .gating import ServiceGate
+from .hold import read_hold
 from .leadership import LeadershipMonitor
+from .panel import async_register_panel
 from .util import parse_sentinel_hosts
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.BINARY_SENSOR, Platform.SENSOR]
+PLATFORMS: list[Platform] = [Platform.BINARY_SENSOR, Platform.SENSOR, Platform.SWITCH]
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register the services once, before any entry is set up.
+
+    Quality-scale rule `action-setup`, and it is a real bug rather than
+    paperwork. Registered from `async_setup_entry`, the services disappear the
+    moment the entry unloads -- so an automation calling
+    `cluster_state_sync.flush_snapshot` fails with "unknown service" instead of
+    something that names the actual problem. Registered here they always exist,
+    and calling one with nothing loaded raises an error that says so.
+    """
+    await _async_register_services(hass)
+    return True
+
+
+async def _async_register_services(hass: HomeAssistant) -> None:
+    """Register the two operator actions, once per Home Assistant.
+
+    Both iterate every loaded entry rather than closing over one. A second entry
+    is unusual but not forbidden, and a service that silently acted on whichever
+    one happened to be set up first would be a genuinely nasty surprise.
+    """
+    if hass.services.has_service(DOMAIN, SERVICE_FLUSH_SNAPSHOT):
+        return
+
+    async def _flush_snapshot(_call: ServiceCall) -> None:
+        """Write the snapshot now, if this node is entitled to.
+
+        Leader-gated, exactly as the scheduled flush is. A follower writing is
+        the split-brain this integration exists to prevent, and being asked
+        nicely by an operator does not make it safe -- the peer would have its
+        identity overwritten by a node that does not hold the lease.
+        """
+        acted = False
+        for loaded in hass.config_entries.async_loaded_entries(DOMAIN):
+            runtime = getattr(loaded, "runtime_data", None) or {}
+            leadership = runtime.get(DATA_LEADERSHIP)
+            mirror = runtime.get(DATA_MIRROR)
+            if leadership is None or mirror is None:
+                continue
+            if not await leadership.async_is_leader():
+                raise HomeAssistantError(
+                    "Refusing to flush: this node does not hold cluster leadership. "
+                    "Flushing from a follower would overwrite the leader's snapshot."
+                )
+            await mirror.async_flush()
+            acted = True
+        if not acted:
+            raise HomeAssistantError("No configured Cluster State Sync entry is set up.")
+
+    async def _clear_degraded(_call: ServiceCall) -> None:
+        """Acknowledge the degraded go-bag marker.
+
+        Clears the marker file and the repair issue it raised. It does not fix
+        anything -- the next promotion is what proves the go-bag is healthy
+        again -- so this is an acknowledgement, not a repair, and the marker
+        comes straight back if the underlying condition persists.
+        """
+        marker = pathlib.Path(hass.config.path(DEGRADED_MARKER_NAME))
+
+        def _unlink() -> None:
+            marker.unlink(missing_ok=True)
+
+        await hass.async_add_executor_job(_unlink)
+        for loaded in hass.config_entries.async_loaded_entries(DOMAIN):
+            runtime = getattr(loaded, "runtime_data", None) or {}
+            runtime[DATA_DEGRADED_MARKER] = None
+        ir.async_delete_issue(hass, DOMAIN, "fileset_degraded")
+
+    hass.services.async_register(DOMAIN, SERVICE_FLUSH_SNAPSHOT, _flush_snapshot)
+    hass.services.async_register(DOMAIN, SERVICE_CLEAR_DEGRADED, _clear_degraded)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -180,6 +274,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         DATA_MIRROR: None,
         DATA_STATS: SyncStats(),
     }
+    # Quality-scale `runtime-data`. Kept in hass.data as well, for now, only
+    # because the unload path and several tests still reach for it; the
+    # entry is the source of truth.
+    entry.runtime_data = runtime
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = runtime
 
     # 1. Seed local state from the snapshot BEFORE automations start.
@@ -252,6 +350,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         node_id,
         source=cfg.get(CONF_LEADERSHIP_SOURCE, DEFAULT_LEADERSHIP_SOURCE),
         entity_id=cfg.get(CONF_LEADERSHIP_ENTITY),
+        config_dir=hass.config.path(),
     )
     runtime[DATA_LEADERSHIP] = leadership
 
@@ -349,6 +448,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 node_id=node_id,
                 secret=secret,
                 exclusions=cfg.get(CONF_FILESET_EXCLUSIONS, DEFAULT_FILESET_EXCLUSIONS),
+                extra_paths=(
+                    *cfg.get(CONF_FILESET_EXTRA_PATHS, DEFAULT_FILESET_EXTRA_PATHS),
+                    *cfg.get(CONF_FILESET_EXTRA_CUSTOM, DEFAULT_FILESET_EXTRA_CUSTOM),
+                ),
                 max_bytes=cfg.get(CONF_FILESET_MAX_BYTES, DEFAULT_FILESET_MAX_BYTES),
             )
 
@@ -443,8 +546,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if await leadership.async_is_leader():
             await _final_flush(mirror)
         # Hand the lease back on the way out so the peer promotes immediately
-        # rather than waiting out the TTL.
-        await _release_leadership(backend, node_id)
+        # rather than waiting out the TTL -- unless the operator has said this
+        # is planned work rather than a departure.
+        if not await _hold_blocks_release(hass, hass.config.path(), "shutdown"):
+            await _release_leadership(backend, node_id)
 
     runtime[DATA_UNSUB].append(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _on_stop))
 
@@ -453,7 +558,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = BackendHealthCoordinator(hass, backend)
     await coordinator.async_config_entry_first_refresh()
     runtime[DATA_COORDINATOR] = coordinator
+
+    # The cluster-wide view, from the shared store rather than from this node.
+    # `async_refresh` and not `async_config_entry_first_refresh`: the latter
+    # raises ConfigEntryNotReady on a failed first poll, and these entities are
+    # exactly the ones that should still appear -- reading "unknown" -- when the
+    # backend is unreachable. Failing setup over a diagnostic would hide the
+    # diagnosis.
+    cluster_view = ClusterViewCoordinator(hass, backend, node_id)
+    await cluster_view.async_refresh()
+    runtime[DATA_CLUSTER_VIEW] = cluster_view
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # The sidebar panel. After the platforms, so the entities it discovers
+    # exist by the time anyone can open it, and best-effort inside its own
+    # module: a convenience view must never be able to stop the thing that
+    # keeps the house running from starting.
+    await async_register_panel(hass)
+
+    # File the device under its own area, so the switches -- which are
+    # deliberately not diagnostic, and therefore DO appear on the default
+    # dashboard -- arrive somewhere meaningful rather than loose among the
+    # lamps. After the platforms, because the device does not exist until they
+    # have run. Never overrides an area the operator has chosen.
+    await async_assign_area(hass, entry)
 
     _LOGGER.info(
         "Cluster State Sync ready — node=%s namespace=%s interval=%ds tracking=%d entities",
@@ -461,6 +589,37 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         namespace,
         interval,
         mirror.tracked_count,
+    )
+    return True
+
+
+async def _hold_blocks_release(hass: HomeAssistant, config_dir: str, why: str) -> bool:
+    """Should this shutdown keep the lease rather than hand it back?
+
+    Handing the lease back on a clean stop is right for a shutdown and wrong
+    for a restart, and from inside `_on_stop` the two are indistinguishable --
+    Home Assistant is going away either way. The maintenance hold is the
+    operator saying which one this is.
+
+    This is the most important of the hold's four behaviours: the release
+    happens in milliseconds, long before any promoter tick could intervene, so
+    a hold that suspended the promoter but not this would still hand the
+    cluster away on every restart.
+    """
+    # Executor, not the loop: this is blocking file I/O and Home Assistant
+    # flags it as such. Cheap, but shutdown is exactly when the loop is
+    # busiest.
+    held, raw = await hass.async_add_executor_job(read_hold, config_dir)
+    if not held:
+        return False
+    reason = raw or "no reason given"
+    _LOGGER.warning(
+        "Maintenance hold is set (%s) - keeping the cluster lease through %s "
+        "instead of handing it to the peer. The host-side promoter renews it "
+        "while this node is down, so failover will NOT happen until the hold "
+        "is removed.",
+        reason,
+        why,
     )
     return True
 
@@ -519,7 +678,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # on the one kind of shutdown that was entirely orderly.
         cfg = runtime.get(DATA_CONFIG) or {}
         node_id = cfg.get(CONF_NODE_ID) or default_node_id()
-        await _release_leadership(backend, node_id)
+        if not await _hold_blocks_release(hass, hass.config.path(), "reload"):
+            await _release_leadership(backend, node_id)
         await backend.close()
     return True
 
@@ -762,14 +922,44 @@ async def _restore_from_snapshot(
 
     max_age = cfg.get(CONF_RESTORE_MAX_AGE, DEFAULT_RESTORE_MAX_AGE)
     now = datetime.now(tz=UTC)
-    cutoff = now - timedelta(seconds=max_age)
+
+    # The age gate belongs to the SNAPSHOT, not to each entry in it.
+    #
+    # It used to be per-entry, compared against each entity's own
+    # `last_updated`, and that inverted its purpose. `async_flush` deliberately
+    # skips when nothing has changed, so on a quiet system the entries simply
+    # get older together -- and the states most worth carrying across a
+    # failover are exactly the stable ones: a setpoint that has held all day, a
+    # boolean nobody has touched since Tuesday. Those were discarded while a
+    # sensor that flickered ten seconds ago sailed through.
+    #
+    # Observed on node-b, 2026-09-04, on an ordinary restart: "Restored
+    # NOTHING from a snapshot that held 28 entries. Skipped: 28 too-old." A
+    # perfectly healthy cluster, idle for half an hour, restoring nothing at
+    # all -- and blaming the peer for it.
+    #
+    # What the setting says it is ("Maximum snapshot age to restore") is what
+    # it now does. The freshness comparison that stays per-entry is
+    # `existing.last_updated > entry_updated` below: do not clobber local state
+    # that is newer than the snapshot's. That is a different question and it
+    # was never the broken one.
+    snapshot_at = _parse_entry_timestamp(meta.get("last_snapshot_at", ""))
+    if snapshot_at is not None and snapshot_at < now - timedelta(seconds=max_age):
+        _LOGGER.warning(
+            "Refusing to restore: the shared snapshot was written %.0fs ago, "
+            "against a %ds limit. On an idle cluster this is normal and "
+            "harmless -- nothing changed, so nothing was written. Raise "
+            "`restore_max_age` if this node should still seed from it.",
+            (now - snapshot_at).total_seconds(),
+            max_age,
+        )
+        return
     # One context shared by every state this restore seeds, so the whole
     # operation is attributable in the logbook and distinguishable by
     # automations from a genuine device report (AR-0027).
     context = Context()
     restored = 0
     skipped_local_newer = 0
-    skipped_too_old = 0
     skipped_own_node = 0
     skipped_oversized = 0
     skipped_unparseable = 0
@@ -811,10 +1001,6 @@ async def _restore_from_snapshot(
             # the comparison below stays meaningful.
             clamped_future += 1
             entry_updated = now
-
-        if entry_updated < cutoff:
-            skipped_too_old += 1
-            continue
 
         if not _should_track(entity_id, cfg):
             continue
@@ -866,11 +1052,10 @@ async def _restore_from_snapshot(
         _LOGGER.warning(
             "Restored NOTHING from a snapshot that held %d entries. This node "
             "has promoted with no state from its peer. Skipped: %d local-newer, "
-            "%d too-old, %d own-node, %d oversized, %d unparseable, %d "
+            "%d own-node, %d oversized, %d unparseable, %d "
             "implausibly-future, %d refused.",
             len(entries),
             skipped_local_newer,
-            skipped_too_old,
             skipped_own_node,
             skipped_oversized,
             skipped_unparseable,
@@ -878,31 +1063,35 @@ async def _restore_from_snapshot(
             skipped_refused,
         )
 
-    # AR-0020: make staleness explicit rather than implicit. Entries past
-    # max_age were always skipped, but nothing said how old the surviving ones
-    # were — so a promotion restoring 3-second-old state and one restoring
-    # 29-minute-old state logged identically, and an operator could not tell a
-    # healthy failover from a barely-legal one.
+    # AR-0020: make staleness explicit rather than implicit. A promotion
+    # restoring 3-second-old state and one restoring 29-minute-old state used
+    # to log identically, so an operator could not tell a healthy failover from
+    # a barely-legal one.
     snapshot_age = _snapshot_age_seconds(meta, now)
     age_text = f"{snapshot_age:.0f}s" if snapshot_age is not None else "unknown"
     _LOGGER.info("Snapshot age at restore: %s (max %ds)", age_text, max_age)
     if snapshot_age is not None and snapshot_age > max_age * STALE_SNAPSHOT_FRACTION:
         _LOGGER.warning(
-            "Restored from a STALE snapshot — %.0fs old, against a %ds limit. "
-            "The peer stopped writing well before this node took over; treat "
-            "the restored state as suspect and check why its flush loop "
-            "stopped.",
+            # Deliberately does not accuse the peer. This warning used to say
+            # its flush loop had stopped, and said so about a completely
+            # healthy node: `async_flush` skips when nothing has changed, so an
+            # idle peer stops advancing the timestamp with nothing wrong at
+            # all. The likely innocent cause goes first; the operator can
+            # decide whether their peer should have been busy.
+            "Restored from an AGEING snapshot — %.0fs old, against a %ds "
+            "limit. On a quiet cluster this is expected: nothing changed, so "
+            "nothing was written. Investigate only if the peer should have "
+            "been busy in that window.",
             snapshot_age,
             max_age,
         )
 
     _LOGGER.info(
         "Restored %d entities from snapshot (skipped: %d local-newer, "
-        "%d too-old, %d own-node, %d oversized, %d unparseable, %d "
+        "%d own-node, %d oversized, %d unparseable, %d "
         "implausibly-future, %d refused) — source meta=%s",
         restored,
         skipped_local_newer,
-        skipped_too_old,
         skipped_own_node,
         skipped_oversized,
         skipped_unparseable,

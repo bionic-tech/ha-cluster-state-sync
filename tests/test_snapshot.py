@@ -6,6 +6,7 @@ interval's changes rather than full state. Eight of fifteen personas found it
 independently and nothing in the repository could have caught it, which is the
 entire reason this file exists.
 """
+
 from __future__ import annotations
 
 from datetime import timedelta
@@ -53,9 +54,7 @@ async def setup_integration(
     }
     entry = MockConfigEntry(domain=DOMAIN, data=data)
     entry.add_to_hass(hass)
-    with patch(
-        "custom_components.cluster_state_sync.RedisBackend", return_value=backend
-    ):
+    with patch("custom_components.cluster_state_sync.RedisBackend", return_value=backend):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
     return entry

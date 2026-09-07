@@ -22,6 +22,7 @@ Three sources, matching ADR-001's wizard step 3:
 backend that will not answer — all resolve to "not leader". Assuming leadership
 when you cannot establish it is precisely how you end up with two of them.
 """
+
 from __future__ import annotations
 
 import logging
@@ -34,6 +35,7 @@ from .const import (
     LEADERSHIP_ENTITY,
     LEADERSHIP_LEASE,
 )
+from .hold import is_held
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -51,6 +53,7 @@ class LeadershipMonitor:
         node_id: str,
         source: str,
         entity_id: str | None = None,
+        config_dir: str | None = None,
     ) -> None:
         self._hass = hass
         self._backend = backend
@@ -58,6 +61,10 @@ class LeadershipMonitor:
         self._source = source
         self._entity_id = entity_id
         self._last_known: bool | None = None
+        # Where to look for the maintenance hold. None disables the check
+        # entirely, which is what every existing test and the `always` and
+        # `entity` sources want: the hold only has meaning for the lease.
+        self._config_dir = config_dir
 
     async def async_is_leader(self) -> bool:
         """Resolve leadership, logging transitions but not steady state."""
@@ -106,11 +113,20 @@ class LeadershipMonitor:
 
     async def _from_lease(self) -> bool:
         try:
+            held = self._config_dir is not None and await self._hass.async_add_executor_job(
+                is_held, self._config_dir
+            )
+            if held:
+                # Maintenance hold: renew what we hold, never take what is
+                # free. A standby that claims the lease here is the failover
+                # the operator set the hold to prevent -- and during planned
+                # work a free lease usually means the peer is mid-restart,
+                # not dead. See hold.py.
+                return await self._backend.renew_leadership(self._node_id)
             return await self._backend.acquire_leadership(self._node_id)
         except Exception:  # noqa: BLE001 — a backend that cannot answer is a no
             _LOGGER.warning(
-                "Could not evaluate the cluster lease — treating this node as a "
-                "follower",
+                "Could not evaluate the cluster lease — treating this node as a follower",
                 exc_info=True,
             )
             return False

@@ -30,9 +30,13 @@ from custom_components.cluster_state_sync.const import (
     CONF_NODE_ID,
     CONF_REDIS_HOST,
     CONF_SNAPSHOT_INTERVAL,
+    DATA_DEGRADED_MARKER,
     DATA_FILESET,
+    DATA_LEADERSHIP,
     DEGRADED_MARKER_NAME,
     DOMAIN,
+    SERVICE_CLEAR_DEGRADED,
+    SERVICE_FLUSH_SNAPSHOT,
 )
 
 from .fakes import FakeBackend
@@ -418,15 +422,19 @@ async def test_fileset_age_climbs_after_a_publish_with_no_marker(
     assert hass.states.get(age_id).state not in ("unknown", "unavailable")
     first = float(hass.states.get(age_id).state)
 
-    # Nothing publishes again. `native_value` uses real wall-clock time (like
-    # `LastSnapshotAgeSensor`/`StateMirror` already do), and this harness only
-    # simulates HA's scheduler clock, not the system clock -- so, matching
-    # `test_last_snapshot_age_grows_between_flushes`'s own idiom, this checks
-    # for growth rather than a specific magnitude. The old hardcoded `0.0`
-    # fails this exactly as it should: 0.0 is never greater than 0.0.
-    await advance(hass, seconds=120)
+    # `native_value` measures real wall-clock time since `last_success_at`,
+    # but `advance()` only moves Home Assistant's simulated scheduler clock.
+    # So the two readings were separated by microseconds of real time, and
+    # which came out larger depended on scheduling jitter -- this test failed
+    # intermittently in a full-suite run at 0.0075 vs 0.0051.
+    #
+    # Move the recorded success backwards instead. That is deterministic, and
+    # it tests the property more directly: the sensor reports elapsed time
+    # since a timestamp, not a constant.
+    publisher.last_success_at -= timedelta(seconds=120)
+    await advance(hass, seconds=61)
     second = float(hass.states.get(age_id).state)
-    assert second > first, (first, second)
+    assert second > first + 100, (first, second)
 
 
 async def test_fileset_age_is_unknown_with_no_marker_and_no_publish(
@@ -466,3 +474,165 @@ async def test_fileset_degraded_survives_a_backend_health_coordinator_failure(
     await hass.async_block_till_done()
 
     assert hass.states.get(sensor_id).state == "on"
+
+
+# ---------------------------------------------------------------------------
+# The cluster-wide entities (ADR-006). Everything above this line is local to
+# one node; these read the shared store and must agree across both.
+# ---------------------------------------------------------------------------
+
+
+async def test_the_leader_sensor_names_whoever_holds_the_lease(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """Production change this catches: reporting this node's own id instead of
+    the lease holder's. That version looks perfect on the leader and lies on the
+    standby, which is the node you are looking at when it matters."""
+    backend.lease_holder = "node-b"
+    entry = await setup_integration(hass, backend)
+    state = hass.states.get(entity_id_for(hass, entry, "cluster_leader"))
+    assert state is not None and state.state == "node-b"
+
+
+async def test_is_leader_is_true_only_for_the_node_that_holds_it(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """This node is `node-a`. With `node-b` holding the lease it must read off.
+
+    Production change this catches: comparing against the wrong identity, or
+    returning True whenever any leader exists — which would show both nodes as
+    leader and hide the exact failure the entity exists to reveal.
+    """
+    backend.lease_holder = "node-b"
+    entry = await setup_integration(hass, backend)
+    assert hass.states.get(entity_id_for(hass, entry, "is_leader")).state == "off"
+
+    backend.lease_holder = "node-a"
+    await hass.data[DOMAIN][entry.entry_id]["cluster_view"].async_refresh()
+    await hass.async_block_till_done()
+    assert hass.states.get(entity_id_for(hass, entry, "is_leader")).state == "on"
+
+
+async def test_is_leader_is_unknown_when_nobody_holds_the_lease(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """Not `off`. A backend that cannot answer makes every node look like a
+    follower, and "both nodes say they are not the leader" would then be
+    indistinguishable from a cluster that has genuinely lost one. Unknown says
+    so out loud."""
+    backend.lease_holder = None
+    entry = await setup_integration(hass, backend)
+    assert hass.states.get(entity_id_for(hass, entry, "is_leader")).state == "unknown"
+
+
+async def test_shared_snapshot_age_comes_from_the_store_not_this_node(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """A node that has never flushed still reports the cluster's real freshness.
+
+    Production change this catches: sourcing it from `last_successful_flush`
+    like the local sensor does. That version reads `unknown` forever on a
+    standby — the node whose freshness you most need to know before promoting
+    it.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    written = (datetime.now(tz=UTC) - timedelta(seconds=120)).isoformat()
+    backend.meta = {"source_node": "node-b", "last_snapshot_at": written, "entry_count": 7}
+    entry = await setup_integration(hass, backend)
+
+    state = hass.states.get(entity_id_for(hass, entry, "shared_snapshot_age"))
+    assert state is not None
+    assert 115 < float(state.state) < 125, state.state
+
+    leader = hass.states.get(entity_id_for(hass, entry, "cluster_leader"))
+    assert leader.attributes["snapshot_source"] == "node-b"
+    assert leader.attributes["entry_count"] == 7
+
+
+# ---------------------------------------------------------------------------
+# The two operator actions.
+# ---------------------------------------------------------------------------
+
+
+async def test_flush_snapshot_refuses_on_a_node_that_does_not_lead(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """🚨 The one that matters. A follower writing overwrites the leader's
+    snapshot with its own identity — the split brain this integration exists to
+    prevent — and being asked politely by an operator does not make it safe.
+
+    Production change this catches: dropping the leadership check, or checking
+    it and continuing anyway. Both would leave the service looking like it
+    worked.
+    """
+    from homeassistant.exceptions import HomeAssistantError
+
+    backend.lease_holder = "node-b"  # someone else leads; we are node-a
+    entry = await setup_integration(hass, backend)
+    runtime = hass.data[DOMAIN][entry.entry_id]
+    with patch.object(runtime[DATA_LEADERSHIP], "async_is_leader", return_value=False):
+        with pytest.raises(HomeAssistantError, match="does not hold cluster leadership"):
+            await hass.services.async_call(DOMAIN, SERVICE_FLUSH_SNAPSHOT, {}, blocking=True)
+    assert backend.writes == [], "a follower must not have written anything"
+
+
+async def test_flush_snapshot_writes_when_this_node_leads(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """The positive half — without it the test above is satisfied by a service
+    that refuses unconditionally."""
+    entry = await setup_integration(hass, backend)
+    runtime = hass.data[DOMAIN][entry.entry_id]
+    hass.states.async_set("input_boolean.holiday_mode", "on")
+    await hass.async_block_till_done()
+    with patch.object(runtime[DATA_LEADERSHIP], "async_is_leader", return_value=True):
+        await hass.services.async_call(DOMAIN, SERVICE_FLUSH_SNAPSHOT, {}, blocking=True)
+    assert backend.writes, "a leader's explicit flush must reach the backend"
+
+
+async def test_clear_degraded_removes_the_marker_and_the_repair_issue(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """Production change this catches: deleting the file but leaving the issue,
+    which is the worse half — the operator clears it, the banner stays, and they
+    conclude the service is broken."""
+    from homeassistant.helpers import issue_registry as ir
+
+    marker = pathlib.Path(hass.config.path(DEGRADED_MARKER_NAME))
+    marker.write_text('{"reason": "no_staged_fileset"}', encoding="utf-8")
+    entry = await _setup_entry_with_fileset(hass, backend)
+    assert ir.async_get(hass).async_get_issue(DOMAIN, "fileset_degraded") is not None
+
+    await hass.services.async_call(DOMAIN, SERVICE_CLEAR_DEGRADED, {}, blocking=True)
+    await hass.async_block_till_done()
+
+    assert not marker.exists()
+    assert ir.async_get(hass).async_get_issue(DOMAIN, "fileset_degraded") is None
+    assert hass.data[DOMAIN][entry.entry_id][DATA_DEGRADED_MARKER] is None
+
+
+async def test_the_services_exist_before_any_entry_is_set_up(
+    hass: HomeAssistant,
+) -> None:
+    """Quality-scale `action-setup`, and a real bug rather than paperwork.
+
+    Registered from `async_setup_entry`, the services vanish the moment the
+    entry unloads — so an automation calling them fails with "unknown service"
+    instead of anything that names the actual problem. Registered at component
+    setup they always exist, and calling one with nothing loaded says so.
+
+    Production change this catches: moving the registration back inside
+    `async_setup_entry`.
+    """
+    from homeassistant.exceptions import HomeAssistantError
+    from homeassistant.setup import async_setup_component
+
+    assert await async_setup_component(hass, DOMAIN, {})
+    await hass.async_block_till_done()
+
+    assert hass.services.has_service(DOMAIN, SERVICE_FLUSH_SNAPSHOT)
+    assert hass.services.has_service(DOMAIN, SERVICE_CLEAR_DEGRADED)
+
+    with pytest.raises(HomeAssistantError, match="No configured"):
+        await hass.services.async_call(DOMAIN, SERVICE_FLUSH_SNAPSHOT, {}, blocking=True)

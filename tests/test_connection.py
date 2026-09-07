@@ -4,6 +4,7 @@ These assert on the parameters handed to the redis client rather than on a live
 connection -- what matters is that a TLS-configured entry cannot silently
 produce a plaintext socket.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -50,8 +51,32 @@ async def test_ar_0003_tls_reaches_the_client_when_enabled() -> None:
     kwargs = await captured_direct_kwargs(use_tls=True, tls_ca_certs="/etc/ssl/valkey-ca.pem")
 
     assert kwargs["ssl"] is True
-    assert kwargs["ssl_ca_certs"] == "/etc/ssl/valkey-ca.pem"
     assert kwargs["ssl_cert_reqs"] == "required"
+    # The CA arrives as `ssl_ca_data`, not a path: a path makes `redis` open a
+    # file on the event loop when it builds its SSLContext, which Home
+    # Assistant flags and which was observed stalling the config flow. This
+    # path does not exist in the test environment, so what is asserted here is
+    # that verification is still required -- the CA's *contents* reaching the
+    # client is covered in test_backend_tls.py against a real file.
+    assert kwargs.get("ssl_ca_certs") is None
+
+
+async def test_ar_0003_a_readable_ca_reaches_the_client_as_data(tmp_path) -> None:
+    """The other half of the above: when the CA can actually be read, its bytes
+    must be what the client verifies against.
+
+    Production change that would make this fail: loading the CA and then not
+    passing it -- which would silently downgrade every deployment to the system
+    trust store while still reporting TLS as on.
+    """
+    ca = tmp_path / "valkey-ca.pem"
+    ca.write_text("-----BEGIN CERTIFICATE-----\nfleet-root\n-----END CERTIFICATE-----\n")
+
+    kwargs = await captured_direct_kwargs(use_tls=True, tls_ca_certs=str(ca))
+
+    assert kwargs["ssl"] is True
+    assert kwargs["ssl_cert_reqs"] == "required"
+    assert "fleet-root" in kwargs["ssl_ca_data"]
 
 
 async def test_tls_without_a_ca_still_verifies_against_the_system_store() -> None:
@@ -63,19 +88,24 @@ async def test_tls_without_a_ca_still_verifies_against_the_system_store() -> Non
     assert kwargs["ssl_ca_certs"] is None
 
 
-async def test_ar_0003_tls_reaches_the_sentinel_client() -> None:
+async def test_ar_0003_tls_reaches_the_sentinel_client(tmp_path) -> None:
     """Sentinel mode must get the same treatment as direct mode.
 
     Both the sentinel connections themselves and the resolved master
-    connection need TLS; securing only one leaves the other in the clear.
+    connection need TLS; securing only one leaves the other in the clear. A
+    real CA file here, so this also proves the loaded bytes reach *both* legs
+    -- loading the CA once and passing it to only one of them would leave the
+    other verifying against the system store while reporting TLS as on.
     """
+    ca = tmp_path / "valkey-ca.pem"
+    ca.write_text("-----BEGIN CERTIFICATE-----\nfleet-root\n-----END CERTIFICATE-----\n")
     backend = RedisBackend(
         namespace="testns",
         use_sentinel=True,
         sentinel_hosts=[("valkey-1.invalid", 26379)],
         sentinel_service="valkey-primary",
         use_tls=True,
-        tls_ca_certs="/etc/ssl/valkey-ca.pem",
+        tls_ca_certs=str(ca),
     )
     sentinel = MagicMock()
     sentinel.master_for.return_value = AsyncMock()
@@ -86,11 +116,11 @@ async def test_ar_0003_tls_reaches_the_sentinel_client() -> None:
 
     sentinel_kwargs = sentinel_cls.call_args.kwargs
     assert sentinel_kwargs["ssl"] is True
-    assert sentinel_kwargs["ssl_ca_certs"] == "/etc/ssl/valkey-ca.pem"
+    assert "fleet-root" in sentinel_kwargs["ssl_ca_data"]
 
     master_kwargs = sentinel.master_for.call_args.kwargs
     assert master_kwargs["ssl"] is True
-    assert master_kwargs["ssl_ca_certs"] == "/etc/ssl/valkey-ca.pem"
+    assert "fleet-root" in master_kwargs["ssl_ca_data"]
 
 
 # -- AR-0024: sentinel host parsing ----------------------------------------

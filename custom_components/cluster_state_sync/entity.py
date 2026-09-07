@@ -1,4 +1,5 @@
 """Shared base for the diagnostic entities."""
+
 from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
@@ -8,7 +9,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import StateMirror
 from .const import DOMAIN
-from .coordinator import BackendHealthCoordinator
+from .coordinator import BackendHealthCoordinator, ClusterViewCoordinator
 
 
 class ClusterSyncDiagnosticEntity(CoordinatorEntity[BackendHealthCoordinator]):
@@ -60,6 +61,39 @@ class MirrorBackedEntity(ClusterSyncDiagnosticEntity):
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
-        self.async_on_remove(
-            self._mirror.add_listener(self.async_write_ha_state)
+        self.async_on_remove(self._mirror.add_listener(self.async_write_ha_state))
+
+
+class ClusterViewEntity(CoordinatorEntity[ClusterViewCoordinator]):
+    """A diagnostic entity whose value comes from the shared store.
+
+    Separate from `ClusterSyncDiagnosticEntity` only because it rides a
+    different coordinator. Everything else -- the device it attaches to, the
+    diagnostic category, the unique-id convention -- is deliberately identical,
+    so the two families sit together on one device rather than looking like two
+    integrations.
+
+    These are the entities that read the same on both nodes. That is the point
+    of them: comparing a leader's view with a standby's is how you see a split
+    brain, and you cannot compare two numbers that mean different things on each
+    side.
+    """
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(
+        self,
+        coordinator: ClusterViewCoordinator,
+        entry: ConfigEntry,
+        key: str,
+    ) -> None:
+        super().__init__(coordinator)
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_{key}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=entry.title,
+            manufacturer="Cluster State Sync",
+            entry_type=None,
         )

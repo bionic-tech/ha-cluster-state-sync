@@ -29,8 +29,13 @@ CONF_CLUSTER_SECRET: Final = "cluster_secret"
 CONF_REDIS_USE_TLS: Final = "redis_use_tls"
 CONF_REDIS_TLS_CA_CERTS: Final = "redis_tls_ca_certs"
 CONF_NODE_ID: Final = "node_id"
+CONF_ACCEPT_RISK: Final = "accept_risk"
 CONF_LEADERSHIP_SOURCE: Final = "leadership_source"
 CONF_TOPOLOGY_MODEL: Final = "topology_model"
+#: Removed from the wizard 2026-09-04: collected, stored, and read by nothing.
+#: The constant stays so existing entries that carry the key can still be read
+#: without a KeyError anywhere that enumerates config, and so a future field
+#: does not silently reuse the name for a different meaning.
 CONF_PEER_HOST: Final = "peer_host"
 CONF_HA_CONTAINER: Final = "ha_container"
 # AR-0042: where Home Assistant's config directory lives ON THE HOST, which is
@@ -44,6 +49,35 @@ CONF_BLOCK_DISCOVERY: Final = "block_discovery"
 CONF_DOCKER_NETWORK: Final = "docker_network"
 CONF_HA_UID: Final = "ha_uid"
 CONF_HA_CONTAINER_IP: Final = "ha_container_ip"
+
+# -- how Home Assistant is started and stopped -----------------------------
+#
+# `docker start` is the default because it is the fastest and least surprising
+# thing that can work: it acts on one existing container, needs no project
+# file, and cannot be broken by an unrelated service elsewhere in an estate.
+#
+# Compose mode exists because plenty of installations do not have a container
+# anyone starts by hand -- it is one service in a project, possibly behind a
+# profile, and `docker start` on a container the project has since recreated
+# addresses the wrong thing. Bringing up a whole estate to promote one node is
+# not acceptable either, which is why the service name (and profile) are part
+# of the configuration rather than assumed.
+CONF_HA_START_MODE: Final = "ha_start_mode"
+HA_START_DOCKER: Final = "docker"
+HA_START_COMPOSE: Final = "compose"
+HA_START_MODES: Final = [HA_START_DOCKER, HA_START_COMPOSE]
+DEFAULT_HA_START_MODE: Final = HA_START_DOCKER
+
+CONF_COMPOSE_FILE: Final = "compose_file"
+CONF_COMPOSE_SERVICE: Final = "compose_service"
+CONF_COMPOSE_PROFILE: Final = "compose_profile"
+#: Sourced before every compose call. Compose interpolates the WHOLE project
+#: file before it filters by profile or service, so one unset variable in an
+#: unrelated service aborts the command -- measured on this fleet, where
+#: `--profile automation` still failed on a pgbouncer password. A promoter
+#: running from systemd has none of the operator's shell environment, so
+#: without this compose mode fails at exactly the moment it is needed.
+CONF_COMPOSE_ENV_FILE: Final = "compose_env_file"
 CONF_SETTLE_DELAY: Final = "settle_delay"
 CONF_LEADERSHIP_ENTITY: Final = "leadership_entity"
 CONF_SNAPSHOT_INTERVAL: Final = "snapshot_interval"
@@ -225,11 +259,89 @@ def leader_key(namespace: str) -> str:
     return f"ha:cluster_state_sync:{namespace}:leader"
 
 
+def node_key(namespace: str, node_id: str) -> str:
+    """This node's entry in the cluster registry.
+
+    Nothing anywhere enumerated cluster members before this. Leadership was
+    always answerable -- one key, one holder -- but "who else is in this
+    cluster" had no answer at all, so a node that should not be here (a
+    restored backup on a test box pointed at `prod`, most plausibly) joined
+    silently and began pulling everyone's `.storage`. A registry does not
+    prevent that; it makes it visible, which is the part that was missing.
+    """
+    return f"ha:cluster_state_sync:{namespace}:nodes:{node_id}"
+
+
+def node_key_pattern(namespace: str) -> str:
+    """Every member's key, for the scan that counts them."""
+    return f"ha:cluster_state_sync:{namespace}:nodes:*"
+
+
+#: How long a member's registry entry survives without being refreshed.
+#:
+#: Comfortably more than two `HEALTH_POLL_INTERVAL`s, so a node that misses a
+#: single poll -- a slow backup, a GC pause -- does not flicker out of the
+#: member list and back. Short enough that a node genuinely gone stops being
+#: counted within a few minutes rather than lingering as a phantom member and
+#: making a two-node cluster read as three.
+NODE_REGISTRY_TTL: Final = 180
+
+#: Clock skew above which the restore starts silently refusing entries.
+#:
+#: Not a threshold anyone chose: it is `CLOCK_SKEW_TOLERANCE` above, the point
+#: at which `_restore_from_snapshot` rejects a peer's entries outright as
+#: `skipped_future`. Repeated here as a name so the sensor and the guard cannot
+#: drift apart -- a warning at a number the code no longer uses would be worse
+#: than none.
+CLOCK_SKEW_CRITICAL_SECONDS: Final = CLOCK_SKEW_TOLERANCE
+
+#: Where the sensor starts complaining. Deliberately far below the cliff: 60s
+#: is where the restore is already fully broken, not where it starts to be, and
+#: NTP-disciplined hosts sit in single-digit milliseconds -- so anything near
+#: this is already a fault, not a fluctuation.
+CLOCK_SKEW_WARN_SECONDS: Final = 10
+
+
 # -- Fileset replication (design 2026-08-29) --------------------------------
 
 CONF_FILESET_ENABLED: Final = "fileset_enabled"
 CONF_FILESET_HOT_INTERVAL: Final = "fileset_hot_interval"
 CONF_FILESET_EXCLUSIONS: Final = "fileset_exclusions"
+
+#: Extra paths the operator adds by hand, relative to the config directory.
+#:
+#: The include scan finds everything `configuration.yaml` *references*. It
+#: cannot see what an integration opens by path at runtime -- `python_scripts/`,
+#: `custom_templates/`, ZHA's `zigbee.db`, `known_devices.yaml` -- because
+#: nothing in the YAML mentions them. This is where those go.
+CONF_FILESET_EXTRA_PATHS: Final = "fileset_extra_paths"
+
+#: Free-text paths, for anything the picker did not offer -- a nested directory
+#: like `configs/private`, most likely. Separate from the tick list above
+#: because a single field cannot be both: Home Assistant renders a multi-select
+#: with `custom_value` as a type-to-add chip box, losing the checkboxes that
+#: make a list of found candidates usable.
+CONF_FILESET_EXTRA_CUSTOM: Final = "fileset_extra_custom"
+DEFAULT_FILESET_EXTRA_CUSTOM: Final[tuple[str, ...]] = ()
+
+#: Empty. Guessing on the operator's behalf is how the go-bag ended up carrying
+#: a fixed list that did not match anyone's configuration; the wizard offers
+#: candidates instead, and the operator chooses.
+DEFAULT_FILESET_EXTRA_PATHS: Final[tuple[str, ...]] = ()
+
+#: Offered in the wizard when present in the config directory. Not replicated
+#: unless ticked -- a suggestion, not a default. Drawn from what integrations
+#: are known to read by path, which is exactly the set a parser cannot find.
+FILESET_EXTRA_CANDIDATES: Final[tuple[str, ...]] = (
+    "python_scripts",
+    "custom_templates",
+    "zigbee.db",
+    "known_devices.yaml",
+    "ip_bans.yaml",
+    "ui-lovelace.yaml",
+    "shell_scripts",
+    "templates",
+)
 CONF_FILESET_MAX_BYTES: Final = "fileset_max_bytes"
 CONF_FILESET_STALE_AFTER: Final = "fileset_stale_after"
 
@@ -273,6 +385,15 @@ DATA_MIRROR: Final = "mirror"
 DATA_CONFIG: Final = "config"
 DATA_STATS: Final = "stats"
 DATA_COORDINATOR: Final = "coordinator"
+DATA_CLUSTER_VIEW: Final = "cluster_view"
+
+#: Services. Deliberately only two, and neither of them touches leadership:
+#: the one operator action that bypasses the split-brain guard is
+#: `force-master`, and that stays a host-side file you have to be on the box to
+#: create. A web button for it would be the easiest possible way to end up with
+#: two leaders.
+SERVICE_FLUSH_SNAPSHOT: Final = "flush_snapshot"
+SERVICE_CLEAR_DEGRADED: Final = "clear_degraded"
 DATA_LEADERSHIP: Final = "leadership"
 DATA_GATE: Final = "gate"
 DATA_FILESET: Final = "fileset"

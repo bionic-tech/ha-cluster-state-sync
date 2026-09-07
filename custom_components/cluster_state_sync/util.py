@@ -7,6 +7,7 @@ is the import system telling you the layering is wrong. Parsing a host list
 needs neither the integration's setup module nor a backend, so it lives here
 and both callers import it normally.
 """
+
 from __future__ import annotations
 
 from .const import DEFAULT_SENTINEL_PORT
@@ -50,8 +51,6 @@ def parse_sentinel_hosts(raw: str) -> list[tuple[str, int]]:
                 f"sentinel host {piece!r} has a non-numeric port {port_str!r}"
             ) from err
         if not 1 <= port <= 65535:
-            raise ValueError(
-                f"sentinel host {piece!r} has port {port}, outside 1-65535"
-            )
+            raise ValueError(f"sentinel host {piece!r} has port {port}, outside 1-65535")
         out.append((host, port))
     return out

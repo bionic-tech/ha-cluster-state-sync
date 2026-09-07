@@ -8,6 +8,7 @@ The interim guard from Phase 1 (no `DEL`, so concurrent writers merge instead
 of erasing each other) stays in place underneath. These tests are about not
 having two writers in the first place.
 """
+
 from __future__ import annotations
 
 from datetime import timedelta
@@ -63,9 +64,7 @@ async def setup_integration(
         },
     )
     entry.add_to_hass(hass)
-    with patch(
-        "custom_components.cluster_state_sync.RedisBackend", return_value=backend
-    ):
+    with patch("custom_components.cluster_state_sync.RedisBackend", return_value=backend):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
     return entry
@@ -93,9 +92,7 @@ async def test_default_is_always_leader_for_backwards_compatibility(
     assert backend.writes
 
 
-async def test_ar_0017_follower_does_not_write(
-    hass: HomeAssistant, backend: FakeBackend
-) -> None:
+async def test_ar_0017_follower_does_not_write(hass: HomeAssistant, backend: FakeBackend) -> None:
     """AR-0017 — a node that is not leader must not touch the shared snapshot.
 
     Production change that would make this fail: flushing without consulting
@@ -123,9 +120,7 @@ async def test_ar_0017_follower_does_not_write(
     assert not backend.writes, "a follower must not write to the shared snapshot"
 
 
-async def test_promotion_starts_writing(
-    hass: HomeAssistant, backend: FakeBackend
-) -> None:
+async def test_promotion_starts_writing(hass: HomeAssistant, backend: FakeBackend) -> None:
     """Flipping the leadership signal promotes without a restart.
 
     This is the failover path: Keepalived's notify_master flips the flag and
@@ -153,9 +148,7 @@ async def test_promotion_starts_writing(
     assert backend.writes, "a promoted node must start publishing"
 
 
-async def test_demotion_stops_writing(
-    hass: HomeAssistant, backend: FakeBackend
-) -> None:
+async def test_demotion_stops_writing(hass: HomeAssistant, backend: FakeBackend) -> None:
     """A demoted node must go quiet immediately, not at the next restart."""
     hass.states.async_set("input_boolean.one", "on")
     hass.states.async_set(LEADER_FLAG, "on")
@@ -214,14 +207,26 @@ async def test_lease_holder_writes(hass: HomeAssistant, backend: FakeBackend) ->
     backend.lease_holder = NODE_ID
 
     await setup_integration(hass, backend, **{CONF_LEADERSHIP_SOURCE: LEADERSHIP_LEASE})
+
+    # Change something AFTER setup, so there is unambiguously an unflushed
+    # revision when the interval fires. `async_flush` skips when nothing has
+    # changed, and whether setup's own capture lands before or after the first
+    # flush is a race -- measured at roughly one failure in twelve runs before
+    # this line existed.
+    hass.states.async_set("input_boolean.one", "off")
+    await hass.async_block_till_done()
+    # Two intervals, deliberately. The claim under test is "the lease holder
+    # writes", not "writes within exactly one interval": if the first flush
+    # fires before the lease check has resolved leadership, writing nothing is
+    # correct behaviour, not a regression. Measured at ~1 failure in 20 runs
+    # with a single advance, including run in isolation.
+    await advance(hass)
     await advance(hass)
 
     assert backend.writes
 
 
-async def test_lease_lost_to_peer_stops_writes(
-    hass: HomeAssistant, backend: FakeBackend
-) -> None:
+async def test_lease_lost_to_peer_stops_writes(hass: HomeAssistant, backend: FakeBackend) -> None:
     """Losing the lease to the peer must stop this node writing.
 
     This is the split-brain guard ADR-001 leans on: VRRP alone can dual-master
@@ -233,6 +238,11 @@ async def test_lease_lost_to_peer_stops_writes(
     backend.lease_holder = NODE_ID
 
     await setup_integration(hass, backend, **{CONF_LEADERSHIP_SOURCE: LEADERSHIP_LEASE})
+
+    # As above: guarantee an unflushed change rather than racing setup.
+    hass.states.async_set("input_boolean.one", "off")
+    await hass.async_block_till_done()
+    await advance(hass)
     await advance(hass)
     writes_while_leader = len(backend.writes)
     assert writes_while_leader

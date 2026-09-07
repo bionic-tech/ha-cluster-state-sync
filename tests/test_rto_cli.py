@@ -73,9 +73,7 @@ def test_log_report_names_the_slowest_domains() -> None:
 
 
 def test_log_report_handles_a_log_with_no_startup() -> None:
-    assert "no home assistant startup" in ha_log_rto.format_report(
-        [], budget_seconds=150.0
-    ).lower()
+    assert "no home assistant startup" in ha_log_rto.format_report([], budget_seconds=150.0).lower()
 
 
 def test_log_report_flags_a_run_that_never_finished() -> None:

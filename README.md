@@ -3,6 +3,32 @@
 > **Status**: alpha skeleton — boots, listens, snapshots, restores. Not yet battle-tested.
 > Built for a 2.5-minute failover budget against a Valkey/Redis Sentinel cluster.
 
+> ## ⚠ No warranty — read before installing
+>
+> **This is alpha software and there are no guarantees that it runs.** It is
+> built for Home Assistant, shared with the community for testing and feedback,
+> and it requires exactly that: testing, and feedback. **No guarantees are given
+> on data integrity or on consistency of functionality at this time.**
+>
+> **It restores state to devices that act in the physical world.** The default
+> mirrored domains include `climate`, `water_heater`, `vacuum` and `timer`, so a
+> stale or wrong restore can change your heating setpoint or your hot water —
+> not merely a number on a dashboard. `alarm_control_panel`, `person` and
+> `device_tracker` are **opt-in and off by default**; turn them on and an
+> alarm's state is mirrored too. Decide deliberately what you let it mirror, and
+> test a failover before you depend on one.
+>
+> Provided **as is**, without warranty of any kind, and without liability — see
+> [LICENSE](LICENSE). If losing state, or an entity coming back in the wrong
+> state, would matter to you, do not run this on a system you rely on until you
+> have proven it on one you do not.
+
+
+> **Before changing the restore, the swap, or the bundle, read
+> [`docs/GOTCHAS.md`](docs/GOTCHAS.md).** Fourteen traps this project has
+> actually fallen into, nearly all of which reported success while doing
+> nothing.
+
 ## What this is
 
 A Home Assistant custom integration that:
@@ -80,6 +106,17 @@ decision, the Docker firewall recipe, and the trade-offs.
 
 ## Installation
 
+**Start here: [the installation runbook](docs/RUNBOOK-installation.md)** — requirements
+(including which Home Assistant installation types can run the failover half at
+all), the two setup scenarios, and the order things must be done in.
+
+> **Installation is a file copy, not HACS.** This repository is private, and
+> HACS fetches `manifest.json` and `hacs.json` from `raw.githubusercontent.com`
+> without authentication — which 404s on a private repo, so it cannot install
+> from one. Copy `custom_components/cluster_state_sync/` into your Home
+> Assistant `config/custom_components/` and restart. The `hacs.json` here is
+> kept accurate so that nothing needs doing on the day this goes public.
+
 **Via HACS** (once this repository is added as a custom repository, category
 *Integration*): install it on **both** HA instances, then restart both.
 
@@ -104,7 +141,7 @@ decision, the Docker firewall recipe, and the trade-offs.
 | Node ID | container hostname | Used to attribute state writes; we never restore states this node wrote itself. |
 | Snapshot interval | 5s | How often the buffer flushes to Redis. Lower = less data loss on failover, more write pressure. |
 | Restore max age | 1800s (30m) | Snapshots older than this are ignored on startup. Stops a node coming back after a week from restoring ancient garbage. |
-| Include domains | see `const.py` | Entity domains we mirror. Defaults to stateful things like `input_*`, `alarm_control_panel`, `person`. Edit `DEFAULT_INCLUDE_DOMAINS` to extend. |
+| Include domains | see `const.py` | Entity domains we mirror. Defaults to `input_*`, `counter`, `timer`, `vacuum`, `climate`, `humidifier`, `water_heater`. **`person`, `device_tracker` and `alarm_control_panel` are opt-in** — see `SENSITIVE_DOMAINS`. Edit `DEFAULT_INCLUDE_DOMAINS` to extend. |
 
 ## Sizing & performance
 
@@ -445,6 +482,28 @@ Several design questions are closed and keep getting rediscovered. Before raisin
 blocker, check **[DECISIONS-SETTLED.md](docs/DECISIONS-SETTLED.md)** — it covers the standby
 rebuild, Sentinel, the Valkey placement, the cold-standby default and secret storage.
 
+## Remote access during a failover
+
+**GUIDE-ingress.md** — the
+cluster can promote in 15 seconds and still leave the mobile app dead, because
+nothing about the ingress path follows the lease. Traefik `failover` services,
+the `trusted_proxies` trap, and why the same rule belongs on two hosts.
+
+## The Cluster dashboard
+
+**[docs/GUIDE-dashboard.md](docs/GUIDE-dashboard.md)** — the panel appears in your
+sidebar on its own after install: nothing to paste, no entity names to look up. The
+guide covers what each row means, what each button does, **when not to press it**, and
+what the colours are telling you (plain = safe, amber = changes cluster behaviour,
+red = moves the house to the other machine).
+
+## Something not working?
+
+**[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** — symptom-first, from
+real failures on a live cluster. Start there; two commands at the top catch
+the majority of confusing cases (a Home Assistant restart loop, and two
+integrations claiming one domain).
+
 ## Design documentation
 
 | Document | Covers |
@@ -460,7 +519,84 @@ The adversarial review that drove most of this
 is kept in the repo, along with the closure record
 for all 35 findings.
 
-## License
+## Actions
 
-Apache 2.0 — same as Home Assistant core, so an upstream PR remains
-straightforward.
+Two, and deliberately no more.
+
+| Action | What it does |
+|---|---|
+| `cluster_state_sync.flush_snapshot` | Writes this node's entity state to the shared store immediately, rather than waiting for the next interval. **Refuses on a node that does not hold cluster leadership** — a follower writing would overwrite the leader's snapshot. Does nothing if nothing has changed since the last flush. |
+| `cluster_state_sync.clear_degraded` | Acknowledges the "go-bag was stale or missing at promotion" marker and removes the repair issue it raised. It fixes nothing on its own: the next promotion is what proves the go-bag is healthy, and the marker returns if the condition persists. |
+
+There is **no force-promote action**, on purpose. Forcing a promotion bypasses
+the split-brain guard, so it stays a file you have to be on the host to create —
+`touch /run/cluster-sync/force-master` — and it records the bypass in
+`force-master.used`. A button for it would make "both nodes believe they lead"
+something you could cause by accident from a phone.
+
+Both are also wired to buttons on the generated dashboard
+(`cluster-dashboard.yaml` in the bundle).
+
+> **The promoter ships inside the integration, and is inert there.**
+> `scripts/cluster_promoter.py`, `scripts/resp.py` and `lease.py` live in the
+> package you copy into `custom_components/`, which reads as though installing
+> the integration installs the promoter. It does not. `bundle.py` reads those
+> files with `.read_text()` and emits them as *text* for the operator to install
+> deliberately (ADR-005). The only `import subprocess` in the package is inside
+> scripts the runtime modules never import, so nothing in a running Home
+> Assistant can execute them. Verified independently by homelab, 2026-09-02.
+
+## Removing it
+
+Removing the integration does **not** remove what it generated on the host, and
+nothing else will tell you that.
+
+1. **Delete the config entry** — Settings → Devices & Services → Cluster State
+   Sync → the three-dot menu → Delete. This stops the mirroring and removes the
+   entities and the device.
+2. **Delete the integration folder** — `config/custom_components/cluster_state_sync/`
+   — then restart Home Assistant.
+3. **Stop and remove the host units**, on **both** nodes, if you installed the
+   bundle:
+   ```bash
+   sudo systemctl disable --now cluster-promoter.timer cluster-fileset-pull.timer
+   sudo rm -f /etc/systemd/system/cluster-promoter.{service,timer}
+   sudo rm -f /etc/systemd/system/cluster-fileset-pull.{service,timer}
+   sudo systemctl daemon-reload
+   sudo rm -rf /etc/cluster-sync /run/cluster-sync
+   ```
+   🚨 **Leave the promoter running and you keep a timer taking a lease and
+   restarting Home Assistant on leadership changes, with nothing left to explain
+   why.** This is the step people forget.
+4. **Check the firewall**, for a warm-standby install. If a follower ruleset was
+   loaded, the node is still gated: `sudo nft list ruleset`. The bundle ships
+   `nft-safety-revert.sh` for exactly this.
+5. **Optionally clear the shared store** — the snapshot and go-bag outlive the
+   integration:
+   ```bash
+   redis-cli ... --scan --pattern 'ha:cluster_state_sync:<namespace>:*' | xargs redis-cli ... DEL
+   ```
+
+## Licence
+
+Copyright © 2026 Maurice Manning.
+
+**GNU Affero General Public License v3.0.** See [LICENSE](LICENSE) for the full
+text. Distributed **WITHOUT ANY WARRANTY** — see sections 15 and 16, and the
+warning at the top of this file.
+
+> **What it asks of you, in plain terms.** Run it at home, modify it, take it
+> apart — the licence asks nothing at all. The obligations begin only when
+> *other people* use your version: distribute a modified copy, or let others
+> interact with one over a network (§13), and you must offer them your changes
+> under the same licence.
+>
+> That network clause is the difference between the AGPL and the ordinary GPL,
+> and it is the point: improvements to something people *run* rather than ship
+> should come back.
+
+> **Note on upstreaming.** This section previously read "Apache 2.0 — same as
+> Home Assistant core, so an upstream PR remains straightforward." That is no
+> longer true and the trade was made deliberately: Home Assistant core is
+> Apache-2.0, and AGPL code cannot be merged into it. This integration is a
+> custom component and stays one.

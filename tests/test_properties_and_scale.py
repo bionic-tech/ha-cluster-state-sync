@@ -88,9 +88,7 @@ def test_an_explicit_include_beats_the_domain_list(entity_id: str) -> None:
 
 @settings(max_examples=300)
 @given(entity_id=entity_ids, other=entity_ids)
-def test_excluding_one_entity_never_affects_another(
-    entity_id: str, other: str
-) -> None:
+def test_excluding_one_entity_never_affects_another(entity_id: str, other: str) -> None:
     """A filter that catches more than it names is worse than no filter."""
     from custom_components.cluster_state_sync import _should_track
 

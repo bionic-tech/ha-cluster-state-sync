@@ -2,11 +2,10 @@
   "config": {
     "step": {
       "user": {
-        "title": "Cluster State Sync",
-        "description": "Choose how to connect to your shared state backend. Use Sentinel if you have a Valkey/Redis Sentinel HA cluster (recommended). Use Direct for a single host or a VIP.",
-        "menu_options": {
-          "direct": "Direct (single host / VIP)",
-          "sentinel": "Sentinel (HA cluster)"
+        "title": "Before you install",
+        "description": "**This is alpha software and there are no guarantees that it runs.** It is shared with the Home Assistant community for testing and feedback, and no guarantees are given on data integrity or on consistency of functionality at this time.\n\n**It restores state to devices that act in the physical world.** The default mirrored domains include `climate`, `water_heater`, `vacuum` and `timer` — so a stale or wrong restore can change your heating setpoint or hot water, not just a value on a dashboard. `alarm_control_panel`, `person` and `device_tracker` are **opt-in and off by default**; if you turn them on, an alarm's state is mirrored too.\n\nProvided as is, without warranty and without liability. Prove a failover on a system you do not depend on, before you depend on one.",
+        "data": {
+          "accept_risk": "I understand and accept the risk"
         }
       },
       "direct": {
@@ -14,6 +13,7 @@
         "data": {
           "redis_host": "Host",
           "redis_port": "Port",
+          "redis_username": "Username (leave blank if the server has no ACL user)",
           "redis_password": "Password (leave blank if none)",
           "redis_db": "Database number",
           "cluster_namespace": "Cluster namespace (must match across nodes)",
@@ -21,10 +21,6 @@
           "cluster_secret": "Cluster secret (must be identical on both nodes)",
           "redis_use_tls": "Use TLS",
           "redis_tls_ca_certs": "TLS CA certificate path (blank = system trust store)",
-          "leadership_source": "Leadership signal",
-          "leadership_entity": "Leadership entity (only for the 'entity' signal)",
-          "gate_recorder": "Stop recorder writes on the follower (needs a shared recorder database)",
-          "gate_automations": "Stop automations on the follower (warm standby only)",
           "snapshot_interval": "Snapshot interval (seconds)",
           "restore_max_age": "Maximum snapshot age to restore (seconds)"
         },
@@ -39,6 +35,7 @@
         "data": {
           "redis_sentinel_hosts": "Sentinel hosts (comma-separated host:port)",
           "redis_sentinel_service": "Sentinel master service name",
+          "redis_username": "Username (leave blank if the server has no ACL user)",
           "redis_password": "Password (leave blank if none)",
           "redis_db": "Database number",
           "cluster_namespace": "Cluster namespace (must match across nodes)",
@@ -46,10 +43,6 @@
           "cluster_secret": "Cluster secret (must be identical on both nodes)",
           "redis_use_tls": "Use TLS",
           "redis_tls_ca_certs": "TLS CA certificate path (blank = system trust store)",
-          "leadership_source": "Leadership signal",
-          "leadership_entity": "Leadership entity (only for the 'entity' signal)",
-          "gate_recorder": "Stop recorder writes on the follower (needs a shared recorder database)",
-          "gate_automations": "Stop automations on the follower (warm standby only)",
           "snapshot_interval": "Snapshot interval (seconds)",
           "restore_max_age": "Maximum snapshot age to restore (seconds)"
         },
@@ -68,7 +61,6 @@
           "leadership_entity": "Leadership entity (only for the 'entity' signal)",
           "gate_recorder": "Stop recorder writes on the follower (needs a shared recorder database)",
           "gate_automations": "Stop automations on the follower (warm standby only)",
-          "peer_host": "Peer host (rsync target, e.g. tiger2.lan)",
           "ha_config_path": "Home Assistant config path ON THE HOST (not /config)",
           "ha_container": "Home Assistant container name"
         }
@@ -87,28 +79,85 @@
       },
       "fileset": {
         "title": "Config replication",
-        "description": "Replicate .storage and the config bulk to the standby, so a promoted node keeps its refresh tokens and mobile app registrations. Encrypted with the cluster secret.",
+        "description": "Everything `configuration.yaml` includes is replicated automatically — `configs/`, `themes/`, `packages/` and so on are followed, so you do not list them here.\n\nThis is for what no parser can see: files an integration opens by path at runtime. Anything found in your config directory is offered below; you can also type a path.",
         "data": {
           "fileset_enabled": "Replicate the config fileset to the standby",
           "fileset_hot_interval": "How often to publish .storage (seconds)",
           "fileset_exclusions": "Filename patterns to skip",
+          "fileset_extra_paths": "Also replicate these (tick what a promoted standby needs)",
           "fileset_max_bytes": "Refuse to publish above this many bytes",
-          "fileset_stale_after": "Warn if the standby's copy is older than (seconds)"
+          "fileset_stale_after": "Warn if the standby's copy is older than (seconds)",
+          "fileset_extra_custom": "Additional paths not listed above (type and press enter)"
         }
       },
       "bundle": {
         "title": "Host bundle generated",
-        "description": "Written to:\n`{bundle_path}`\n\nModel: **{model}**\n\n{file_list}\n\nCopy these to `/etc/cluster-sync/` on **both** hosts and read `INSTALL.md` first. The firewall rules were generated without access to your machines and have not been tested — load them with `nft-safety-revert.sh` armed.",
-        "data": {}
+        "description": "Written to:\n`{bundle_path}`\n\nModel: **{model}**\n\n{file_list}\n\n{next_steps}",
+        "menu_options": {
+          "transfer": "Show me how to copy these onto this host",
+          "finish": "Finish — I'll handle the files myself"
+        }
+      },
+      "choose": {
+        "title": "How does this node reach Valkey?",
+        "description": "**Direct** is what almost everyone wants: one Valkey or Redis server, reached by host and port.\n\n**Sentinel** is for a Redis Sentinel cluster that elects its own primary. The code path exists but is **deferred and untested** — choose it only if you already run Sentinel and are willing to be the first to prove it.",
+        "menu_options": {
+          "direct": "Direct — a single Valkey or Redis server",
+          "sentinel": "Sentinel — a Redis Sentinel cluster (untested)"
+        }
+      },
+      "transfer": {
+        "title": "Copying the bundle onto this host",
+        "description": "The bundle was written **inside** Home Assistant's container. It has to reach `/etc/cluster-sync` on the host this container runs on.\n\nLeave all three blank if you are already at a terminal on that host.\n\n🚨 This is about **this** node only. Nine of these files carry this node's identity — installing them on the other node would make it claim this one's id, and both would then believe they lead. The other node runs its own wizard.\n\nNone of these answers is saved.",
+        "data": {
+          "host": "Host address (blank if you are on it already)",
+          "user": "SSH username (blank for your current one)",
+          "key_path": "SSH key path (blank for your default, or if you use a password)"
+        }
+      },
+      "transfer_commands": {
+        "title": "Commands to run",
+        "description": "{commands}\n\nSubmit to go back."
+      },
+      "domains": {
+        "title": "What crosses to the standby",
+        "description": "Which entity domains are mirrored and restored on the node that takes over.\n\nThe defaults are conservative on purpose: stateful things a promoted node needs to know, and nothing whose restore could actuate hardware.\n\n**Adding `light` or `switch` is a real decision.** Restoring one writes a state change, and a state change is what automations trigger on — so a restored value can fire an automation and turn real things on. Check what triggers on them before adding them.\n\n`person`, `device_tracker` and `alarm_control_panel` also tell anyone who can read the shared store when the house is empty. Pair them with TLS and a dedicated user.",
+        "data": {
+          "include_domains": "Entity domains to mirror",
+          "include_entities": "Individual entities to mirror as well (optional)"
+        },
+        "data_description": {
+          "include_domains": "Leave empty to use the built-in defaults.",
+          "include_entities": "Full entity IDs, for one-off entities in a domain you do not want wholesale. They need not exist yet."
+        }
+      },
+      "container": {
+        "title": "How this node starts Home Assistant",
+        "description": "**`docker` — the default, and right for most installs.** The promoter runs `docker start` / `docker stop` on one container. Fast, needs no project file, and nothing else in your estate can break it.\n\n**`compose` — when nobody starts the container by hand.** Home Assistant is one service in a compose project, possibly behind a profile. The promoter acts on that service alone (`up -d --no-deps`), never the whole estate, and stops it with `stop` — never `down`, which would remove the container a demoted node needs in order to be promoted again.\n\n🚨 **Compose mode needs an env file.** Compose interpolates the *entire* project file before it filters by profile or service, so one unset variable in a service you are not touching aborts the command. The promoter runs from systemd with none of your shell environment — without an env file it fails at exactly the moment it is needed.",
+        "data": {
+          "ha_start_mode": "Start method",
+          "compose_file": "Compose file",
+          "compose_service": "Service name",
+          "compose_profile": "Profile (if the service is behind one)",
+          "compose_env_file": "Env file to source before every compose call"
+        },
+        "data_description": {
+          "compose_file": "Full path on the host, e.g. /srv/docker/compose.yml",
+          "compose_service": "The service name in the file, not the container name.",
+          "compose_profile": "Leave empty if you do not use profiles.",
+          "compose_env_file": "Strongly recommended. Sourced and exported before compose runs."
+        }
       }
     },
     "error": {
       "cannot_connect": "Could not reach the backend with these settings.",
       "invalid_namespace": "Namespace must be lowercase letters, digits, '_' or '-' only.",
-      "fileset_needs_secret": "A cluster secret is required to encrypt the replicated fileset. Set one on the backend step before enabling this."
+      "fileset_needs_secret": "A cluster secret is required to encrypt the replicated fileset. Set one on the backend step before enabling this.",
+      "must_accept": "You must accept before continuing. This software carries no warranty."
     },
     "abort": {
-      "already_configured": "This node is already configured for this cluster namespace."
+      "already_configured": "This node is already configured for this cluster namespace.",
+      "reconfigure_successful": "Cluster State Sync reconfigured. The host bundle has been regenerated — reinstall it on this host if any host-side value changed."
     }
   },
   "issues": {
@@ -161,6 +210,21 @@
       },
       "fileset_age": {
         "name": "Fileset age"
+      },
+      "cluster_leader": {
+        "name": "Cluster leader"
+      },
+      "shared_snapshot_age": {
+        "name": "Shared snapshot age"
+      },
+      "cluster_members": {
+        "name": "Cluster members"
+      },
+      "clock_skew": {
+        "name": "Clock skew"
+      },
+      "unreplicated_references": {
+        "name": "Unreplicated config references"
       }
     },
     "binary_sensor": {
@@ -169,6 +233,12 @@
       },
       "fileset_degraded": {
         "name": "Fileset degraded"
+      },
+      "is_leader": {
+        "name": "Is leader"
+      },
+      "maintenance_hold": {
+        "name": "Maintenance hold"
       }
     }
   },
@@ -193,6 +263,22 @@
         "bridge": "bridge — cleanest filtering via DOCKER-USER, needs an mDNS reflector",
         "all": "Not sure — generate all three and choose at install time"
       }
+    },
+    "ha_start_mode": {
+      "options": {
+        "docker": "docker start / docker stop (default)",
+        "compose": "docker compose (one service)"
+      }
+    }
+  },
+  "services": {
+    "flush_snapshot": {
+      "name": "Flush snapshot",
+      "description": "Write this node's entity state to the shared store now. Refuses on a node that does not hold cluster leadership."
+    },
+    "clear_degraded": {
+      "name": "Clear the degraded marker",
+      "description": "Acknowledge the degraded go-bag marker and remove its repair issue. Fixes nothing on its own; the marker returns if the condition persists."
     }
   }
 }

@@ -62,6 +62,29 @@ return 0
 """
 
 
+#: Renew, but never take (the maintenance hold).
+#:
+#: LEASE_SCRIPT's whole trick is that taking and renewing are one call -- the
+#: identity check makes them indistinguishable, which is what keeps a single
+#: definition honest. The hold is the one case that has to tell them apart: a
+#: node under maintenance must keep a lease it already holds, so a restart does
+#: not hand the cluster away, while never claiming one that has come free,
+#: because "come free" during maintenance usually means the peer is mid-restart
+#: rather than dead.
+#:
+#: Note the deliberate asymmetry with LEASE_SCRIPT: a missing key returns 0
+#: here instead of claiming it. That is the entire difference, and it is why
+#: this cannot be expressed as a flag on the other script without making the
+#: common path carry a branch that must never fire.
+RENEW_ONLY_SCRIPT: Final[str] = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    redis.call('PEXPIRE', KEYS[1], ARGV[2])
+    return 1
+end
+return 0
+"""
+
+
 def lease_ttl_ms(ttl_seconds: int) -> str:
     """Redis `PX` takes milliseconds.
 

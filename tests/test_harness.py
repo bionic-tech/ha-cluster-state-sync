@@ -87,3 +87,39 @@ def test_default_include_domains_is_non_empty() -> None:
     """A sanity floor: the default allowlist must actually track something."""
     assert DEFAULT_INCLUDE_DOMAINS
     assert "input_boolean" in DEFAULT_INCLUDE_DOMAINS
+
+
+def test_the_licence_is_agpl_and_carries_no_foreign_copyright() -> None:
+    """The repository has claimed three different licences at various points:
+    Apache-2.0 in the READMEs, MIT in a LICENSE file, and now AGPL-3.0. Only one
+    can be true, and a licence nobody checks is how that happened.
+
+    The foreign-copyright assertion is not hypothetical: the AGPL text this was
+    built from had `Copyright (c) 2023 AUTOMATIC1111` injected into its header
+    by the project it was copied from. Shipping that verbatim would have put
+    someone else's copyright line at the top of our licence.
+    """
+    import pathlib
+
+    text = pathlib.Path(__file__).parent.parent.joinpath("LICENSE").read_text()
+    assert "GNU AFFERO GENERAL PUBLIC LICENSE" in text
+    assert "Version 3, 19 November 2007" in text
+    # The clause that makes it AGPL rather than GPL, and the reason it was chosen.
+    assert "Remote Network Interaction" in text
+    assert "Copyright (C) 2007 Free Software Foundation" in text
+    assert "AUTOMATIC1111" not in text
+    assert "MIT License" not in text
+
+
+def test_no_readme_still_claims_a_different_licence() -> None:
+    """Production change this catches: changing LICENSE and forgetting the
+    prose, which is exactly how this repository ended up asserting Apache-2.0
+    in two READMEs while a MIT LICENSE file sat beside them."""
+    import pathlib
+
+    root = pathlib.Path(__file__).parent.parent
+    for name in ("README.md", "custom_components/cluster_state_sync/README.md"):
+        body = root.joinpath(name).read_text()
+        licence_section = body[body.index("## Licence") :]
+        assert "Affero" in licence_section, name
+        assert "MIT" not in licence_section, name

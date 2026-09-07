@@ -69,3 +69,22 @@ def test_the_ttl_is_expressed_in_milliseconds() -> None:
     """Redis PX takes milliseconds; passing seconds would give a 30ms lease and
     every node would win every race."""
     assert lease.lease_ttl_ms(30) == "30000"
+
+
+def test_renew_only_keeps_a_held_lease_but_never_claims_a_free_one() -> None:
+    """The maintenance hold's primitive (owner ask, 2026-09-03).
+
+    Production change that would make this fail: implementing the hold with
+    LEASE_SCRIPT and a Python-side guard. The guard would run between the GET
+    and the SET, which is the race the Lua exists to close.
+    """
+    script = lease.RENEW_ONLY_SCRIPT
+    assert "PEXPIRE" in script, "must renew a lease it already holds"
+    assert "SET" not in script, "must never claim -- that is the whole point"
+    assert "ARGV[1]" in script, "renewal is identity-checked, like every other path"
+
+
+def test_renew_only_is_not_the_take_or_renew_script() -> None:
+    """They differ by exactly one behaviour and must stay separate definitions."""
+    assert lease.RENEW_ONLY_SCRIPT != lease.LEASE_SCRIPT
+    assert "if current == false" not in lease.RENEW_ONLY_SCRIPT

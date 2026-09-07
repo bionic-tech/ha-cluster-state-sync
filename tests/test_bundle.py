@@ -95,11 +95,74 @@ def test_cold_bundle_has_no_firewall_rules() -> None:
 
 
 def test_cold_notify_scripts_start_and_stop_home_assistant() -> None:
-    """Cold promotion is: start the container. Demotion is: stop it."""
+    """Cold promotion is: start the container. Demotion is: stop it.
+
+    The stop must carry an explicit `-t`. Docker's default grace is 10s, and
+    Home Assistant writes `.storage` as it shuts down (AR-0034), so a default
+    stop SIGKILLs it mid-write. Measured on node-b, 2026-09-04: every
+    demotion ended `Container failed to exit within 10s of signal 15 - using
+    the force`, exit 137, which was misread as the standby crashing.
+    """
+    from custom_components.cluster_state_sync.bundle import (
+        DOCKER_STOP_TIMEOUT_SECONDS,
+    )
+
     bundle = files()
+    stop = f"docker stop -t {DOCKER_STOP_TIMEOUT_SECONDS} homeassistant"
     assert "docker start homeassistant" in bundle["notify_master.sh"]
-    assert "docker stop homeassistant" in bundle["notify_backup.sh"]
-    assert "docker stop homeassistant" in bundle["notify_fault.sh"]
+    assert stop in bundle["notify_backup.sh"]
+    assert stop in bundle["notify_fault.sh"]
+    assert DOCKER_STOP_TIMEOUT_SECONDS > 10, "Docker's default is what broke this"
+
+
+def test_promotion_claims_hardware_before_the_preflight() -> None:
+    """Ordering is the whole point of the pre-start hook, and BOTH orderings
+    matter for different reasons.
+
+    Before `docker start`, because a container's /dev is a snapshot taken at
+    start and a device attached afterwards never appears inside it (GOTCHAS 17).
+    Before the device pre-flight, because the pre-flight DISABLES config entries
+    whose hardware is absent -- so claiming afterwards would let a promoted node
+    disable the very radios it had just acquired.
+
+    Production change this catches: moving the hook below the pre-flight or
+    below `docker start`, either of which reads as harmless.
+    """
+    script = files()["notify_master.sh"]
+    hook = script.index("pre-start.d")
+    preflight = script.index("ha-device-preflight.py")
+    start = script.index("docker start")
+    assert hook < preflight, "hardware must be claimed before the pre-flight"
+    assert preflight < start, "pre-flight must precede the container start"
+
+
+def test_demotion_releases_hardware_after_the_container_stops() -> None:
+    """Release only once nothing is using the device."""
+    script = files()["notify_backup.sh"]
+    assert script.index("docker stop") < script.index("post-stop.d")
+
+
+def test_a_hook_failure_never_blocks_promotion() -> None:
+    """D4's rule, applied to hardware: network-attached devices work whatever
+    happened to a radio, so refusing to promote over an unattached one turns a
+    partial outage into a total one."""
+    script = files()["notify_master.sh"]
+    block = script[script.index("pre-start.d") : script.index("ha-device-preflight.py")]
+    assert "DEGRADED" in block, "a failed hook must say the node is degraded"
+    assert "exit 1" not in block, "a failed hook must not abort the promotion"
+    assert "rc=$?" in block, "capture rc first, or $? reports basename's success"
+
+
+def test_hooks_are_declared_but_never_installed() -> None:
+    """The common case -- USB passed straight through -- must cost nothing and
+    ship no vendor's script. The directory is consulted, not populated."""
+    bundle = files()
+    assert not any("pre-start.d/" in name for name in bundle), (
+        "no hook may ship in the bundle by default"
+    )
+    assert '[[ -d "$HOOKS" ]]' in bundle["notify_master.sh"], (
+        "an absent hook directory must be the ordinary, silent case"
+    )
 
 
 def test_fault_is_treated_as_demotion() -> None:
@@ -1806,7 +1869,10 @@ def test_install_readme_does_not_instruct_manual_wiring_of_the_swap() -> None:
 # so a standby promoted carrying the leader's `node_id` renews the leader's
 # own lease, and the returning leader is told it still holds it. Both nodes
 # then believe they lead, both publish, and each prunes the other's blobs.
-# The same entry also carries `peer_host` (a promoted node whose peer is
+# The same entry also carries `peer_host` -- removed from the wizard in
+# 2026-09 and kept here on purpose: a key nothing collects any more still
+# has to survive the graft, because the rule is whole-entry preservation
+# rather than a list of fields. (A promoted node whose peer is
 # itself), `ha_container_ip` and `ha_config_path`.
 
 
@@ -2855,3 +2921,466 @@ def test_probe_grace_is_actually_emitted(tmp_path) -> None:
     assert result.returncode == 0, result.stderr
     lines = argv_log.read_text().splitlines()
     assert "--probe-grace" in lines, lines
+
+
+# ---------------------------------------------------------------------------
+# The generated Lovelace dashboard.
+# ---------------------------------------------------------------------------
+
+
+def test_the_dashboard_is_valid_yaml_and_calls_only_real_services() -> None:
+    """A dashboard that will not parse is worse than none: the operator pastes
+    it, Home Assistant rejects the whole raw config, and they have lost whatever
+    was there before."""
+    import yaml
+
+    doc = yaml.safe_load(build_bundle(FS)["cluster-dashboard.yaml"])
+    assert isinstance(doc, dict) and doc["views"], doc
+    services = set(re.findall(r"perform_action: (\S+)", build_bundle(FS)["cluster-dashboard.yaml"]))
+    assert services == {
+        "cluster_state_sync.flush_snapshot",
+        "cluster_state_sync.clear_degraded",
+    }, services
+
+
+def test_the_dashboard_hardcodes_no_entity_ids() -> None:
+    """🚨 The reason every card uses a template.
+
+    Entity ids carry the device name as a prefix, and that prefix is NOT stable
+    across a promotion: the standby inherits the leader's entity registry, so a
+    node called node2 serves entities named `..._node1_...` for the rest of its
+    life. A dashboard with ids baked in works on the node it was generated from
+    and is blank on the one you actually need it on at 2am.
+    """
+    body = build_bundle(FS)["cluster-dashboard.yaml"]
+    assert "sensor.cluster" not in body
+    assert "binary_sensor.cluster" not in body
+    assert "selectattr" in body, "cards must find entities by suffix"
+
+
+def test_every_dashboard_template_compiles_and_survives_an_empty_match() -> None:
+    """Parsing is not enough — these blew up on a real Home Assistant while
+    parsing perfectly.
+
+    `| list | first` raises UndefinedError on an empty sequence in Home
+    Assistant's strict template mode, so the `is none` guard that follows never
+    runs. On a node where the integration is not set up, every card that looked
+    up an entity failed outright instead of degrading. Binding through a list
+    and indexing is what makes the guard reachable.
+    """
+    import jinja2
+    import yaml
+
+    doc = yaml.safe_load(build_bundle(FS)["cluster-dashboard.yaml"])
+    env = jinja2.Environment()
+    checked = 0
+    for card in doc["views"][0]["cards"]:
+        for inner in [card, *card.get("cards", [])]:
+            if "content" not in inner:
+                continue
+            env.parse(inner["content"])  # raises TemplateSyntaxError on bad syntax
+            assert "| list | first" not in inner["content"], (
+                "raises on an empty match before the none-guard can run"
+            )
+            checked += 1
+    assert checked >= 3, f"expected several templated cards, found {checked}"
+
+
+# -- host vs container paths (owner incident, 2026-09-03) ---------------------
+
+
+def _tiger2_cfg(**over):
+    cfg = {
+        "topology_model": "cold",
+        "leadership_source": "lease",
+        "node_id": "node-b",
+        "cluster_namespace": "prod",
+        "cluster_secret": "s" * 43,
+        "ha_config_path": "/mnt/docker_data/homeassistant",
+        "ha_container": "home-assistant-2",
+        "redis_host": "valkey.example",
+        "redis_port": 6380,
+        "redis_db": 2,
+        "redis_username": "cluster_state_sync",
+        "redis_password": "pw",
+        "redis_use_tls": True,
+        "redis_tls_ca_certs": "/config/manning-madness-root.crt",
+        "fileset_enabled": True,
+    }
+    cfg.update(over)
+    return cfg
+
+
+def test_the_promoter_gets_a_host_path_for_the_ca_not_a_container_one() -> None:
+    """Production change that would make this fail: passing the stored CA path
+    straight through to cluster-promoter.sh.
+
+    The wizard's CA field is a path inside the container, because that is the
+    only filesystem the integration can validate it against. But
+    cluster-promoter.sh runs python3 on the HOST, and no host here has a
+    /config. Untranslated, load_verify_locations raises FileNotFoundError,
+    run() catches it as an OSError, every tick exits 1, and the lease is never
+    taken -- failover that never happens, with a log line the only symptom.
+    """
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    promoter = build_bundle(_tiger2_cfg())["cluster-promoter.sh"]
+    assert "--tls-ca-file /mnt/docker_data/homeassistant/manning-madness-root.crt" in promoter
+    assert "/config/manning-madness-root.crt" not in promoter
+
+
+def test_the_pull_mounts_the_ca_from_a_host_path() -> None:
+    """Same defect, second victim. `docker run -v` resolves its source on the
+    host; handed one that does not exist, Docker creates an empty DIRECTORY
+    there and mounts it, so the pull verifies TLS against a directory.
+    """
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    pull = build_bundle(_tiger2_cfg())["cluster-fileset-pull.sh"]
+    assert '-v "/mnt/docker_data/homeassistant/manning-madness-root.crt:/ca:ro"' in pull
+    assert '-v "/config/' not in pull
+
+
+def test_tiger1_shape_translates_against_its_own_config_level() -> None:
+    """The two hosts differ by a trailing /config component, so the translation
+    has to use each node's own answer rather than a shared constant."""
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    promoter = build_bundle(_tiger2_cfg(ha_config_path="/mnt/docker_data/homeassistant/config"))[
+        "cluster-promoter.sh"
+    ]
+    assert (
+        "--tls-ca-file /mnt/docker_data/homeassistant/config/manning-madness-root.crt" in promoter
+    )
+
+
+def test_a_ca_outside_the_config_dir_is_left_alone() -> None:
+    """A system trust-store path means the same thing on both sides; rewriting
+    it would break a deployment that was already correct."""
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    promoter = build_bundle(_tiger2_cfg(redis_tls_ca_certs="/etc/ssl/certs/ca-certificates.crt"))[
+        "cluster-promoter.sh"
+    ]
+    assert "--tls-ca-file /etc/ssl/certs/ca-certificates.crt" in promoter
+
+
+def test_no_ha_config_path_leaves_the_ca_untranslated() -> None:
+    """With nothing to translate against, a guess is worse than the original."""
+    from custom_components.cluster_state_sync.bundle import _host_path
+
+    assert _host_path({}, "/config/ca.crt") == "/config/ca.crt"
+    assert _host_path({"ha_config_path": ""}, "/config/ca.crt") == "/config/ca.crt"
+
+
+# -- install.sh (owner ask, 2026-09-03) ---------------------------------------
+
+
+def test_the_bundle_ships_an_installer() -> None:
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    assert "install.sh" in build_bundle(_tiger2_cfg())
+
+
+def test_the_installer_adopts_before_it_enables_the_promoter() -> None:
+    """Production change that would make this fail: moving --adopt after the
+    timer is enabled, or dropping it.
+
+    This is the whole reason the installer exists rather than a list of
+    commands. decide() acts on a CHANGE of the lease outcome, and a fresh
+    install has no vrrp-state, so the first tick calls the status quo a
+    transition and runs the notify script for it. On the node that already
+    leads that is notify_master.sh: a fileset swap and a device pre-flight
+    rewriting .storage underneath a Home Assistant that never stopped.
+    """
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    script = build_bundle(_tiger2_cfg())["install.sh"]
+    adopt_at = script.index("cluster-promoter.sh --adopt")
+    enable_at = script.index("systemctl enable --now cluster-promoter.timer")
+    assert adopt_at < enable_at, "the installer arms the promoter before seeding its state"
+
+
+def test_the_installer_refuses_a_config_path_with_no_storage() -> None:
+    """The `…/homeassistant` vs `…/homeassistant/config` slip, caught at install
+    time rather than at the first promotion that silently writes nowhere."""
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    script = build_bundle(_tiger2_cfg())["install.sh"]
+    assert "/mnt/docker_data/homeassistant/.storage" in script
+    assert "-type d -name .storage" in script, "offers a way to find the right one"
+
+
+def test_the_installer_checks_the_ca_is_readable_from_the_host() -> None:
+    """A container path that reached a host-side script is silent everywhere
+    else: the promoter exits 1 every tick and never promotes."""
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    script = build_bundle(_tiger2_cfg())["install.sh"]
+    assert "-r /mnt/docker_data/homeassistant/manning-madness-root.crt" in script
+
+
+def test_the_installer_has_a_dry_run() -> None:
+    """Nobody should run a stranger's install script without seeing what it
+    does first -- ADR-005's argument, applied to our own install step."""
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    script = build_bundle(_tiger2_cfg())["install.sh"]
+    assert "--dry-run" in script
+    assert "DRY_RUN" in script
+
+
+def test_an_installer_with_no_timers_says_so_rather_than_adopting() -> None:
+    """With fileset off there is no promoter and no pull, so there is no first
+    tick to protect and nothing to enable. The installer must not pretend."""
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    script = build_bundle(_tiger2_cfg(fileset_enabled=False))["install.sh"]
+    assert "--adopt" not in script
+    assert "systemctl enable --now" not in script
+    assert "no promoter" in script
+
+
+def test_the_generated_installer_is_valid_bash() -> None:
+    """Production change that would make this fail: any quoting slip in the
+    generator. One already shipped -- an unquoted `;` terminating a `-exec`,
+    which would have ended the wrapper call instead of the find."""
+    import shutil
+    import subprocess
+
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover - bash is present everywhere we run
+        pytest.skip("bash not available")
+
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    for cfg in (
+        _tiger2_cfg(),
+        _tiger2_cfg(fileset_enabled=False),
+        _tiger2_cfg(topology_model="warm"),
+    ):
+        script = build_bundle(cfg)["install.sh"]
+        proc = subprocess.run(
+            [bash, "-n"], input=script, text=True, capture_output=True, check=False
+        )
+        assert proc.returncode == 0, proc.stderr
+
+
+def test_the_installer_verifies_the_d3_probe_target() -> None:
+    """Production change that would make this fail: dropping the probe check.
+
+    A node that fails the D3 probe RELEASES the lease and demotes, and
+    notify_backup.sh stops the container. So a probe that cannot reach Home
+    Assistant does not merely fail to protect it -- it stops it, for the
+    hold-down, repeatedly. Arming the timer without checking the URL first is
+    scheduling an outage.
+    """
+    from custom_components.cluster_state_sync.bundle import (
+        PROMOTER_RELEASE_HOLDDOWN_SECONDS,
+        build_bundle,
+    )
+
+    script = build_bundle(_tiger2_cfg())["install.sh"]
+    assert "http://127.0.0.1:8123/" in script
+    # Read from the constant, not typed again. A literal here is what let the
+    # installer keep advertising 900s after the promoter moved to 180.
+    assert str(int(PROMOTER_RELEASE_HOLDDOWN_SECONDS)) in script, (
+        "says how long a failed probe keeps HA stopped"
+    )
+
+
+def test_the_installer_probes_the_container_ip_when_one_is_set() -> None:
+    """A published port rather than network_mode host means loopback on the
+    host is not where Home Assistant answers."""
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    script = build_bundle(_tiger2_cfg(ha_container_ip="10.0.0.9"))["install.sh"]
+    assert "http://10.0.0.9:8123/" in script
+
+
+def test_the_installers_holddown_matches_the_promoters() -> None:
+    """The installer quotes this number to the operator as the cost of a failed
+    probe. A drift would make it lie."""
+    from custom_components.cluster_state_sync.bundle import (
+        PROMOTER_PROBE_GRACE_SECONDS,
+        PROMOTER_RELEASE_HOLDDOWN_SECONDS,
+    )
+    from custom_components.cluster_state_sync.scripts.cluster_promoter import (
+        DEFAULT_PROBE_GRACE_SECONDS,
+        DEFAULT_RELEASE_HOLDDOWN_SECONDS,
+    )
+
+    assert PROMOTER_RELEASE_HOLDDOWN_SECONDS == DEFAULT_RELEASE_HOLDDOWN_SECONDS
+    assert PROMOTER_PROBE_GRACE_SECONDS == DEFAULT_PROBE_GRACE_SECONDS
+
+
+def test_install_md_leads_with_the_installer_it_ships() -> None:
+    """Production change that would make this fail: adding install.sh to the
+    bundle without telling the operator it exists.
+
+    INSTALL.md handed over sixteen sudo commands and did not mention the script
+    that runs them, which is how a generated installer ends up unused.
+    """
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    md = build_bundle(_tiger2_cfg())["INSTALL.md"]
+    assert "./install.sh --dry-run" in md
+    assert md.index("install.sh") < md.index("sudo mkdir -p"), (
+        "the installer must come before the manual commands, not after"
+    )
+    assert "standby first" in md, "the install order between hosts is load-bearing"
+
+
+def test_the_swap_refuses_while_the_container_is_running() -> None:
+    """Production change that would make this fail: dropping the guard.
+
+    The cold model's promotion path is swap -> pre-flight -> docker start, and
+    every step assumes nothing holds .storage open. A standby whose Home
+    Assistant is still up -- left running after setup, most likely -- keeps
+    those files in memory and rewrites them on its own shutdown (AR-0034), so
+    the swap lands and is then silently undone. The node comes up on its own
+    old identity behind a successful promotion and a clean log.
+
+    Refusing is the safe direction: D4 already accommodates a degraded
+    promotion and marks it. Swapping under a live process is data loss.
+    """
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    swap = build_bundle(_tiger2_cfg())["cluster-fileset-swap.sh"]
+    assert "{{.State.Running}}" in swap
+    assert 'mark "container_running"' in swap
+    # Before anything *uses* the staged copy. `STAGED=` is assigned at the top
+    # of the script, so the meaningful anchor is the first swap_dir call, not
+    # the variable.
+    assert swap.index("State.Running") < swap.index("if ! swap_dir"), (
+        "the guard must come before anything touches .storage"
+    )
+
+
+def test_the_swap_guard_names_this_nodes_own_container() -> None:
+    """Two nodes routinely differ here -- homeassistant vs home-assistant-2 --
+    and a guard checking the wrong name would pass while the real container
+    ran."""
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    swap = build_bundle(_tiger2_cfg())["cluster-fileset-swap.sh"]
+    assert "CONTAINER=home-assistant-2" in swap
+
+
+def test_the_swap_installs_whatever_was_staged_not_a_fixed_list() -> None:
+    """Production change that would make this fail: hardcoding the install set
+    again.
+
+    This was the third allow-list in one path, and the last to be found. The
+    publisher followed the config's includes, the pull staged every file
+    faithfully — and the swap installed only `custom_components www blueprints`
+    plus seven top-level YAMLs. node-b promoted into recovery mode with
+    `configs/customize.yaml` sitting in `.cluster_sync_staged` the whole time.
+
+    What the leader publishes varies per deployment, so the swap cannot know
+    the set in advance. It has to read it.
+    """
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    swap = build_bundle(_tiger2_cfg())["cluster-fileset-swap.sh"]
+    assert 'for d in $(cd "$STAGED/storage"' in swap
+    assert 'for f in $(cd "$STAGED/storage"' in swap
+    # The old fixed lists must be gone, or a partial revert would look fine.
+    assert "for d in custom_components www blueprints" not in swap
+    assert "for f in configuration.yaml automations.yaml" not in swap
+
+
+def test_the_swap_still_handles_storage_separately() -> None:
+    """`.storage` carries the identity graft, so it must not be swept up by the
+    generic directory loop and installed twice."""
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    swap = build_bundle(_tiger2_cfg())["cluster-fileset-swap.sh"]
+    assert 'swap_dir "$STAGED/storage/.storage" "$CONFIG/.storage"' in swap
+    assert '[[ "$d" == ".storage" ]] && continue' in swap
+
+
+# -- compose-managed Home Assistant ----------------------------------------
+
+
+def _compose_cfg(**over):
+    cfg = _tiger2_cfg()
+    cfg.update(
+        {
+            "ha_start_mode": "compose",
+            "compose_file": "/srv/docker-compose.yml",
+            "compose_service": "home-assistant",
+        }
+    )
+    cfg.update(over)
+    return cfg
+
+
+def test_docker_start_remains_the_default() -> None:
+    """The fastest, least surprising thing that can work.
+
+    It acts on one existing container, needs no project file, and cannot be
+    broken by an unrelated service elsewhere in someone's estate.
+    """
+    scripts = files()
+    assert "docker start" in scripts["notify_master.sh"]
+    assert "docker compose" not in scripts["notify_master.sh"]
+
+
+def test_compose_mode_acts_on_one_service_never_the_estate() -> None:
+    """Bringing up a whole estate to promote one node is not acceptable.
+
+    Production change this catches: dropping the service name, or losing
+    `--no-deps`, either of which turns a promotion into "start everything".
+    """
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    master = build_bundle(_compose_cfg())["notify_master.sh"]
+    assert "docker compose" in master
+    assert "up -d --no-deps home-assistant" in master, "one service, no dependencies"
+
+
+def test_compose_mode_honours_a_profile() -> None:
+    """A service behind a profile is invisible to compose without it."""
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    master = build_bundle(_compose_cfg(compose_profile="automation"))["notify_master.sh"]
+    assert "--profile automation" in master
+
+
+def test_compose_demotion_stops_and_never_downs() -> None:
+    """`down` removes containers and networks, and with a stray flag, volumes.
+
+    A demoted node must be promotable again in ten seconds, not rebuilt.
+    """
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    backup = build_bundle(_compose_cfg())["notify_backup.sh"]
+    assert "compose" in backup and " stop " in backup
+    assert " down" not in backup, "demotion must never tear the service down"
+
+
+def test_compose_promotion_uses_up_not_start() -> None:
+    """A node that has never led may have no container at all, and `start`
+    cannot create one. `up -d` also applies configuration changed since --
+    which is how a /dev/serial mount a promoted node needs actually arrives.
+    """
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    master = build_bundle(_compose_cfg())["notify_master.sh"]
+    assert "up -d" in master
+    assert "compose start" not in master
+
+
+def test_the_env_file_is_sourced_and_exported() -> None:
+    """Compose interpolates the WHOLE project file before it filters by profile
+    or service, so one unset variable in a service you are not touching aborts
+    the command -- measured on this fleet, where `--profile automation` still
+    failed on a pgbouncer password three services away. A promoter started by
+    systemd has none of the operator's shell environment.
+    """
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    master = build_bundle(_compose_cfg(compose_env_file="/srv/.env"))["notify_master.sh"]
+    assert "set -a" in master and "/srv/.env" in master, "env must be sourced AND exported"
+    assert master.index("set -a") < master.index("docker compose"), "sourced before use"

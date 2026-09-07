@@ -17,9 +17,15 @@ import sys
 
 import pytest
 
-from custom_components.cluster_state_sync.lease import FORCE_SCRIPT, LEASE_SCRIPT, RELEASE_SCRIPT
+from custom_components.cluster_state_sync.lease import (
+    FORCE_SCRIPT,
+    LEASE_SCRIPT,
+    RELEASE_SCRIPT,
+    RENEW_ONLY_SCRIPT,
+)
 from custom_components.cluster_state_sync.scripts import cluster_promoter
 from custom_components.cluster_state_sync.scripts.cluster_promoter import (
+    adopt,
     decide,
     main,
     read_state,
@@ -859,13 +865,77 @@ def test_a_standby_with_a_dead_ha_can_still_take_a_free_lease_and_promote(
 # -- M3: the release hold-down ------------------------------------------------
 
 
+def test_releasing_the_lease_says_why(tmp_path: pathlib.Path, capsys) -> None:
+    """The promoter's most consequential act must not be silent.
+
+    Releasing drops the lease and `notify_backup.sh` then stops Home
+    Assistant. Until 2026-09-05 this branch printed nothing, and
+    reconstructing a live flap meant inferring releases from a container exit
+    code hours later. Production change this catches: removing the message, or
+    releasing before emitting it.
+    """
+    state = tmp_path / "vrrp-state"
+    state.write_text("MASTER\n")
+    _backdate(state, 10_000)  # grace long expired
+    client = FakeClient(holds=True)
+
+    rc = run(
+        client,
+        namespace=NAMESPACE,
+        node_id=NODE,
+        ttl=30,
+        state_path=state,
+        install_dir=tmp_path,
+        force_path=tmp_path / "force-master",
+        runner=_runner([], state),
+        holddown_path=tmp_path / "release-holddown",
+        probe=lambda _u, _t: False,  # Home Assistant is silent
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "RELEASING the lease" in err, "the release must announce itself"
+    assert "--adopt" in err, "must say how to clear the hold-down it just wrote"
+
+
+def test_a_held_down_node_says_why_it_is_not_taking(tmp_path: pathlib.Path, capsys) -> None:
+    """A node sitting at BACKUP beside a free lease looks identical to one that
+    has not noticed. The hold-down is the whole explanation, so it must say so."""
+    state = tmp_path / "vrrp-state"
+    state.write_text("BACKUP\n")
+    holddown = tmp_path / "release-holddown"
+    holddown.touch()
+
+    rc = run(
+        FakeClient(holds=True),  # the lease IS free and grantable
+        namespace=NAMESPACE,
+        node_id=NODE,
+        ttl=30,
+        state_path=state,
+        install_dir=tmp_path,
+        force_path=tmp_path / "force-master",
+        runner=_runner([]),
+        holddown_path=holddown,
+        probe=lambda _u, _t: False,
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "NOT taking the free lease" in err
+    assert "--adopt" in err
+
+
 def test_a_recent_release_holds_down_the_next_take(tmp_path: pathlib.Path) -> None:
     """Without this, release (above) writes BACKUP, this node's very next
     tick sees `previous == "BACKUP"`, takes the lease it just freed, and
     promotes -- with the peer down, a perpetual cycle that re-runs the
     fileset swap on every lap. Production change this catches: dropping the
     hold-down check, or gating it on the wrong `previous` value so it also
-    blocks renewal."""
+    blocks renewal.
+
+    The tick does NOT consult the probe here, and must not: see
+    `test_the_probe_cannot_clear_a_hold_down`. This asserts the plain M3
+    behaviour -- a marker inside its window refuses the take, whatever Home
+    Assistant is or is not doing.
+    """
     state = tmp_path / "vrrp-state"
     state.write_text("BACKUP\n")
     holddown = tmp_path / "release-holddown"
@@ -873,8 +943,11 @@ def test_a_recent_release_holds_down_the_next_take(tmp_path: pathlib.Path) -> No
     client = FakeClient(holds=True)  # the lease IS free and grantable
     ran: list[list[str]] = []
 
-    def must_not_be_called(_url: str, _timeout: float) -> bool:
-        raise AssertionError("a held-down tick must never consult the probe either")
+    probed: list[bool] = []
+
+    def still_wedged(_url: str, _timeout: float) -> bool:
+        probed.append(True)
+        return False
 
     rc = run(
         client,
@@ -887,11 +960,12 @@ def test_a_recent_release_holds_down_the_next_take(tmp_path: pathlib.Path) -> No
         runner=_runner(ran),
         holddown_path=holddown,
         release_holddown=900,
-        probe=must_not_be_called,
+        probe=still_wedged,
     )
     assert rc == 0
     assert ran == [], "must not promote while held down"
     assert client.calls == [], "must refuse to even attempt the take"
+    assert holddown.exists(), "the marker must survive to block the next tick"
 
 
 def test_a_hold_down_past_its_window_allows_the_take(tmp_path: pathlib.Path) -> None:
@@ -1136,3 +1210,577 @@ def test_the_promoters_dependency_chain_imports_nothing_but_stdlib_and_siblings(
 
     disallowed = imported - set(sys.stdlib_module_names) - allowed_siblings
     assert not disallowed, disallowed
+
+
+# -- adopt(): arming the timer must not itself be a promotion ------------------
+
+
+class ObservingClient:
+    """Answers GET, and records every eval so a test can prove none happened."""
+
+    def __init__(self, holder: str | None) -> None:
+        self.holder = holder
+        self.gets: list[str] = []
+        self.evals: list[tuple[str, list[str], list[str]]] = []
+
+    def get(self, key: str) -> str | None:
+        self.gets.append(key)
+        return self.holder
+
+    def eval(self, script: str, keys: list[str], args: list[str]) -> int:
+        self.evals.append((script, keys, args))
+        return 1
+
+    def close(self) -> None: ...
+
+
+def test_adopt_records_master_when_this_node_already_holds_the_lease(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The case that makes install.sh safe on a live primary.
+
+    Without a seeded state file the first tick reads previous == "" , calls the
+    status quo a transition into MASTER, and runs notify_master.sh -- a fileset
+    swap and a device pre-flight rewriting .storage under a Home Assistant that
+    never stopped.
+    """
+    state = tmp_path / "run" / "vrrp-state"
+    client = ObservingClient(holder=NODE)
+
+    assert adopt(client, namespace=NAMESPACE, node_id=NODE, state_path=state) == 0
+    assert state.read_text().strip() == "MASTER"
+
+
+def test_adopt_records_backup_when_the_peer_holds_the_lease(
+    tmp_path: pathlib.Path,
+) -> None:
+    state = tmp_path / "vrrp-state"
+    client = ObservingClient(holder="tiger2-def456")
+
+    assert adopt(client, namespace=NAMESPACE, node_id=NODE, state_path=state) == 0
+    assert state.read_text().strip() == "BACKUP"
+
+
+def test_adopt_records_backup_when_nobody_holds_the_lease(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Production change that would make this fail: treating an unheld lease as
+    "then it must be mine".
+
+    read_state() already refuses to default to MASTER for exactly this reason —
+    a node that claims leadership because it could not establish otherwise is
+    the split brain. Seeding BACKUP costs one ordinary tick, which then takes
+    the lease through the tested path.
+    """
+    state = tmp_path / "vrrp-state"
+    client = ObservingClient(holder=None)
+
+    assert adopt(client, namespace=NAMESPACE, node_id=NODE, state_path=state) == 0
+    assert state.read_text().strip() == "BACKUP"
+
+
+def test_adopt_never_touches_the_lease(tmp_path: pathlib.Path) -> None:
+    """Production change that would make this fail: implementing adopt with
+    LEASE_SCRIPT instead of GET.
+
+    Taking the lease on a standby IS the promotion this exists to avoid, and
+    even renewing it on the leader would extend a TTL on the strength of an
+    install step rather than a health check.
+    """
+    for holder in (NODE, "someone-else", None):
+        client = ObservingClient(holder=holder)
+        adopt(
+            client,
+            namespace=NAMESPACE,
+            node_id=NODE,
+            state_path=tmp_path / f"state-{holder}",
+        )
+        assert client.evals == [], f"adopt evaluated a script with holder={holder!r}"
+        assert client.gets == [f"ha:cluster_state_sync:{NAMESPACE}:leader"]
+
+
+def test_adopt_runs_no_notify_script(tmp_path: pathlib.Path) -> None:
+    """adopt() has no runner argument at all, so there is nothing to call —
+    this asserts the signature stays that way."""
+    import inspect
+
+    assert "runner" not in inspect.signature(adopt).parameters
+    assert "install_dir" not in inspect.signature(adopt).parameters
+
+
+def test_adopt_reports_failure_rather_than_leaving_no_state(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Production change that would make this fail: letting a ValkeyError escape.
+
+    install.sh gates enabling the timer on this exiting 0. A traceback that
+    left no state file, with the installer carrying on regardless, would arm a
+    timer whose first tick promotes — the precise outcome adopt exists to
+    prevent.
+    """
+    state = tmp_path / "vrrp-state"
+
+    class DeadClient:
+        def get(self, key: str) -> str | None:
+            raise RespError("connection refused")
+
+        def close(self) -> None: ...
+
+    assert adopt(DeadClient(), namespace=NAMESPACE, node_id=NODE, state_path=state) == 1
+    assert not state.exists()
+
+
+# -- the maintenance hold (owner ask, 2026-09-03) ------------------------------
+
+
+class HoldClient:
+    """Records which script was evaluated, so a test can prove which path ran."""
+
+    def __init__(self, holder: str | None) -> None:
+        self.holder = holder
+        self.scripts: list[str] = []
+
+    def eval(self, script: str, keys: list[str], args: list[str]) -> int:
+        self.scripts.append(script)
+        if script == RENEW_ONLY_SCRIPT:
+            return 1 if self.holder == args[0] else 0
+        if script == LEASE_SCRIPT:
+            if self.holder is None:
+                self.holder = args[0]
+            return 1 if self.holder == args[0] else 0
+        return 1
+
+    def close(self) -> None: ...
+
+
+def _hold(tmp_path: pathlib.Path, text: str = "") -> pathlib.Path:
+    f = tmp_path / ".cluster_sync_hold"
+    f.write_text(text)
+    return f
+
+
+def test_a_held_leader_renews_and_never_demotes(tmp_path: pathlib.Path) -> None:
+    """The point of the hold: a planned restart must not cost leadership.
+
+    Production change that would make this fail: letting the D3 probe run under
+    a hold. The leader's Home Assistant is deliberately down during planned
+    work, so the probe would fail, release, and demote -- exactly the failover
+    the operator set the hold to prevent.
+    """
+    state = tmp_path / "vrrp-state"
+    state.write_text("MASTER\n")
+    recorded: list[list[str]] = []
+    client = HoldClient(holder=NODE)
+
+    rc = cluster_promoter.run(
+        client,
+        namespace=NAMESPACE,
+        node_id=NODE,
+        ttl=30,
+        state_path=state,
+        install_dir=tmp_path,
+        force_path=tmp_path / "force-master",
+        runner=_runner(recorded),
+        hold_path=_hold(tmp_path),
+        probe=lambda _u, _t: False,  # HA is down: without the hold this demotes
+        probe_grace=0,
+    )
+    assert rc == 0
+    assert recorded == [], "a held node must run no notify script"
+    assert client.scripts == [RENEW_ONLY_SCRIPT]
+    assert state.read_text().strip() == "MASTER", "still the leader"
+
+
+def test_a_held_standby_refuses_a_free_lease(tmp_path: pathlib.Path) -> None:
+    """During planned work a free lease usually means the peer is mid-restart,
+    not dead. Taking it is the failover the hold exists to stop."""
+    state = tmp_path / "vrrp-state"
+    state.write_text("BACKUP\n")
+    recorded: list[list[str]] = []
+    client = HoldClient(holder=None)  # nobody holds it
+
+    rc = cluster_promoter.run(
+        client,
+        namespace=NAMESPACE,
+        node_id=NODE,
+        ttl=30,
+        state_path=state,
+        install_dir=tmp_path,
+        force_path=tmp_path / "force-master",
+        runner=_runner(recorded),
+        hold_path=_hold(tmp_path),
+    )
+    assert rc == 0
+    assert recorded == [], "a held standby must not promote"
+    assert client.scripts == [RENEW_ONLY_SCRIPT], "renew-only, never LEASE_SCRIPT"
+    assert client.holder is None, "the free lease was left alone"
+
+
+def test_force_master_still_beats_the_hold(tmp_path: pathlib.Path) -> None:
+    """Production change that would make this fail: checking the hold before
+    force-master, or letting the hold veto it.
+
+    The hold is the operator saying "not yet". force-master is the operator
+    saying "now, I have checked the peer is gone". An override a flag file
+    could countermand would not be an override.
+    """
+    state = tmp_path / "vrrp-state"
+    state.write_text("BACKUP\n")
+    recorded: list[list[str]] = []
+    force = tmp_path / "force-master"
+    force.touch()
+
+    rc = cluster_promoter.run(
+        HoldClient(holder="someone-else"),
+        namespace=NAMESPACE,
+        node_id=NODE,
+        ttl=30,
+        state_path=state,
+        install_dir=tmp_path,
+        force_path=force,
+        runner=_runner(recorded, state),
+        hold_path=_hold(tmp_path),
+    )
+    assert rc == 0
+    assert [c[0].rsplit("/", 1)[-1] for c in recorded] == ["notify_master.sh"]
+
+
+def test_no_hold_file_means_no_hold(tmp_path: pathlib.Path) -> None:
+    """Fails safe toward *not* holding: a hold that switched itself on would be
+    a cluster that had silently stopped failing over."""
+    state = tmp_path / "vrrp-state"
+    state.write_text("BACKUP\n")
+    recorded: list[list[str]] = []
+
+    cluster_promoter.run(
+        HoldClient(holder=None),
+        namespace=NAMESPACE,
+        node_id=NODE,
+        ttl=30,
+        state_path=state,
+        install_dir=tmp_path,
+        force_path=tmp_path / "force-master",
+        runner=_runner(recorded, state),
+        hold_path=tmp_path / "absent",
+    )
+    assert [c[0].rsplit("/", 1)[-1] for c in recorded] == ["notify_master.sh"]
+
+
+def test_both_import_branches_expose_the_same_names() -> None:
+    """Production change that would make this fail: adding a name to the
+    package-relative import and not to the standalone one.
+
+    Only the standalone branch runs on the host, and it is the branch no test
+    exercises by importing -- so a name missing there is a NameError that
+    appears for the first time on a real node, mid-promotion. This project has
+    already shipped exactly that shape once (`cryptography` via fileset_pull).
+    """
+    import ast
+    import pathlib as _p
+
+    src = (
+        _p.Path(__file__).parent.parent
+        / "custom_components/cluster_state_sync/scripts/cluster_promoter.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    rel = [
+        {a.name for a in node.names}
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and (node.module or "").endswith("lease")
+    ]
+    assert len(rel) == 2, f"expected two lease imports, found {len(rel)}"
+    assert rel[0] == rel[1], f"import branches differ: {rel[0] ^ rel[1]}"
+
+
+# -- the two stalls found by the live failover test, 2026-09-04 ---------------
+
+
+def test_adopt_clears_a_hold_down(tmp_path: pathlib.Path) -> None:
+    """Adopt is the operator's escape hatch, and now the only one.
+
+    `run()` deliberately refuses to let the D3 probe open a hold-down, because
+    a cold standby's Home Assistant is stopped on purpose and its probe can
+    never answer (see `test_the_probe_cannot_clear_a_hold_down`). That leaves
+    time, or a human. Adopting re-reads the cluster's real state from Valkey on
+    an explicit operator action, so a marker left by an earlier release is
+    exactly the stale thing it should clear.
+
+    Production change this catches: dropping the unlink from `adopt`, which
+    would strand a standby for the full window with no way to release it short
+    of deleting the file by hand -- which is how this was recovered before.
+    """
+    state = tmp_path / "vrrp-state"
+    holddown = cluster_promoter._holddown_path(state)
+    holddown.parent.mkdir(parents=True, exist_ok=True)
+    holddown.touch()
+    assert holddown.exists()
+
+    rc = adopt(
+        ObservingClient(holder="tiger2-def456"),
+        namespace=NAMESPACE,
+        node_id=NODE,
+        state_path=state,
+    )
+    assert rc == 0
+    assert state.read_text().strip() == "BACKUP"
+    assert not holddown.exists(), "adopt must clear a stale hold-down marker"
+
+
+def test_adopt_survives_having_no_hold_down_to_clear(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The ordinary case -- a first install has no marker. Unlinking a file
+    that was never there must not turn a successful adopt into a failed one,
+    which is why the unlink is best-effort."""
+    state = tmp_path / "vrrp-state"
+    assert not cluster_promoter._holddown_path(state).exists()
+
+    rc = adopt(
+        ObservingClient(holder=NODE),
+        namespace=NAMESPACE,
+        node_id=NODE,
+        state_path=state,
+    )
+    assert rc == 0
+    assert state.read_text().strip() == "MASTER"
+
+
+def test_adopt_does_not_grant_a_probe_grace(tmp_path: pathlib.Path) -> None:
+    """Production change that would make this fail: writing the state file with
+    a current mtime.
+
+    D3's grace is measured from that mtime — a freshly promoted node renews
+    without probing while Home Assistant boots. Adopt records a state the node
+    has been in, possibly for weeks. A fresh mtime told the promoter this node
+    had just promoted, so it renewed unconditionally for five minutes after
+    Home Assistant stopped: a failover measured at 12 seconds sat at over two
+    minutes when `install.sh` had run shortly before.
+    """
+    import time as _time
+
+    state = tmp_path / "vrrp-state"
+    adopt(ObservingClient(holder=NODE), namespace=NAMESPACE, node_id=NODE, state_path=state)
+
+    age = _time.time() - state.stat().st_mtime
+    assert age > 3600, f"adopt granted a {age:.0f}s grace window"
+
+
+def test_the_probe_cannot_clear_a_hold_down(tmp_path: pathlib.Path) -> None:
+    """The inverse of a test that used to live here, and the reason it went.
+
+    An earlier version cleared the hold-down as soon as the probe answered,
+    so that a healthy node was not kept out. It is unreachable exactly when it
+    matters: a cold standby's Home Assistant is *deliberately stopped* by
+    `notify_backup.sh`, so its probe can never answer, so the hatch never opens
+    for the node that most needs it. Measured on 2026-09-04 -- node-b sat
+    BACKUP for 901 seconds with its peer down, then promoted unaided the
+    instant the window expired.
+
+    It also broke D3's invariant: *the probe gates renewal, never taking*.
+
+    So even a probe that answers must not open a live hold-down. Production
+    change this catches: re-adding a probe call to the hold-down branch.
+    """
+    state = tmp_path / "vrrp-state"
+    state.write_text("BACKUP\n")
+    holddown = tmp_path / "release-holddown"
+    holddown.touch()  # fresh -- inside the window
+    recorded: list[list[str]] = []
+    probed: list[bool] = []
+
+    def answering(_url: str, _timeout: float) -> bool:
+        probed.append(True)
+        return True  # Home Assistant is emphatically alive
+
+    rc = cluster_promoter.run(
+        FakeClient(holds=True),  # the lease is free and grantable
+        namespace=NAMESPACE,
+        node_id=NODE,
+        ttl=30,
+        state_path=state,
+        install_dir=tmp_path,
+        force_path=tmp_path / "force-master",
+        runner=_runner(recorded, state),
+        holddown_path=holddown,
+        probe=answering,
+    )
+    assert rc == 0
+    assert recorded == [], "a healthy probe must NOT open a live hold-down"
+    assert holddown.exists(), "the marker must survive its full window"
+
+
+def test_a_cold_standby_promotes_when_the_window_expires(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The scenario the old probe-escape was reaching for, done with time.
+
+    A cold standby has no Home Assistant running -- that is the design, not a
+    fault -- so its probe fails on every tick. It must still promote once the
+    hold-down window passes, or a standby that once released can never take
+    over again.
+    """
+    state = tmp_path / "vrrp-state"
+    state.write_text("BACKUP\n")
+    holddown = tmp_path / "release-holddown"
+    holddown.touch()
+    _backdate(holddown, cluster_promoter.DEFAULT_RELEASE_HOLDDOWN_SECONDS + 30)
+    recorded: list[list[str]] = []
+
+    rc = cluster_promoter.run(
+        FakeClient(holds=True),
+        namespace=NAMESPACE,
+        node_id=NODE,
+        ttl=30,
+        state_path=state,
+        install_dir=tmp_path,
+        force_path=tmp_path / "force-master",
+        runner=_runner(recorded, state),
+        holddown_path=holddown,
+        probe=lambda _u, _t: False,  # stopped on purpose, never answers
+    )
+    assert rc == 0
+    assert [c[0].rsplit("/", 1)[-1] for c in recorded] == ["notify_master.sh"]
+    assert not holddown.exists(), "a spent marker must be cleared"
+
+
+def test_an_unhealthy_probe_still_honours_the_holddown(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The control. A node whose Home Assistant is still silent must stay out —
+    that is the cycling the hold-down was written to stop, and each promotion
+    also re-runs the fileset swap."""
+    state = tmp_path / "vrrp-state"
+    state.write_text("BACKUP\n")
+    holddown = tmp_path / "release-holddown"
+    holddown.touch()
+    recorded: list[list[str]] = []
+
+    cluster_promoter.run(
+        FakeClient(holds=True),
+        namespace=NAMESPACE,
+        node_id=NODE,
+        ttl=30,
+        state_path=state,
+        install_dir=tmp_path,
+        force_path=tmp_path / "force-master",
+        runner=_runner(recorded, state),
+        holddown_path=holddown,
+        probe=lambda _u, _t: False,  # still wedged
+    )
+    assert recorded == [], "a wedged node must not promote"
+    assert holddown.exists(), "the hold-down must survive to block the next tick"
+
+
+# -- operator-requested handover -------------------------------------------
+
+
+def test_a_handover_request_releases_the_lease(tmp_path: pathlib.Path) -> None:
+    """ "Fail over now", as an operator action rather than an outage.
+
+    Before this, moving the cluster deliberately meant stopping Home Assistant
+    on the leader -- which caused a real outage on 2026-09-06, because a
+    stopped leader is a leader whose container `notify_backup.sh` will not
+    restart -- or writing force-master on the peer by hand.
+    """
+    state = tmp_path / "vrrp-state"
+    state.write_text("MASTER\n")
+    req = tmp_path / ".cluster_sync_handover_request"
+    req.write_text("requested from the dashboard\n")
+    recorded: list[list[str]] = []
+    client = FakeClient(holds=True)
+
+    rc = run(
+        client,
+        namespace=NAMESPACE,
+        node_id=NODE,
+        ttl=30,
+        state_path=state,
+        install_dir=tmp_path,
+        force_path=tmp_path / "force-master",
+        runner=_runner(recorded, state),
+        holddown_path=tmp_path / "release-holddown",
+        handover_path=req,
+        probe=lambda _u, _t: True,  # Home Assistant is perfectly healthy
+    )
+    assert rc == 0
+    assert [c[0].rsplit("/", 1)[-1] for c in recorded] == ["notify_backup.sh"]
+    assert not req.exists(), "the request must be consumed, not left to re-fire"
+
+
+def test_a_handover_does_not_require_an_unhealthy_node(tmp_path: pathlib.Path) -> None:
+    """It is the one release that happens while everything is working.
+
+    Production change this catches: putting the handover branch after the D3
+    probe check, which would make a deliberate handover depend on Home
+    Assistant being unwell.
+    """
+    state = tmp_path / "vrrp-state"
+    state.write_text("MASTER\n")
+    req = tmp_path / ".cluster_sync_handover_request"
+    req.touch()
+    recorded: list[list[str]] = []
+
+    run(
+        client=FakeClient(holds=True),
+        namespace=NAMESPACE,
+        node_id=NODE,
+        ttl=30,
+        state_path=state,
+        install_dir=tmp_path,
+        force_path=tmp_path / "force-master",
+        runner=_runner(recorded, state),
+        holddown_path=tmp_path / "release-holddown",
+        handover_path=req,
+        probe=lambda _u, _t: True,
+    )
+    assert [c[0].rsplit("/", 1)[-1] for c in recorded] == ["notify_backup.sh"]
+
+
+def test_a_handover_writes_a_holddown(tmp_path: pathlib.Path) -> None:
+    """Without it this node takes back on its very next tick the lease it was
+    just asked to give away."""
+    state = tmp_path / "vrrp-state"
+    state.write_text("MASTER\n")
+    req = tmp_path / ".cluster_sync_handover_request"
+    req.touch()
+    holddown = tmp_path / "release-holddown"
+
+    run(
+        client=FakeClient(holds=True),
+        namespace=NAMESPACE,
+        node_id=NODE,
+        ttl=30,
+        state_path=state,
+        install_dir=tmp_path,
+        force_path=tmp_path / "force-master",
+        runner=_runner([], state),
+        holddown_path=holddown,
+        handover_path=req,
+        probe=lambda _u, _t: True,
+    )
+    assert holddown.exists(), "a handover must hold this node down like any release"
+
+
+def test_a_handover_request_on_a_follower_is_ignored(tmp_path: pathlib.Path) -> None:
+    """A follower has nothing to hand over. Acting on it would be a standby
+    releasing a lease it does not hold."""
+    state = tmp_path / "vrrp-state"
+    state.write_text("BACKUP\n")
+    req = tmp_path / ".cluster_sync_handover_request"
+    req.touch()
+    recorded: list[list[str]] = []
+
+    run(
+        client=FakeClient(holds=True),
+        namespace=NAMESPACE,
+        node_id=NODE,
+        ttl=30,
+        state_path=state,
+        install_dir=tmp_path,
+        force_path=tmp_path / "force-master",
+        runner=_runner(recorded, state),
+        holddown_path=tmp_path / "release-holddown",
+        handover_path=req,
+        probe=lambda _u, _t: False,
+    )
+    assert "notify_backup.sh" not in [c[0].rsplit("/", 1)[-1] for c in recorded]

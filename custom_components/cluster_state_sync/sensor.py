@@ -17,16 +17,19 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from . import StateMirror
 from .const import (
+    CLOCK_SKEW_CRITICAL_SECONDS,
+    CLOCK_SKEW_WARN_SECONDS,
+    DATA_CLUSTER_VIEW,
     DATA_COORDINATOR,
     DATA_DEGRADED_MARKER,
     DATA_FILESET,
     DATA_MIRROR,
     DATA_STATS,
-    DOMAIN,
 )
-from .coordinator import BackendHealthCoordinator, SyncStats
-from .entity import ClusterSyncDiagnosticEntity, MirrorBackedEntity
-from .fileset import FilesetPublisher
+from .coordinator import BackendHealthCoordinator, ClusterViewCoordinator, SyncStats
+from .entity import ClusterSyncDiagnosticEntity, ClusterViewEntity, MirrorBackedEntity
+from .fileset import REPLICATED_DIRS, REPLICATED_FILES, FilesetPublisher
+from .includes import scan as scan_includes
 
 
 async def async_setup_entry(
@@ -35,12 +38,13 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the diagnostic sensors."""
-    runtime = hass.data[DOMAIN][entry.entry_id]
+    runtime = entry.runtime_data
     coordinator: BackendHealthCoordinator = runtime[DATA_COORDINATOR]
     mirror: StateMirror = runtime[DATA_MIRROR]
     stats: SyncStats = runtime[DATA_STATS]
     publisher: FilesetPublisher | None = runtime.get(DATA_FILESET)
     degraded_marker: dict[str, Any] | None = runtime.get(DATA_DEGRADED_MARKER)
+    cluster_view: ClusterViewCoordinator = runtime[DATA_CLUSTER_VIEW]
 
     async_add_entities(
         [
@@ -48,6 +52,11 @@ async def async_setup_entry(
             LastSnapshotAgeSensor(coordinator, entry, mirror),
             EntitiesRestoredSensor(coordinator, entry, stats),
             FilesetAgeSensor(coordinator, entry, degraded_marker, publisher),
+            ClusterLeaderSensor(cluster_view, entry),
+            SharedSnapshotAgeSensor(cluster_view, entry),
+            ClusterMembersSensor(cluster_view, entry),
+            ClockSkewSensor(cluster_view, entry),
+            UnreplicatedReferencesSensor(coordinator, entry, hass.config.path()),
         ]
     )
 
@@ -219,3 +228,232 @@ class FilesetAgeSensor(ClusterSyncDiagnosticEntity, SensorEntity):
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=UTC)
         return max(0.0, (datetime.now(tz=UTC) - parsed).total_seconds())
+
+
+class ClusterLeaderSensor(ClusterViewEntity, SensorEntity):
+    """Which node currently holds the lease.
+
+    Reads the same on both nodes, which is the point: open it on each and they
+    must agree. Two nodes each naming themselves is a split brain, and it is far
+    easier to see here than by comparing log lines at 2am.
+
+    A value of `None` is genuinely ambiguous and worth knowing about. Read it
+    together with the Backend binary sensor: Backend off means "we could not
+    ask", Backend on means "we asked and nobody holds it" -- which is normal for
+    a few seconds after a leader releases, and a real problem if it persists.
+    """
+
+    _attr_translation_key = "cluster_leader"
+
+    def __init__(self, coordinator: ClusterViewCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "cluster_leader")
+
+    @property
+    def native_value(self) -> str | None:
+        return self.coordinator.data.leader if self.coordinator.data else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        view = self.coordinator.data
+        if view is None:
+            return {}
+        # Which node wrote the snapshot, as opposed to which one leads now.
+        # They differ for exactly as long as it takes a new leader to flush, and
+        # a lasting difference means the leader is not writing.
+        return {"snapshot_source": view.snapshot_source, "entry_count": view.entry_count}
+
+
+class SharedSnapshotAgeSensor(ClusterViewEntity, SensorEntity):
+    """How old the snapshot in the shared store is, whoever wrote it.
+
+    Not the same question as `Last snapshot age`, which measures this node's own
+    last successful flush. On a standby that never flushes by design, that one
+    climbs forever and says nothing about whether the cluster is healthy. This
+    one is read from the store, so it reads identically on both nodes and is the
+    number that actually answers "how much would we lose if we promoted now".
+    """
+
+    _attr_translation_key = "shared_snapshot_age"
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfTime.SECONDS
+    _attr_suggested_display_precision = 0
+
+    def __init__(self, coordinator: ClusterViewCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "shared_snapshot_age")
+
+    @property
+    def native_value(self) -> float | None:
+        return self.coordinator.data.snapshot_age if self.coordinator.data else None
+
+
+class ClusterMembersSensor(ClusterViewEntity, SensorEntity):
+    """How many nodes are in this cluster right now.
+
+    Nothing counted them before. Leadership was always answerable — one key,
+    one holder — but "who else is here" had no answer at all, so a node that
+    should not be in this namespace joined silently and began pulling the
+    cluster's `.storage`. The most plausible version is not malicious: a
+    restored backup on a test box, still pointed at `prod`.
+
+    A registry does not prevent that. It makes it visible, which is the part
+    that was missing — and a hard cap on members would not have caught it
+    either, because the stray node is not the one running the wizard.
+
+    Unknown, not zero, when the store cannot answer: a cluster of no nodes is
+    not a reading anyone should be shown.
+    """
+
+    _attr_translation_key = "cluster_members"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "nodes"
+
+    def __init__(self, coordinator: ClusterViewCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "cluster_members")
+
+    @property
+    def native_value(self) -> int | None:
+        view = self.coordinator.data
+        if view is None or not view.members:
+            return None
+        return len(view.members)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        view = self.coordinator.data
+        if view is None:
+            return {}
+        return {
+            "node_ids": sorted(view.members),
+            "clock_offsets_s": {
+                node: m.get("offset_s") for node, m in sorted(view.members.items())
+            },
+        }
+
+
+class ClockSkewSensor(ClusterViewEntity, SensorEntity):
+    """Widest disagreement between any two nodes' clocks.
+
+    Not a diagnostic nicety: skew silently disables the restore, in both
+    directions, and the symptom is this project's founding incident — "restored
+    0 entities" and a polite log line.
+
+    `_restore_from_snapshot` compares a **peer-written** `last_updated` against
+    **local** `now` three times. A peer more than `CLOCK_SKEW_TOLERANCE` ahead
+    has every entry refused as `skipped_future`; a peer more than
+    `restore_max_age` behind has every entry skipped as too old. Neither
+    corrupts anything. Both produce a restore that does nothing while every
+    other entity here reads green.
+
+    The lease is immune, because Valkey expires it server-side. So leadership
+    stays correct while the thing leadership exists to protect quietly stops
+    working, and that asymmetry is the whole argument for measuring this.
+
+    Measured against the store's clock rather than the peer's — see
+    `RedisBackend.register_node` for why that cancels most of the round trip.
+    """
+
+    _attr_translation_key = "clock_skew"
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfTime.SECONDS
+    _attr_suggested_display_precision = 3
+
+    def __init__(self, coordinator: ClusterViewCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "clock_skew")
+
+    @property
+    def native_value(self) -> float | None:
+        view = self.coordinator.data
+        return view.clock_skew if view is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        skew = self.native_value
+        if skew is None:
+            return {"status": "unknown", "warn_above_s": CLOCK_SKEW_WARN_SECONDS}
+        if skew >= CLOCK_SKEW_CRITICAL_SECONDS:
+            status = "critical — the restore is refusing the peer's entries"
+        elif skew >= CLOCK_SKEW_WARN_SECONDS:
+            status = "warning — drifting toward the restore's cliff"
+        else:
+            status = "ok"
+        return {
+            "status": status,
+            "warn_above_s": CLOCK_SKEW_WARN_SECONDS,
+            "breaks_restore_above_s": CLOCK_SKEW_CRITICAL_SECONDS,
+        }
+
+
+class UnreplicatedReferencesSensor(ClusterSyncDiagnosticEntity, SensorEntity):
+    """How many files the configuration needs that the go-bag will not carry.
+
+    This exists because the failure it measures is invisible. On 2026-09-04 a
+    promotion succeeded in every observable way -- lease taken in 12 seconds,
+    `.storage` swapped, the right identity, 20 refresh tokens, the mobile app
+    connected -- and Home Assistant came up in recovery mode, because twelve
+    referenced files had never been replicated. Nothing anywhere said so until
+    the house was the test.
+
+    Zero is the healthy reading. Anything above it is the number of files a
+    promoted standby would be missing, and the attributes name them.
+
+    Counts only what a parser can see. `python_scripts/`, `custom_templates/`,
+    ZHA's `zigbee.db` and anything an integration opens by path at runtime are
+    invisible to it -- so zero here means "nothing *referenced* is missing",
+    not "a promotion is guaranteed complete".
+    """
+
+    _attr_translation_key = "unreplicated_references"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "files"
+
+    def __init__(
+        self,
+        coordinator: BackendHealthCoordinator,
+        entry: ConfigEntry,
+        config_dir: str,
+    ) -> None:
+        super().__init__(coordinator, entry, "unreplicated_references")
+        self._config_dir = config_dir
+        self._count: int | None = None
+        self._detail: dict[str, Any] = {}
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        await self._async_rescan()
+
+    def _handle_coordinator_update(self) -> None:
+        self.hass.async_create_task(self._async_rescan())
+        super()._handle_coordinator_update()
+
+    async def _async_rescan(self) -> None:
+        """Walk the configuration in an executor -- it reads many files."""
+        try:
+            result = await self.hass.async_add_executor_job(scan_includes, self._config_dir)
+        except Exception:  # noqa: BLE001 - a diagnostic must never break setup
+            return
+        gap = sorted(p for p in result.paths if not _is_replicated(p))
+        detail: dict[str, Any] = {"missing_from_go_bag": gap}
+        if result.outside:
+            detail["outside_config_dir"] = [t for _, t in result.outside]
+        if result.missing:
+            detail["referenced_but_absent"] = [t for _, t in result.missing]
+        if result.unreadable:
+            detail["unreadable"] = [f for f, _ in result.unreadable]
+        if (len(gap), detail) != (self._count, self._detail):
+            self._count, self._detail = len(gap), detail
+            self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> int | None:
+        return self._count
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return self._detail
+
+
+def _is_replicated(rel: str) -> bool:
+    """Would the go-bag already carry this path?"""
+    return rel.split("/")[0] in REPLICATED_DIRS or rel in REPLICATED_FILES

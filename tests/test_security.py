@@ -5,6 +5,7 @@ crossing a flat LAN unencrypted, into a shared password-only keyspace, applied
 verbatim on restore with no integrity check. No one of those is fatal alone.
 These tests pin each leg of it.
 """
+
 from __future__ import annotations
 
 import json
@@ -40,9 +41,7 @@ def make_entry(entity_id: str = "alarm_control_panel.house") -> SnapshotEntry:
 def test_signed_entry_round_trips() -> None:
     """The happy path: an entry we signed verifies and parses back."""
     entry = make_entry()
-    restored = SnapshotEntry.from_json(
-        entry.entity_id, entry.to_json(secret=SECRET), secret=SECRET
-    )
+    restored = SnapshotEntry.from_json(entry.entity_id, entry.to_json(secret=SECRET), secret=SECRET)
     assert restored == entry
 
 
@@ -125,9 +124,7 @@ def test_ar_0036_replay_is_not_unlocked_by_shadowing_the_entity_id() -> None:
     payload["e"] = "input_boolean.holiday_mode"
 
     with pytest.raises(ValueError):
-        SnapshotEntry.from_json(
-            "alarm_control_panel.house", json.dumps(payload), secret=SECRET
-        )
+        SnapshotEntry.from_json("alarm_control_panel.house", json.dumps(payload), secret=SECRET)
 
 
 def test_ar_0036_signing_binds_an_entity_id_the_payload_cannot_change() -> None:
@@ -179,9 +176,7 @@ def test_ar_0036_entry_carrying_an_unknown_field_is_rejected() -> None:
     payload["extra"] = "unexpected"
 
     with pytest.raises(ValueError, match="unexpected field"):
-        SnapshotEntry.from_json(
-            "alarm_control_panel.house", json.dumps(payload), secret=SECRET
-        )
+        SnapshotEntry.from_json("alarm_control_panel.house", json.dumps(payload), secret=SECRET)
 
 
 def test_ar_0005_unsigned_entry_is_rejected_when_a_secret_is_configured() -> None:
@@ -198,9 +193,7 @@ def test_ar_0005_entry_signed_with_another_key_is_rejected() -> None:
     """Two clusters sharing a Valkey must not be able to write into each other."""
     entry = make_entry()
     with pytest.raises(ValueError, match="signature"):
-        SnapshotEntry.from_json(
-            entry.entity_id, entry.to_json(secret=OTHER_SECRET), secret=SECRET
-        )
+        SnapshotEntry.from_json(entry.entity_id, entry.to_json(secret=OTHER_SECRET), secret=SECRET)
 
 
 def test_signature_covers_every_signed_field() -> None:
@@ -219,17 +212,13 @@ def test_signature_covers_every_signed_field() -> None:
         if mutated[field] == payload[field]:
             continue
         with pytest.raises(ValueError, match="signature"):
-            SnapshotEntry.from_json(
-                entry.entity_id, json.dumps(mutated), secret=SECRET
-            )
+            SnapshotEntry.from_json(entry.entity_id, json.dumps(mutated), secret=SECRET)
 
 
 # -- AR-0004: sensitive domains off by default -----------------------------
 
 
-@pytest.mark.parametrize(
-    "domain", ["person", "device_tracker", "alarm_control_panel"]
-)
+@pytest.mark.parametrize("domain", ["person", "device_tracker", "alarm_control_panel"])
 def test_ar_0004_sensitive_domains_are_not_mirrored_by_default(domain: str) -> None:
     """AR-0004 — where people are and whether the house is armed is opt-in.
 
@@ -261,7 +250,7 @@ def test_ar_0010_valid_namespaces_are_accepted(value: str) -> None:
 @pytest.mark.parametrize(
     "value",
     [
-        "has:colon",       # would forge a key boundary
+        "has:colon",  # would forge a key boundary
         "has space",
         "UPPER",
         "trailing-",

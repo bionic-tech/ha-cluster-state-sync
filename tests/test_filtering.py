@@ -6,6 +6,7 @@ precedence is exactly where a filter goes quietly wrong: an operator who adds
 an entity to both the include and exclude lists has a clear intent, and the
 code has to honour it the same way every time.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -48,9 +49,7 @@ def test_custom_domain_list_replaces_the_default() -> None:
 def test_sensitive_domains_need_opting_in(domain: str) -> None:
     """AR-0004 at the filter level, not just the constant."""
     assert not _should_track(f"{domain}.someone", cfg())
-    assert _should_track(
-        f"{domain}.someone", cfg(**{CONF_INCLUDE_DOMAINS: [domain]})
-    )
+    assert _should_track(f"{domain}.someone", cfg(**{CONF_INCLUDE_DOMAINS: [domain]}))
 
 
 # -- precedence -------------------------------------------------------------

@@ -45,3 +45,9 @@ mutmut>=3.0
 # Lint + supply-chain gate (AR-0033).
 ruff==0.14.4
 pip-audit==2.9.0
+
+# Syntax-checks the shipped panel JavaScript. There is no JS runtime in
+# CI, and a panel that fails to parse is reported by Home Assistant only
+# as "Unable to load custom panel" -- with no clue that the cause is the
+# file rather than the delivery.
+esprima

@@ -75,12 +75,20 @@ class ServiceGate:
         """
         if self._gate_recorder:
             await self._reconcile(
-                is_leader, "_recorder_state", RECORDER_DOMAIN, "enable", "disable",
+                is_leader,
+                "_recorder_state",
+                RECORDER_DOMAIN,
+                "enable",
+                "disable",
                 target_all=False,
             )
         if self._gate_automations:
             await self._reconcile(
-                is_leader, "_automation_state", AUTOMATION_DOMAIN, "turn_on", "turn_off",
+                is_leader,
+                "_automation_state",
+                AUTOMATION_DOMAIN,
+                "turn_on",
+                "turn_off",
             )
 
     async def _reconcile(
@@ -113,11 +121,19 @@ class ServiceGate:
         nothing to undo and must not issue a spurious `turn_on`.
         """
         await self._reconcile(
-            True, "_recorder_state", RECORDER_DOMAIN, "enable", "disable",
+            True,
+            "_recorder_state",
+            RECORDER_DOMAIN,
+            "enable",
+            "disable",
             target_all=False,
         )
         await self._reconcile(
-            True, "_automation_state", AUTOMATION_DOMAIN, "turn_on", "turn_off",
+            True,
+            "_automation_state",
+            AUTOMATION_DOMAIN,
+            "turn_on",
+            "turn_off",
         )
 
     async def _call(self, domain: str, service: str, *, target_all: bool = True) -> bool:

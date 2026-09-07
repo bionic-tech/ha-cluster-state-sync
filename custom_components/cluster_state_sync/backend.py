@@ -11,12 +11,14 @@ import asyncio
 import base64
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC
+from datetime import UTC, datetime
 import hashlib
 import hmac
 import json
 import logging
+import pathlib
 import socket
+import time
 from typing import Any
 
 import redis.asyncio as aioredis
@@ -24,15 +26,19 @@ from redis.asyncio.sentinel import Sentinel
 
 from .const import (
     LEASE_TTL_SECONDS,
+    NODE_REGISTRY_TTL,
     SCHEMA_VERSION,
     fileset_blob_key,
     fileset_manifest_key,
     leader_key,
     meta_key,
+    node_key,
+    node_key_pattern,
     states_key,
 )
 from .lease import LEASE_SCRIPT as _LEASE_SCRIPT
 from .lease import RELEASE_SCRIPT as _RELEASE_SCRIPT
+from .lease import RENEW_ONLY_SCRIPT as _RENEW_ONLY_SCRIPT
 from .lease import lease_ttl_ms
 
 # Take-or-renew, evaluated atomically inside Valkey (AR-0017).
@@ -229,12 +235,46 @@ class ClusterBackend(ABC):
         """Load the full snapshot and metadata. Returns ({}, {}) on miss/error."""
 
     @abstractmethod
+    async def read_cluster_view(self) -> tuple[str | None, dict[str, Any]]:
+        """Who holds the lease, and the snapshot meta — without the snapshot.
+
+        `read_snapshot` deserialises and verifies every entry, which is far too
+        much work to do on a poll when all you want is two small values. This
+        reads the leader key and the meta key and nothing else.
+
+        Degrades to `(None, {})` rather than raising: an unreachable backend is
+        a reading to publish, not an error that should blank the entities and
+        hide the problem.
+        """
+
+    @abstractmethod
+    async def register_node(self, node_id: str) -> float | None:
+        """Announce this node, with its clock offset against the store.
+
+        Returns the offset in seconds (local clock minus the store's), or None
+        if it could not be measured.
+        """
+
+    @abstractmethod
+    async def read_members(self) -> dict[str, dict[str, Any]]:
+        """Every node that has announced itself recently, by node id."""
+
+    @abstractmethod
     async def health(self) -> bool:
         """Lightweight liveness check, for the cluster status endpoint."""
 
     @abstractmethod
     async def acquire_leadership(self, node_id: str) -> bool:
         """Take or renew the cluster lease. True if this node holds it."""
+
+    @abstractmethod
+    async def renew_leadership(self, node_id: str) -> bool:
+        """Renew a lease this node already holds. Never take a free one.
+
+        The maintenance hold's read of leadership: keep what we have across a
+        planned restart, but do not claim a lease that has come free, because
+        during maintenance "free" usually means the peer is mid-restart.
+        """
 
     @abstractmethod
     async def write_fileset(self, manifest: bytes, blobs: Mapping[str, bytes]) -> None:
@@ -296,6 +336,9 @@ class RedisBackend(ClusterBackend):
         self._sentinel_service = sentinel_service
         self._use_tls = use_tls
         self._tls_ca_certs = tls_ca_certs
+        # The CA's *contents*, read once off the event loop. See
+        # `_load_ca` and `_tls_kwargs`.
+        self._tls_ca_data: str | None = None
         self._secret = secret
         self._client: aioredis.Redis | None = None
         self._sentinel: Sentinel | None = None
@@ -310,13 +353,72 @@ class RedisBackend(ClusterBackend):
         "insecure TLS" toggle — if the CA path is omitted the system trust
         store is used, which is still verification.
         """
-        return {
-            "ssl": self._use_tls,
-            "ssl_ca_certs": self._tls_ca_certs if self._use_tls else None,
-            "ssl_cert_reqs": "required" if self._use_tls else None,
-        }
+        if not self._use_tls:
+            return {"ssl": False, "ssl_ca_certs": None, "ssl_cert_reqs": None}
+        kwargs: dict[str, Any] = {"ssl": True, "ssl_cert_reqs": "required"}
+        if self._tls_ca_data is not None:
+            # The PEM itself, so `redis` builds its SSLContext from memory.
+            kwargs["ssl_ca_data"] = self._tls_ca_data
+        else:
+            # No CA configured, or it could not be read: the system trust store,
+            # which is still verification.
+            kwargs["ssl_ca_certs"] = None
+        return kwargs
+
+    async def _load_ca(self) -> None:
+        """Read the CA bundle once, off the event loop.
+
+        `redis.asyncio` builds its `SSLContext` lazily on the first connect, so
+        passing `ssl_ca_certs` (a path) means `load_verify_locations` opens a
+        file on whichever loop called `connect()`. Home Assistant flags that as
+        a blocking call, with a link inviting a bug report, and it is right to:
+        it was observed stalling the config flow's own connectivity test, where
+        the operator is watching a spinner.
+
+        Passing `ssl_ca_data` instead hands `redis` the bytes and leaves no
+        filesystem work on the loop. Read once and cached, because the CA does
+        not change between reconnects and this runs on every one.
+
+        **Home Assistant still logs the warning, and that is now a false
+        positive we cannot silence from here.** Its exemption
+        (`block_async_io._check_load_verify_locations_call_allowed`) fires only
+        when `cadata` is the *sole* keyword argument, and `redis`'s
+        `RedisSSLContext.get` unconditionally calls
+        `load_verify_locations(cafile=self.ca_certs, cadata=self.ca_data)` —
+        two arguments, even when the first is None. There is no `ssl_context`
+        parameter to pass a pre-built context through instead. With
+        `cafile=None` OpenSSL reads no file, so the blocking is genuinely gone;
+        only the detector cannot tell. The fix belongs upstream in `redis`
+        (omit `cafile` when it is None) — see TODO.md.
+
+        A CA that cannot be read falls back to the system trust store rather
+        than failing the connection. That is a real trade and it is the right
+        way round: verification still happens, against a different trust root,
+        and the alternative -- refusing to connect -- turns a mistyped path into
+        a total outage rather than a connection that fails loudly at handshake
+        if the server really is not trusted.
+        """
+        if not self._use_tls or not self._tls_ca_certs or self._tls_ca_data is not None:
+            return
+        path = self._tls_ca_certs
+        try:
+            loop = asyncio.get_running_loop()
+            self._tls_ca_data = await loop.run_in_executor(
+                None, lambda: pathlib.Path(path).read_text(encoding="utf-8")
+            )
+        except OSError as err:
+            _LOGGER.warning(
+                "Could not read the TLS CA at %s (%s) — falling back to the "
+                "system trust store. Verification still happens, but against a "
+                "different root than you configured.",
+                path,
+                err,
+            )
 
     async def connect(self) -> None:
+        # Before either branch: both pass `_tls_kwargs`, and both would
+        # otherwise read the CA from the event loop.
+        await self._load_ca()
         if self._use_sentinel:
             if not self._sentinel_hosts or not self._sentinel_service:
                 raise ValueError("Sentinel mode requires sentinel_hosts and sentinel_service")
@@ -467,6 +569,26 @@ class RedisBackend(ClusterBackend):
             _LOGGER.warning("Failed to read snapshot from Redis", exc_info=True)
             return {}, {}
 
+    async def read_cluster_view(self) -> tuple[str | None, dict[str, Any]]:
+        """Leader and snapshot meta in one round trip. See the base class."""
+        if self._client is None:
+            return None, {}
+        try:
+            leader, raw_meta = await self._client.mget(
+                leader_key(self._namespace), meta_key(self._namespace)
+            )
+        except Exception:  # noqa: BLE001 — never crash HA on backend failure
+            _LOGGER.debug("Could not read the cluster view", exc_info=True)
+            return None, {}
+        try:
+            meta = json.loads(raw_meta) if raw_meta else {}
+        except (ValueError, TypeError):
+            # Same posture as read_snapshot: unreadable meta is missing meta,
+            # not a reason to lose the leader we successfully read alongside it.
+            _LOGGER.debug("Snapshot meta is unreadable", exc_info=True)
+            meta = {}
+        return (leader or None), meta
+
     async def health(self) -> bool:
         if self._client is None:
             return False
@@ -475,6 +597,79 @@ class RedisBackend(ClusterBackend):
             return True
         except Exception:  # noqa: BLE001
             return False
+
+    async def register_node(self, node_id: str) -> float | None:
+        """Write this node's registry entry, and measure the clock against the store.
+
+        **Measured against Valkey, never against the peer.** Two nodes cannot
+        compare clocks directly without a round trip whose latency they cannot
+        separate from the skew they are trying to measure. Both compare
+        themselves to the same third party instead, and the difference of the
+        two offsets is the skew -- with most of the round trip cancelling,
+        because it appears in both measurements with the same sign.
+
+        The offset is taken around the call rather than after it: `TIME` is
+        answered at some instant between the request leaving and the reply
+        arriving, so the midpoint of the two local readings is the best
+        estimate of "local time when the server said that", and the error is
+        bounded by half the round trip rather than all of it.
+        """
+        if self._client is None:
+            return None
+        try:
+            before = time.time()
+            seconds, micros = await self._client.time()
+            after = time.time()
+            server = float(seconds) + float(micros) / 1_000_000
+            offset = (before + after) / 2 - server
+            payload = json.dumps(
+                {
+                    "node_id": node_id,
+                    "offset_s": round(offset, 3),
+                    "at": datetime.now(tz=UTC).isoformat(),
+                }
+            )
+            await self._client.set(
+                node_key(self._namespace, node_id), payload, ex=NODE_REGISTRY_TTL
+            )
+            return offset
+        except Exception:  # noqa: BLE001 — never crash HA on backend failure
+            _LOGGER.debug("Could not register this node", exc_info=True)
+            return None
+
+    async def read_members(self) -> dict[str, dict[str, Any]]:
+        """Every member that has announced itself inside the registry TTL.
+
+        `scan_iter`, not `keys`: the member count is tiny, but this runs on a
+        poll against a store the operator may well be sharing with other
+        things, and `KEYS` blocks the server for the whole keyspace rather than
+        the handful of keys we asked about.
+
+        A member whose payload will not parse is skipped rather than fatal --
+        it is one row of a diagnostic, and losing the whole reading because one
+        node wrote something odd would defeat the point of having it.
+        """
+        if self._client is None:
+            return {}
+        members: dict[str, dict[str, Any]] = {}
+        try:
+            async for key in self._client.scan_iter(
+                match=node_key_pattern(self._namespace), count=100
+            ):
+                raw = await self._client.get(key)
+                if not raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                node_id = entry.get("node_id")
+                if isinstance(node_id, str) and node_id:
+                    members[node_id] = entry
+        except Exception:  # noqa: BLE001 — a diagnostic must not break setup
+            _LOGGER.debug("Could not read cluster members", exc_info=True)
+            return {}
+        return members
 
     async def acquire_leadership(self, node_id: str) -> bool:
         """Take or renew this node's cluster lease (AR-0017).
@@ -496,6 +691,30 @@ class RedisBackend(ClusterBackend):
             return bool(int(result))
         except Exception:  # noqa: BLE001 — never crash HA on backend failure
             _LOGGER.warning("Could not evaluate the cluster lease", exc_info=True)
+            return False
+
+    async def renew_leadership(self, node_id: str) -> bool:
+        """Renew only — the maintenance hold's version of `acquire_leadership`.
+
+        Same failure posture as `acquire_leadership`: a backend that cannot
+        answer is not a yes. Here that means a node under maintenance whose
+        Valkey is unreachable reports itself a follower and stops publishing,
+        which is the safe direction — the lease it cannot renew will expire on
+        its own, and the peer is entitled to it.
+        """
+        if self._client is None:
+            return False
+        try:
+            result = await self._client.eval(
+                _RENEW_ONLY_SCRIPT,
+                1,
+                leader_key(self._namespace),
+                node_id,
+                lease_ttl_ms(LEASE_TTL_SECONDS),
+            )
+            return bool(int(result))
+        except Exception:  # noqa: BLE001 — never crash HA on backend failure
+            _LOGGER.warning("Could not renew the cluster lease", exc_info=True)
             return False
 
     async def release_leadership(self, node_id: str) -> None:

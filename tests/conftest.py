@@ -10,6 +10,7 @@ HACS copies `custom_components/<domain>/` out of the repo, and a symlink does
 not survive that — it arrives either pointing outside the install root or as a
 short text file containing the path. Moved 2026-08-26.
 """
+
 from __future__ import annotations
 
 from collections.abc import Generator
@@ -120,16 +121,18 @@ def valkey_server() -> Generator[tuple[str, int]]:
     container = started.stdout.strip()
 
     try:
-        mapped = subprocess.run(
-            ["docker", "port", container, "6379/tcp"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip().splitlines()[0]
+        mapped = (
+            subprocess.run(
+                ["docker", "port", container, "6379/tcp"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            .stdout.strip()
+            .splitlines()[0]
+        )
         port = int(mapped.rpartition(":")[2])
         _wait_for_container_valkey(container)
         yield "127.0.0.1", port
     finally:
-        subprocess.run(
-            ["docker", "rm", "-f", container], capture_output=True, check=False
-        )
+        subprocess.run(["docker", "rm", "-f", container], capture_output=True, check=False)

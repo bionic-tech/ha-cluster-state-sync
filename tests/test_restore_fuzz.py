@@ -50,9 +50,7 @@ attributes = st.dictionaries(text, json_scalars, max_size=8)
 @st.composite
 def valid_entries(draw: st.DrawFn) -> tuple[str, SnapshotEntry]:
     """An entry the integration itself could legitimately have written."""
-    entity_id = draw(
-        st.from_regex(r"\A[a-z_]{3,12}\.[a-z0-9_]{3,20}\Z", fullmatch=True)
-    )
+    entity_id = draw(st.from_regex(r"\A[a-z_]{3,12}\.[a-z0-9_]{3,20}\Z", fullmatch=True))
     stamp = draw(st.datetimes()).isoformat()
     return entity_id, SnapshotEntry(
         entity_id=entity_id,
@@ -71,9 +69,7 @@ def valid_entries(draw: st.DrawFn) -> tuple[str, SnapshotEntry]:
 
 @settings(max_examples=400, suppress_health_check=[HealthCheck.too_slow])
 @given(raw=st.text(max_size=400), entity_id=text)
-def test_arbitrary_text_is_never_accepted_as_a_signed_entry(
-    raw: str, entity_id: str
-) -> None:
+def test_arbitrary_text_is_never_accepted_as_a_signed_entry(raw: str, entity_id: str) -> None:
     """Fuzz the front door.
 
     Whatever comes back must either be a refusal or a correctly-signed entry.
@@ -179,9 +175,7 @@ def test_mutating_any_byte_of_a_signed_payload_is_caught(
 
 @settings(max_examples=200)
 @given(data=valid_entries(), other=text)
-def test_a_signature_is_bound_to_its_entity_id(
-    data: tuple[str, SnapshotEntry], other: str
-) -> None:
+def test_a_signature_is_bound_to_its_entity_id(data: tuple[str, SnapshotEntry], other: str) -> None:
     """A valid entry must not be replayable under a different entity.
 
     Without this, anything able to write the hash could take a legitimately

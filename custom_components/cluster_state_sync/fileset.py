@@ -29,6 +29,7 @@ import logging
 import pathlib
 from typing import Any, Final
 
+from . import includes
 from .crypto import MANIFEST_AAD, blob_aad, blob_ref, derive_fileset_key, seal
 
 _LOGGER = logging.getLogger(__name__)
@@ -154,19 +155,78 @@ def is_excluded(rel_path: str, patterns: Sequence[str]) -> bool:
     )
 
 
-def _candidates(root: pathlib.Path) -> list[tuple[str, pathlib.Path]]:
+def _candidates(root: pathlib.Path, extra: Sequence[str] = ()) -> list[tuple[str, pathlib.Path]]:
+    """Everything to publish: the fixed floor, plus whatever the config needs.
+
+    The fixed lists below are a floor, not the answer. They cannot know how an
+    operator has split their configuration up, and on this fleet they did not:
+    `configuration.yaml` pulled in `configs/*.yaml`, `themes/`, `packages/` and
+    a Google service-account credential under `secure/`, none of which crossed.
+    The promoted node could not parse its own configuration and came up in
+    recovery mode, behind a promotion that reported success at every step.
+
+    So `includes.scan` follows the includes and adds what it finds. See
+    `includes.py` for what it deliberately cannot see.
+    """
     found: list[tuple[str, pathlib.Path]] = []
-    for name in REPLICATED_DIRS:
-        base = root / name
+    seen: set[str] = set()
+
+    def add_file(rel: str, path: pathlib.Path) -> None:
+        if rel in seen:
+            return
+        if path.is_file() and not path.is_symlink():
+            seen.add(rel)
+            found.append((rel, path))
+
+    def add_tree(base: pathlib.Path) -> None:
         if not base.is_dir():
-            continue
+            return
         for path in sorted(base.rglob("*")):
             if path.is_file() and not path.is_symlink():
-                found.append((path.relative_to(root).as_posix(), path))
+                add_file(path.relative_to(root).as_posix(), path)
+
+    for name in REPLICATED_DIRS:
+        add_tree(root / name)
     for name in REPLICATED_FILES:
-        path = root / name
-        if path.is_file() and not path.is_symlink():
-            found.append((name, path))
+        add_file(name, root / name)
+
+    # Whatever the configuration actually references. Never raises: a
+    # configuration too broken to parse must still publish the floor above,
+    # because a degraded go-bag beats no go-bag.
+    try:
+        referenced = includes.scan(str(root))
+    except Exception:  # noqa: BLE001 - a scan failure must not stop publishing
+        _LOGGER.warning("Could not scan configuration.yaml for includes", exc_info=True)
+        return found
+
+    for rel in sorted(referenced.paths):
+        target = root / rel
+        if target.is_dir():
+            add_tree(target)
+        else:
+            add_file(rel, target)
+
+    # The operator's own list, for what no parser can see.
+    for rel in extra:
+        target = root / rel
+        if target.is_dir():
+            add_tree(target)
+        elif target.is_file():
+            add_file(rel, target)
+        else:
+            _LOGGER.warning(
+                "Extra replicated path %r does not exist in the config "
+                "directory; a promoted standby will not have it.",
+                rel,
+            )
+
+    for source, target in referenced.outside:
+        _LOGGER.warning(
+            "%s references %s, which is outside the config directory and "
+            "CANNOT be replicated. A promoted standby will not have it.",
+            source,
+            target,
+        )
     return found
 
 
@@ -175,6 +235,7 @@ def scan(
     *,
     secret: str,
     exclusions: Sequence[str],
+    extra_paths: Sequence[str] = (),
     previous: Mapping[str, FileEntry] | None = None,
     max_bytes: int | None = None,
 ) -> ScanResult:
@@ -196,7 +257,7 @@ def scan(
     bodies: dict[str, bytes] = {}
     total = 0
 
-    for rel, path in _candidates(root):
+    for rel, path in _candidates(root, extra_paths):
         if is_excluded(rel, exclusions):
             continue
         stat = path.stat()
@@ -259,6 +320,7 @@ class FilesetPublisher:
         node_id: str,
         secret: str,
         exclusions: Sequence[str],
+        extra_paths: Sequence[str] = (),
         max_bytes: int,
     ) -> None:
         self.backend = backend
@@ -267,6 +329,7 @@ class FilesetPublisher:
         self._secret = secret
         self._key = derive_fileset_key(secret)
         self._exclusions = tuple(exclusions)
+        self._extra_paths = tuple(extra_paths)
         self._max_bytes = max_bytes
         self._generation = 0
         self._current: dict[str, FileEntry] = {}
@@ -369,6 +432,7 @@ class FilesetPublisher:
             self._root,
             secret=self._secret,
             exclusions=self._exclusions,
+            extra_paths=self._extra_paths,
             previous=self._current,
             max_bytes=self._max_bytes,
         )

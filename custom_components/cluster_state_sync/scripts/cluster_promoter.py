@@ -61,13 +61,20 @@ import urllib.error
 import urllib.request
 
 try:  # imported as part of the integration package, e.g. by the tests
-    from ..lease import FORCE_SCRIPT, LEASE_SCRIPT, RELEASE_SCRIPT, lease_ttl_ms
+    from ..lease import (
+        FORCE_SCRIPT,
+        LEASE_SCRIPT,
+        RELEASE_SCRIPT,
+        RENEW_ONLY_SCRIPT,
+        lease_ttl_ms,
+    )
     from .resp import DEFAULT_DB, PASSWORD_ENV, ValkeyClient, ValkeyError
 except ImportError:  # run as a standalone script on the host, with its siblings beside it
     from lease import (  # type: ignore[no-redef]
         FORCE_SCRIPT,
         LEASE_SCRIPT,
         RELEASE_SCRIPT,
+        RENEW_ONLY_SCRIPT,
         lease_ttl_ms,
     )
     from resp import DEFAULT_DB, PASSWORD_ENV, ValkeyClient, ValkeyError  # type: ignore[no-redef]
@@ -120,7 +127,24 @@ PROBE_TIMEOUT_SECONDS = 5.0
 #: this, a freshly-promoted node would fail its own probe while still
 #: booting, release the lease it just took, and flap. Comfortably longer
 #: than a cold Home Assistant boot; overridable via `--probe-grace`.
-DEFAULT_PROBE_GRACE_SECONDS = 300.0
+#: **600, not 300.** 300 was shorter than a real Home Assistant takes to boot,
+#: which made every promotion of node-b self-terminating. Measured twice on
+#: 2026-09-04: `Home Assistant initialized in 328.71s` and `325.11s`, against a
+#: 300s grace. The sequence was deterministic, not flaky --
+#:
+#:     18:39:26  container starts
+#:     18:44:26  grace expires; Home Assistant still ~27s from ready
+#:     18:44:53  Home Assistant initialized in 325.11s
+#:     18:45:14  Demoting to BACKUP - stopping home-assistant-2
+#:
+#: -- and it was read as "the standby keeps crashing" for a day. The node
+#: promoted, released the lease it had just taken, stopped its own Home
+#: Assistant, and did it again on the next promotion.
+#:
+#: The grace must exceed the SLOWEST cold boot on the slowest node, not a
+#: typical one, because being wrong in this direction costs a full failover
+#: rather than a slow one.
+DEFAULT_PROBE_GRACE_SECONDS = 600.0
 
 #: How long after releasing a lease for a silent probe this node refuses to
 #: take a free one back (design M3). Without this: release writes BACKUP
@@ -132,7 +156,39 @@ DEFAULT_PROBE_GRACE_SECONDS = 300.0
 #: unhealthy probe; a lease free for any other reason (first boot, the peer
 #: crashed) is unaffected -- see the hold-down marker's own docstring.
 #: Overridable via `--release-holddown`.
+#:
+#: **900, and 180 was measured to be wrong.** This value has now failed in both
+#: directions on real hardware, so both are recorded here.
+#:
+#: Too long (900) looked like the fault first: node-b sat BACKUP for 901
+#: seconds with its peer down before promoting unaided. The reasoning that
+#: followed -- that 900 was a 6x overshoot of the failover budget -- was wrong,
+#: because it treated the window as a delay to be minimised rather than as the
+#: thing keeping a broken leader out.
+#:
+#: Too short (180) took the house down. 2026-09-04, with both nodes live:
+#:
+#:     21:02:11  node-a demotes (its Home Assistant was stopped)
+#:     21:02:14  node-b promotes
+#:     21:05:48  node-a RECLAIMS -- hold-down expired at 180s
+#:     21:05:52  node-b demotes
+#:     21:06:20  node-b promotes again
+#:     21:06:21  node-a demotes again
+#:
+#: A released leader whose Home Assistant is still stopped takes the lease back
+#: the moment this expires, because D3's probe gates renewal and never taking.
+#: So the window must outlast the repair of whatever caused the release -- an
+#: operator's attention span, not a boot time.
+#:
+#: What makes 900 affordable now, and did not before, is that `--adopt` unlinks
+#: the marker (see `adopt`). The window is no longer a sentence with no appeal:
+#: an operator who has fixed the node says so, and promotes immediately.
 DEFAULT_RELEASE_HOLDDOWN_SECONDS = 900.0
+
+#: How far back `--adopt` dates the state file. Comfortably beyond any sane
+#: `--probe-grace`, so an adopted node is probed on its very next tick rather
+#: than trusted for a window it never earned.
+_ADOPT_BACKDATE_SECONDS = 86400.0
 
 
 class PromoterError(Exception):
@@ -324,6 +380,8 @@ def run(
     probe: Callable[[str, float], bool] | None = None,
     holddown_path: pathlib.Path | None = None,
     release_holddown: float = DEFAULT_RELEASE_HOLDDOWN_SECONDS,
+    hold_path: pathlib.Path | None = None,
+    handover_path: pathlib.Path | None = None,
 ) -> int:
     """One tick: take or renew the lease, and act only on a change of it.
 
@@ -362,6 +420,37 @@ def run(
         key = _leader_key(namespace)
         holddown = holddown_path if holddown_path is not None else _holddown_path(state_path)
 
+        held = hold_path is not None and hold_path.is_file()
+        if held and not force_path.exists():
+            # Maintenance hold (hold.py). Renew what we have, never take what
+            # is free, and never demote. Two branches collapse into one here
+            # because the same file answers both questions: on the leader this
+            # keeps the lease alive across a planned restart, so it never comes
+            # free at all; on the standby it declines a lease that came free
+            # anyway -- during planned work "free" usually means the peer is
+            # mid-restart rather than dead.
+            #
+            # `force-master` still wins. The hold is the operator saying "not
+            # yet"; force-master is the operator saying "now, I have checked".
+            # An override that the hold could veto would be no override.
+            result = client.eval(RENEW_ONLY_SCRIPT, [key], [node_id, lease_ttl_ms(ttl)])
+            holds_lease = bool(result)
+            print(
+                f"cluster promoter: maintenance hold set ({hold_path}) -- "
+                f"{'renewed' if holds_lease else 'not holding'} the lease, "
+                f"taking no action. Failover is SUSPENDED until it is removed.",
+            )
+            if decide(holds_lease=holds_lease, previous=previous) is not None:
+                # Deliberately not acted on. Say so, because a hold that
+                # silently swallowed a real transition would look identical to
+                # a healthy cluster right up until it mattered.
+                print(
+                    "cluster promoter: a leadership change is pending and is "
+                    "being held; remove the hold to let it happen.",
+                    file=sys.stderr,
+                )
+            return 0
+
         if force_path.exists():
             # D2's override. holds_lease is forced True unconditionally: the
             # whole point of the override is to promote when Valkey itself
@@ -388,6 +477,44 @@ def run(
                 )
             holds_lease = True
             _mark_force_used(force_path, node_id)
+        elif previous == "MASTER" and handover_path is not None and handover_path.is_file():
+            # An operator asked, from the dashboard, for this node to hand the
+            # cluster over. Placed BEFORE the D3 probe branch on purpose: a
+            # deliberate handover must not depend on Home Assistant being
+            # unwell, and it is the one release that happens while everything
+            # is working perfectly.
+            #
+            # The request is consumed here rather than left for the next tick.
+            # A hold is a state you are in; a handover is an event that happens
+            # once, and a request that survived its own execution would hand
+            # the cluster over again on the very next tick.
+            reason = "requested"
+            try:
+                reason = handover_path.read_text(encoding="utf-8").strip() or reason
+            except OSError:
+                pass
+            print(
+                f"cluster promoter: HANDING OVER on request ({reason}). Releasing "
+                f"the lease so the peer can promote, and stopping Home Assistant "
+                f"here. This node will refuse to take the lease back for "
+                f"{release_holddown:.0f}s (clear it with --adopt).",
+                file=sys.stderr,
+            )
+            client.eval(RELEASE_SCRIPT, [key], [node_id])
+            holds_lease = False
+            # Same hold-down as a probe-driven release, and for the same
+            # reason: without it this node takes back on its very next tick
+            # the lease it was just asked to give away.
+            try:
+                holddown.touch()
+            except OSError:
+                pass
+            # Consumed last: if anything above raised, the request survives and
+            # the operator's intent is not silently lost.
+            try:
+                handover_path.unlink()
+            except OSError:
+                pass
         elif (
             previous == "MASTER"
             and not _recently_touched(state_path, probe_grace)
@@ -409,6 +536,22 @@ def run(
             # Valkey being unreachable while trying to release must fail the
             # whole tick loudly, not be treated as "released, so demote"
             # while the key might still be ours.
+            # Say so. This is the most consequential thing the promoter does
+            # -- it drops the lease and `notify_backup.sh` then stops Home
+            # Assistant -- and until 2026-09-05 it did it in total silence.
+            # Reconstructing the 2026-09-04 flap meant inferring releases from
+            # a container's exit code and one line in notify_backup.sh, hours
+            # after the fact. Every other branch says what it did; this one
+            # matters more than any of them.
+            print(
+                f"cluster promoter: RELEASING the lease -- {ha_url} did not "
+                f"answer within {PROBE_TIMEOUT_SECONDS}s and the "
+                f"{probe_grace:.0f}s post-promotion grace has expired. "
+                f"Demoting and stopping Home Assistant; the peer may now "
+                f"promote. This node will refuse to take the lease back for "
+                f"{release_holddown:.0f}s (clear it with --adopt once repaired).",
+                file=sys.stderr,
+            )
             client.eval(RELEASE_SCRIPT, [key], [node_id])
             holds_lease = False
             # M3. Recorded so THIS node's own next tick refuses to take the
@@ -422,6 +565,25 @@ def run(
             except OSError:
                 pass
         elif previous != "MASTER" and _recently_touched(holddown, release_holddown):
+            # NO PROBE HERE, deliberately. An earlier version cleared the
+            # hold-down once the probe answered again, reasoning that a healthy
+            # node should not be kept out. That was wrong twice over.
+            #
+            # It is unreachable exactly when it matters. A cold standby's Home
+            # Assistant is *deliberately stopped* (`notify_backup.sh` runs
+            # `docker stop`), so its probe can never succeed, so the escape
+            # hatch never opens for the node that most needs it. Measured on
+            # 2026-09-04: node-b sat BACKUP for 901 seconds with its peer
+            # down, then promoted on its own the instant the window expired.
+            #
+            # And it breaks D3's invariant -- *the probe gates renewal, never
+            # taking* (see `run()`'s docstring and `_probe_ha`). Letting the
+            # probe decide whether the hold-down blocks a take is the probe
+            # gating a take, however indirectly.
+            #
+            # What clears a hold-down is time, or an operator: `--adopt`
+            # removes the marker outright (see `adopt`), which is the
+            # deliberate act the old probe branch was groping for.
             # M3's hold-down. Without this: release (above) writes BACKUP via
             # notify_backup.sh, this node's very next tick sees
             # `previous == "BACKUP"`, takes the lease it just freed, promotes
@@ -434,6 +596,20 @@ def run(
             # only this node's own recent release triggers it -- a lease
             # free for any other reason (first boot, the peer crashed) has
             # no holddown marker and is never blocked by this branch.
+            #
+            # Announced for the same reason as the release above: a node
+            # sitting at BACKUP with a free lease looks identical to a node
+            # that simply has not noticed, and the difference is the whole
+            # explanation.
+            age = time.time() - holddown.stat().st_mtime if holddown.exists() else 0.0
+            print(
+                f"cluster promoter: NOT taking the free lease -- this node "
+                f"released it {age:.0f}s ago and is holding down for "
+                f"{release_holddown:.0f}s to avoid a promote/fail/release "
+                f"cycle. Run --adopt to clear this once Home Assistant is "
+                f"healthy here.",
+                file=sys.stderr,
+            )
             holds_lease = False
         else:
             # Ordinary take-or-renew: a standby taking a free lease (with no
@@ -441,6 +617,15 @@ def run(
             # boot grace, or an established leader whose probe just
             # answered. All three renew identically -- LEASE_SCRIPT's own
             # identity check is what makes "take" and "renew" the same call.
+            # Reaching here past a hold-down means it EXPIRED (the elif above
+            # is the only thing that reads it, and it refuses while the marker
+            # is recent). Unlink the spent marker so the next tick does not
+            # re-stat a file whose window has already passed.
+            if previous != "MASTER" and holddown.exists():
+                try:
+                    holddown.unlink()
+                except OSError:
+                    pass
             result = client.eval(LEASE_SCRIPT, [key], [node_id, lease_ttl_ms(ttl)])
             holds_lease = bool(result)
 
@@ -490,6 +675,93 @@ def run(
     except (ValkeyError, OSError) as err:
         print(f"cluster promoter: {err}", file=sys.stderr)
         return 1
+
+
+def adopt(
+    client: ValkeyClient,
+    *,
+    namespace: str,
+    node_id: str,
+    state_path: pathlib.Path,
+) -> int:
+    """Record the role this node already has, without acting on it.
+
+    Arming the timer on a cluster that is already running is otherwise a
+    promotion. `decide()` fires on a *change*, and a fresh install has no
+    `vrrp-state` at all, so the very first tick reads `previous == ""`, treats
+    the status quo as a transition into it, and runs the matching notify
+    script. On the node that is already the leader that means
+    `notify_master.sh`: a fileset swap and a device pre-flight that rewrites
+    `.storage` underneath a Home Assistant which never stopped running. The
+    install would break the thing it was installing.
+
+    So `install.sh` seeds the file with this first, and the real first tick
+    then sees no change and does nothing.
+
+    Two properties make it safe to run against a live cluster:
+
+    **It observes with `GET`; it never evaluates the lease script.** Taking the
+    lease on a standby *is* the promotion this exists to avoid, and even a
+    renewal on the leader would extend a TTL on the strength of an install
+    step rather than a health check.
+
+    **A lease nobody holds reads as BACKUP**, for the same reason `read_state`
+    refuses to default to MASTER: a node that claims leadership because it
+    could not establish otherwise is the split brain the design exists to
+    prevent. If that leaves a genuinely-leaderless cluster seeded BACKUP
+    everywhere, the first ordinary tick takes the lease and promotes properly,
+    through the path that is tested.
+    """
+    try:
+        holder = client.get(_leader_key(namespace))
+        state = "MASTER" if holder == node_id else "BACKUP"
+
+        # Same write discipline as `_record_vrrp_state` in bundle.py: the pull
+        # timer reads this file on a schedule and can catch a write in
+        # progress, and a torn value matches none of MASTER, BACKUP or FAULT.
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = state_path.with_suffix(f".adopt.{os.getpid()}")
+        tmp.write_text(f"{state}\n", encoding="utf-8")
+        tmp.replace(state_path)
+
+        # Backdate it, or adopting grants a five-minute no-probe window.
+        #
+        # D3's grace is measured from this file's mtime: a node that has just
+        # promoted renews without probing while Home Assistant boots. Adopt is
+        # the opposite -- it records a state the node has been in, possibly for
+        # weeks. Leaving a fresh mtime told the promoter this node had just
+        # promoted, so it renewed the lease unconditionally for five minutes
+        # after Home Assistant stopped. Measured: a failover that took 12
+        # seconds when the state file was old sat at two minutes and counting
+        # when `install.sh` had run shortly before.
+        old = time.time() - _ADOPT_BACKDATE_SECONDS
+        os.utime(state_path, (old, old))
+
+        # Clear any hold-down. This is the operator's escape hatch, and the
+        # only one: `run()` deliberately will not let the D3 probe open it
+        # (see the hold-down branch), because a cold standby's Home Assistant
+        # is stopped on purpose and its probe can never answer. Adopting is an
+        # explicit human act against a cluster whose real state is being
+        # re-read from Valkey, so a marker left by an earlier release is
+        # exactly the stale thing adoption exists to clear.
+        #
+        # Best-effort, like the `touch()` that writes it: the state file above
+        # is already committed, and failing to unlink a marker must not turn a
+        # successful adopt into a failed install.
+        try:
+            _holddown_path(state_path).unlink()
+        except OSError:
+            pass
+    except (ValkeyError, OSError) as err:
+        # Same boundary as `run()`, and the same reason: install.sh must stop
+        # rather than enable a timer whose first tick would then find no
+        # seeded state and promote.
+        print(f"cluster promoter: adopt failed: {err}", file=sys.stderr)
+        return 1
+
+    held_by = f"held by {holder!r}" if holder else "unheld"
+    print(f"cluster promoter: adopted {state} ({state_path}); lease {held_by}")
+    return 0
 
 
 def _run_notify_script(cmd: list[str]) -> int:
@@ -570,6 +842,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         "Home Assistant does not cycle release/promote/re-fail-probe every "
         "few minutes (default: %(default)s)",
     )
+    parser.add_argument(
+        "--hold-file",
+        default=None,
+        type=pathlib.Path,
+        help="maintenance hold: while this file exists, renew a lease already "
+        "held, never take a free one, and never promote or demote -- so a "
+        "planned restart does not become a failover (see hold.py). "
+        "force-master still overrides it",
+    )
+    parser.add_argument(
+        "--handover-file",
+        type=pathlib.Path,
+        default=None,
+        help="operator handover request, written by the dashboard. When present "
+        "on the leader, the lease is released so the peer promotes, and the "
+        "request is consumed. Lives in the config directory so the container "
+        "and the host see one file.",
+    )
+    parser.add_argument(
+        "--adopt",
+        action="store_true",
+        help="record the role this node already holds into --state-file and "
+        "exit, running no notify script -- what install.sh uses so arming "
+        "the timer on a live cluster is not itself a promotion",
+    )
     # There is deliberately no --password. See resp.PASSWORD_ENV:
     # argv is world readable through `ps`, so the password arrives in the
     # environment instead.
@@ -611,6 +908,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     probe = (lambda _url, _timeout: True) if args.no_probe else None
 
     try:
+        if args.adopt:
+            return adopt(
+                client,
+                namespace=namespace,
+                node_id=node_id,
+                state_path=args.state_file,
+            )
         return run(
             client,
             namespace=namespace,
@@ -624,6 +928,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             probe_grace=args.probe_grace,
             probe=probe,
             release_holddown=args.release_holddown,
+            hold_path=args.hold_file,
+            handover_path=args.handover_file,
         )
     finally:
         # This runs from a systemd timer, forever. A socket leaked on every

@@ -8,9 +8,10 @@ of the guards that exist (AR-0035).
 Integrity checking itself (AR-0005, HMAC) is Phase 3. These tests cover the
 guards that must hold regardless of whether an entry is authentic.
 """
+
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 import logging
 from typing import Any
 from unittest.mock import patch
@@ -54,9 +55,7 @@ def peer_entry(
     last_updated: str | None = None,
 ) -> SnapshotEntry:
     """Build an entry as the peer node would have written it."""
-    stamp = last_updated or (
-        dt_util.utcnow() - timedelta(seconds=age_seconds)
-    ).isoformat()
+    stamp = last_updated or (dt_util.utcnow() - timedelta(seconds=age_seconds)).isoformat()
     return SnapshotEntry(
         entity_id=entity_id,
         state=state,
@@ -71,6 +70,8 @@ async def boot_with_snapshot(
     hass: HomeAssistant,
     backend: FakeBackend,
     entries: dict[str, SnapshotEntry],
+    *,
+    snapshot_age_seconds: float = 5.0,
     **overrides: object,
 ) -> MockConfigEntry:
     """Set up the integration through the *boot* path and run the restore.
@@ -80,6 +81,18 @@ async def boot_with_snapshot(
     harness hands us a already-running `hass`, so we wind it back first.
     """
     backend.stored = dict(entries)
+    # The meta the real backend would have written alongside those entries.
+    # `snapshot_age_seconds` lets a test age the SNAPSHOT, which is what the
+    # restore's age gate now reads -- as distinct from ageing an individual
+    # entry, which it deliberately no longer cares about.
+    backend.meta = {
+        "schema_version": 1,
+        "source_node": PEER_ID,
+        "entry_count": len(entries),
+        "last_snapshot_at": (
+            datetime.now(tz=UTC) - timedelta(seconds=snapshot_age_seconds)
+        ).isoformat(),
+    }
     hass.set_state(CoreState.not_running)
 
     data = {
@@ -91,9 +104,7 @@ async def boot_with_snapshot(
     }
     entry = MockConfigEntry(domain=DOMAIN, data=data)
     entry.add_to_hass(hass)
-    with patch(
-        "custom_components.cluster_state_sync.RedisBackend", return_value=backend
-    ):
+    with patch("custom_components.cluster_state_sync.RedisBackend", return_value=backend):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
         await hass.async_start()
@@ -106,15 +117,11 @@ async def boot_with_snapshot(
 
 async def test_peer_state_is_restored(hass: HomeAssistant, backend: FakeBackend) -> None:
     """The happy path: a fresh entry from the peer seeds local state."""
-    await boot_with_snapshot(
-        hass, backend, {"input_boolean.quiet": peer_entry(state="on")}
-    )
+    await boot_with_snapshot(hass, backend, {"input_boolean.quiet": peer_entry(state="on")})
     assert hass.states.get("input_boolean.quiet").state == "on"
 
 
-async def test_own_node_entries_are_not_restored(
-    hass: HomeAssistant, backend: FakeBackend
-) -> None:
+async def test_own_node_entries_are_not_restored(hass: HomeAssistant, backend: FakeBackend) -> None:
     """We only learn from the peer; our own writes are not news."""
     await boot_with_snapshot(
         hass,
@@ -124,17 +131,51 @@ async def test_own_node_entries_are_not_restored(
     assert hass.states.get("input_boolean.quiet") is None
 
 
-async def test_entries_older_than_max_age_are_not_restored(
+async def test_an_ancient_snapshot_is_not_restored(
     hass: HomeAssistant, backend: FakeBackend
 ) -> None:
-    """A node returning after a week must not resurrect ancient state."""
+    """A node returning after a week must not resurrect ancient state.
+
+    The gate is on the SNAPSHOT's age, which is what `restore_max_age` says it
+    is. Nothing has written to the shared hash for a week, so none of it is
+    trustworthy.
+    """
     await boot_with_snapshot(
         hass,
         backend,
         {"input_boolean.quiet": peer_entry(age_seconds=7 * 24 * 3600)},
+        snapshot_age_seconds=7 * 24 * 3600,
         **{CONF_RESTORE_MAX_AGE: 1800},
     )
     assert hass.states.get("input_boolean.quiet") is None
+
+
+async def test_a_stable_entity_in_a_fresh_snapshot_is_restored(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """Production change that would make this fail: putting the age gate back
+    on each entry.
+
+    Observed on node-b, 2026-09-04: "Restored NOTHING from a snapshot that
+    held 28 entries. Skipped: 28 too-old." A healthy cluster, idle half an
+    hour, restoring nothing — because every entry's own `last_updated` had
+    aged past the cutoff together.
+
+    That inverted the intent. A setpoint that has held all day is exactly the
+    state worth carrying across a failover; a sensor that flickered ten seconds
+    ago is the one that matters least. Here the peer is still writing — the
+    snapshot is seconds old — while the entity itself has not changed in a day.
+    """
+    await boot_with_snapshot(
+        hass,
+        backend,
+        {"input_boolean.quiet": peer_entry(age_seconds=24 * 3600)},
+        snapshot_age_seconds=5,
+        **{CONF_RESTORE_MAX_AGE: 1800},
+    )
+    restored = hass.states.get("input_boolean.quiet")
+    assert restored is not None, "a stable entity must survive a fresh snapshot"
+    assert restored.state == "on"
 
 
 # -- AR-0035: future-dated timestamps --------------------------------------
@@ -224,15 +265,11 @@ async def test_ar_0009_restore_is_capped_at_max_entries(
     window a failover needs it.
     """
     cap = 10  # patched down from MAX_RESTORE_ENTRIES so the test stays fast
-    entries = {
-        f"input_boolean.e{i}": peer_entry(f"input_boolean.e{i}") for i in range(cap + 5)
-    }
+    entries = {f"input_boolean.e{i}": peer_entry(f"input_boolean.e{i}") for i in range(cap + 5)}
     with patch("custom_components.cluster_state_sync.MAX_RESTORE_ENTRIES", cap):
         await boot_with_snapshot(hass, backend, entries)
 
-    restored = [
-        s for s in hass.states.async_all() if s.entity_id.startswith("input_boolean.e")
-    ]
+    restored = [s for s in hass.states.async_all() if s.entity_id.startswith("input_boolean.e")]
     assert len(restored) == cap
 
 
@@ -272,9 +309,7 @@ async def test_entry_with_an_unreadable_timestamp_is_skipped_alone(
     bad = peer_entry("input_boolean.bad")
     bad.last_updated = "not-a-timestamp"
 
-    await boot_with_snapshot(
-        hass, backend, {"input_boolean.good": good, "input_boolean.bad": bad}
-    )
+    await boot_with_snapshot(hass, backend, {"input_boolean.good": good, "input_boolean.bad": bad})
 
     assert hass.states.get("input_boolean.good") is not None
     assert hass.states.get("input_boolean.bad") is None
@@ -411,9 +446,7 @@ async def test_ar_0012_runtime_add_does_not_restore(
         },
     )
     entry.add_to_hass(hass)
-    with patch(
-        "custom_components.cluster_state_sync.RedisBackend", return_value=backend
-    ):
+    with patch("custom_components.cluster_state_sync.RedisBackend", return_value=backend):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 
@@ -503,9 +536,7 @@ async def test_ar_0020_restore_reports_the_snapshot_age_it_used(
     stamp = (dt_util.utcnow() - timedelta(seconds=600)).isoformat()
     backend.meta = {"last_snapshot_at": stamp, "source_node": PEER_ID}
 
-    await boot_with_snapshot(
-        hass, backend, {"input_boolean.quiet": peer_entry(age_seconds=600)}
-    )
+    await boot_with_snapshot(hass, backend, {"input_boolean.quiet": peer_entry(age_seconds=600)})
 
     assert "snapshot age" in caplog.text.lower()
 
@@ -517,8 +548,13 @@ async def test_ar_0020_a_nearly_expired_snapshot_is_warned_about(
 
     Production change that would make this fail: treating "inside max_age" as
     uniformly fine. Restoring state from 29 minutes ago is legal under a
-    30-minute window and is almost certainly not what the operator wants
-    during a failover -- it means the peer stopped writing long before it died.
+    30-minute window and is worth saying out loud during a failover.
+
+    The wording matters and used to be wrong. It asserted the peer's flush loop
+    had stopped -- and said so about a perfectly healthy node, because
+    `async_flush` skips when nothing has changed, so an idle peer stops
+    advancing the timestamp with nothing at all amiss. It now names the likely
+    innocent cause first.
     """
     import logging
 
@@ -530,10 +566,15 @@ async def test_ar_0020_a_nearly_expired_snapshot_is_warned_about(
         hass,
         backend,
         {"input_boolean.quiet": peer_entry(age_seconds=1700)},
+        snapshot_age_seconds=1700,
         **{CONF_RESTORE_MAX_AGE: 1800},
     )
 
-    assert "stale" in caplog.text.lower()
+    assert "ageing snapshot" in caplog.text.lower()
+    assert "quiet cluster" in caplog.text.lower(), "must not blame a healthy peer"
+    assert "flush loop" not in caplog.text.lower(), (
+        "the old wording accused a healthy peer of having stopped writing"
+    )
 
 
 async def test_fresh_snapshot_does_not_warn(
@@ -547,10 +588,10 @@ async def test_fresh_snapshot_does_not_warn(
     backend.meta = {"last_snapshot_at": stamp, "source_node": PEER_ID}
 
     await boot_with_snapshot(
-        hass, backend, {"input_boolean.quiet": peer_entry(age_seconds=3)}
+        hass, backend, {"input_boolean.quiet": peer_entry(age_seconds=3)}, snapshot_age_seconds=3
     )
 
-    assert "stale" not in caplog.text.lower()
+    assert "ageing snapshot" not in caplog.text.lower()
 
 
 # -- AR-0040: the freshness guard versus Home Assistant's own restore --------
@@ -642,8 +683,7 @@ async def test_ar_0040_outside_boot_local_state_still_wins(
     )
 
     assert hass.states.get("input_boolean.quiet").state == "off", (
-        "off the boot path, a minute-old snapshot must not overwrite a value "
-        "that was just changed"
+        "off the boot path, a minute-old snapshot must not overwrite a value that was just changed"
     )
 
 
@@ -663,15 +703,11 @@ async def test_ar_0040_restoring_nothing_from_a_full_snapshot_is_a_warning(
     """
     # Every entry is the node's own, so all are skipped for a legitimate
     # reason — the point is the *reporting*, not the reason.
-    backend.stored = {
-        "input_boolean.quiet": peer_entry("input_boolean.quiet", source_node=NODE_ID)
-    }
+    backend.stored = {"input_boolean.quiet": peer_entry("input_boolean.quiet", source_node=NODE_ID)}
 
     with caplog.at_level(logging.WARNING):
         await boot_with_snapshot(hass, backend, dict(backend.stored))
 
     assert any(
-        "Restored NOTHING" in r.getMessage()
-        for r in caplog.records
-        if r.levelno >= logging.WARNING
+        "Restored NOTHING" in r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
     ), "an all-skipped restore must be a warning, not an INFO line"

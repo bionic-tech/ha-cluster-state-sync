@@ -26,10 +26,15 @@ and its fix -- suffixing `node_id` with Home Assistant's install UUID -- does
 not save this one: the UUID lives in `.storage/core.uuid`, which is replicated
 too.
 
-`node_id` is not alone in that entry. `peer_host` inherited makes the promoted
-node its own peer, so its pull and config-sync point at itself.
-`ha_container_ip` generates firewall rules for the wrong address, and
-`ha_config_path` differs between the two hosts already (finding F4).
+`node_id` is not alone in that entry. `ha_config_path` differs between the two
+hosts already -- on this fleet by a whole path component (finding F4) -- so an
+inherited one sends the swap to a directory that does not exist.
+`ha_container` differs too, and `ha_container_ip` would generate firewall rules
+for the wrong address.
+
+(`peer_host` used to head this list. It was removed in 2026-09 as genuinely
+dead: collected by the wizard, stored, and read by nothing. The argument below
+is why removing a field is safe and removing the *rule* would not be.)
 
 **The whole entry is preserved, not a list of fields.** A per-node setting
 added in a year cannot then silently reintroduce this bug. The accepted cost

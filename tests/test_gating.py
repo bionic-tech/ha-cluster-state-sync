@@ -346,9 +346,7 @@ async def test_disabling_logs_the_manual_recovery(hass, calls, caplog) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_ar_0039_a_follower_is_gated_before_automations_start(
-    hass, calls
-) -> None:
+async def test_ar_0039_a_follower_is_gated_before_automations_start(hass, calls) -> None:
     """The gate must land in the same window the restore does.
 
     Production change that would make this fail: applying the gate only from
@@ -388,9 +386,7 @@ async def test_ar_0039_a_follower_is_gated_before_automations_start(
         },
     )
     entry.add_to_hass(hass)
-    with patch(
-        "custom_components.cluster_state_sync.RedisBackend", return_value=backend
-    ):
+    with patch("custom_components.cluster_state_sync.RedisBackend", return_value=backend):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
         await hass.async_start()
@@ -434,9 +430,7 @@ async def test_ar_0039_added_to_a_live_follower_gates_immediately(hass, calls) -
         },
     )
     entry.add_to_hass(hass)
-    with patch(
-        "custom_components.cluster_state_sync.RedisBackend", return_value=backend
-    ):
+    with patch("custom_components.cluster_state_sync.RedisBackend", return_value=backend):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
 

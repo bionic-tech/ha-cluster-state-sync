@@ -191,9 +191,7 @@ async def test_a_snapshot_round_trips_through_a_real_valkey(
     """Write with the real pipeline, read back with the real Lua."""
     written = {
         "light.kitchen": _entry("light.kitchen", "on", friendly_name="Kitchen"),
-        "sensor.temperature": _entry(
-            "sensor.temperature", "21.5", unit_of_measurement="°C"
-        ),
+        "sensor.temperature": _entry("sensor.temperature", "21.5", unit_of_measurement="°C"),
     }
 
     assert await valkey_backend.write_snapshot(written, "node-a") is True
@@ -266,3 +264,52 @@ async def test_health_is_true_against_a_live_server(
     valkey_backend: RedisBackend,
 ) -> None:
     assert await valkey_backend.health() is True
+
+
+async def test_register_node_and_read_members_against_a_real_server(
+    valkey_backend,
+) -> None:
+    """The registry, exercised against a real Valkey rather than a fake.
+
+    `TIME`, `SET ... EX`, and `SCAN` are all server behaviours, and the fake
+    models none of them. In particular `scan_iter` against a pattern is the
+    part most likely to be subtly wrong — a mismatched prefix returns an empty
+    cluster while every node registers happily, which reads exactly like a
+    healthy single-node install.
+    """
+    offset = await valkey_backend.register_node("node-a")
+    assert offset is not None
+    # Both hosts are NTP-disciplined and this is a loopback round trip, so the
+    # offset is a sanity bound, not a precision claim.
+    assert abs(offset) < 60, f"implausible offset against the server: {offset}"
+
+    await valkey_backend.register_node("node-b")
+    members = await valkey_backend.read_members()
+    assert set(members) == {"node-a", "node-b"}
+    assert all(isinstance(m["offset_s"], (int, float)) for m in members.values())
+
+
+async def test_members_do_not_leak_between_namespaces(valkey_backend) -> None:
+    """Production change that would make this fail: dropping the namespace from
+    the scan pattern.
+
+    Two clusters sharing one Valkey is the documented deployment — it is why
+    the database number defaults to 2 — so a scan that saw every namespace
+    would report the other cluster's nodes as members of this one.
+    """
+    await valkey_backend.register_node("mine")
+    other = type(valkey_backend)(
+        namespace=valkey_backend._namespace + "-other",
+        host=valkey_backend._host,
+        port=valkey_backend._port,
+        db=valkey_backend._db,
+        password=valkey_backend._password,
+        username=valkey_backend._username,
+    )
+    await other.connect()
+    try:
+        await other.register_node("theirs")
+        assert set(await valkey_backend.read_members()) == {"mine"}
+        assert set(await other.read_members()) == {"theirs"}
+    finally:
+        await other.close()

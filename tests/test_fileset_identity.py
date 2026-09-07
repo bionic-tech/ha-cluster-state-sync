@@ -17,7 +17,10 @@ computing `keep` from its own generations. The rehearsal observed exactly that.
 Suffixing `node_id` with the install UUID (AR-0025) does not help: the UUID
 lives in `.storage/core.uuid`, which is replicated too.
 
-The same entry also carries `peer_host` (inheriting it makes a promoted node
+The same entry also carries `peer_host` -- a field removed from the wizard in
+2026-09, kept here deliberately because an obsolete key is the strongest
+possible example: preservation is of the whole entry, not of a maintained
+list of names. (Inheriting it used to make a promoted node
 its own peer), `ha_container_ip` and `ha_config_path` — the two nodes'
 `/config` mounts are already known to differ (finding F4).
 

@@ -1,0 +1,62 @@
+# Home Assistant's Integration Quality Scale, audited honestly against this
+# integration rather than asserted in the manifest.
+#
+# The manifest says `no_score`, and will keep saying it until `brands` lands --
+# that one is a pull request to home-assistant/brands and is on their schedule,
+# not ours. Everything else at Bronze is done.
+rules:
+  # Bronze
+  action-setup:
+    status: done
+    comment: >-
+      Registered in async_setup, not async_setup_entry. Registered from the
+      entry they vanish on unload, and an automation calling one fails with
+      "unknown service" rather than naming the real problem.
+  appropriate-polling:
+    status: done
+    comment: Two DataUpdateCoordinators on HEALTH_POLL_INTERVAL — health, and the cluster view.
+  brands:
+    status: todo
+    comment: >-
+      Assets exist at custom_components/cluster_state_sync/brand/, but the rule
+      means listed in home-assistant/brands. That is a PR to a repository we do
+      not control; it is the one Bronze rule outstanding.
+  common-modules: done
+  config-flow-test-coverage:
+    status: done
+    comment: >-
+      100%. Reaching it exposed two paths nobody had run: async_step_sentinel,
+      and _test_backend's real RedisBackend construction, which every other
+      test patched out.
+  config-flow: done
+  dependency-transparency:
+    status: done
+    comment: One dependency, redis, pinned with an upper bound (AR-0028) and published on PyPI.
+  docs-actions: done
+  docs-high-level-description: done
+  docs-installation-instructions:
+    status: done
+    comment: A file copy, not HACS — the repository is private, and HACS cannot install from one.
+  docs-removal-instructions:
+    status: done
+    comment: >-
+      Including the host units, which is the step people forget: leave the
+      promoter running and a timer keeps taking a lease and restarting Home
+      Assistant with nothing left to explain why.
+  entity-event-setup:
+    status: done
+    comment: MirrorBackedEntity subscribes in async_added_to_hass and unsubscribes via async_on_remove.
+  entity-unique-id: done
+  has-entity-name: done
+  runtime-data:
+    status: done
+    comment: entry.runtime_data is the source of truth; hass.data is retained only for the unload path.
+  test-before-configure:
+    status: done
+    comment: _test_backend opens and closes a real connection before the entry is created.
+  test-before-setup:
+    status: done
+    comment: async_setup_entry raises ConfigEntryNotReady, so Home Assistant retries with backoff.
+  unique-config-entry:
+    status: done
+    comment: async_set_unique_id plus _abort_if_unique_id_configured.

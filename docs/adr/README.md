@@ -19,6 +19,7 @@ Architecture Decision Records capture the context, decision, and consequences of
 | [ADR-004](./ADR-004-snapshot-write-semantics.md) | Snapshot write semantics — full authoritative map, merge not replace | ✅ Accepted | 2026-08-05 |
 | [ADR-005](./ADR-005-generate-not-control.md) | Generate host configuration, do not control the host | ✅ Accepted | 2026-08-06 |
 | [ADR-006](./ADR-006-lease-promoter.md) | The lease promoter replaces Keepalived | ✅ Accepted | 2026-09-01 |
+| [ADR-007](./ADR-007-operator-surface.md) | The operator surface — a self-registering panel, and controls as flag files | ✅ Accepted | 2026-09-07 |
 
 ## Status Key
 

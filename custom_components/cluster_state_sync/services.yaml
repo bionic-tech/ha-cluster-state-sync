@@ -1,0 +1,22 @@
+# Two actions, and deliberately no third.
+#
+# The one operator action that bypasses the split-brain guard is `force-master`,
+# and it stays a file you have to be on the host to create. Putting it behind a
+# button in a web UI would make "both nodes believe they lead" a thing you could
+# do by accident from a phone.
+
+flush_snapshot:
+  name: Flush snapshot
+  description: >-
+    Write this node's entity state to the shared store immediately, instead of
+    waiting for the next interval. Refuses on a node that does not hold cluster
+    leadership, because a follower writing would overwrite the leader's
+    snapshot. Does nothing if nothing has changed since the last flush.
+
+clear_degraded:
+  name: Clear the degraded marker
+  description: >-
+    Acknowledge the "go-bag was stale or missing at promotion" marker and remove
+    the repair issue it raised. This fixes nothing on its own — the next
+    promotion is what proves the go-bag is healthy again — and the marker will
+    return if the underlying condition persists.

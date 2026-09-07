@@ -158,19 +158,32 @@ def tls_valkey() -> Generator[tuple[int, Path, Path]]:
 
     started = subprocess.run(
         [
-            "docker", "run", "-d", "--rm",
-            "-p", "127.0.0.1::6380",
-            "-v", f"{certs}:/certs:ro",
+            "docker",
+            "run",
+            "-d",
+            "--rm",
+            "-p",
+            "127.0.0.1::6380",
+            "-v",
+            f"{certs}:/certs:ro",
             VALKEY_IMAGE,
             "valkey-server",
-            "--port", "0",
-            "--tls-port", "6380",
-            "--tls-cert-file", "/certs/server.crt",
-            "--tls-key-file", "/certs/server.key",
-            "--tls-ca-cert-file", "/certs/ca.crt",
-            "--tls-auth-clients", "no",
+            "--port",
+            "0",
+            "--tls-port",
+            "6380",
+            "--tls-cert-file",
+            "/certs/server.crt",
+            "--tls-key-file",
+            "/certs/server.key",
+            "--tls-ca-cert-file",
+            "/certs/ca.crt",
+            "--tls-auth-clients",
+            "no",
         ],
-        capture_output=True, text=True, check=False,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if started.returncode != 0:
         pytest.skip(
@@ -180,18 +193,36 @@ def tls_valkey() -> Generator[tuple[int, Path, Path]]:
     container = started.stdout.strip()
 
     try:
-        mapped = subprocess.run(
-            ["docker", "port", container, "6380/tcp"],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip().splitlines()[0]
+        mapped = (
+            subprocess.run(
+                ["docker", "port", container, "6380/tcp"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            .stdout.strip()
+            .splitlines()[0]
+        )
         port = int(mapped.rpartition(":")[2])
 
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             probe = subprocess.run(
-                ["docker", "exec", container, "valkey-cli", "--tls",
-                 "--cacert", "/certs/ca.crt", "-p", "6380", "PING"],
-                capture_output=True, text=True, check=False,
+                [
+                    "docker",
+                    "exec",
+                    container,
+                    "valkey-cli",
+                    "--tls",
+                    "--cacert",
+                    "/certs/ca.crt",
+                    "-p",
+                    "6380",
+                    "PING",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
             )
             if "PONG" in probe.stdout:
                 break
@@ -296,3 +327,60 @@ async def test_a_plaintext_client_cannot_talk_to_the_tls_port(
         await b.connect()
 
     await b.close()
+
+
+# -- the CA is read off the event loop (observed on node-a, 2026-09-03) ----
+
+
+async def test_the_ca_is_passed_as_data_not_as_a_path(tmp_path) -> None:
+    """Production change that would make this fail: going back to ssl_ca_certs.
+
+    `redis.asyncio` builds its SSLContext lazily on the first connect, so a
+    path means `load_verify_locations` opens a file on whichever loop called
+    connect(). Home Assistant flags that as a blocking call — observed live,
+    stalling the config flow's own connectivity test while an operator watched
+    a spinner.
+    """
+    ca = tmp_path / "ca.crt"
+    ca.write_text("-----BEGIN CERTIFICATE-----\nnot-a-real-cert\n-----END CERTIFICATE-----\n")
+
+    backend = RedisBackend(namespace="ns", host="h", use_tls=True, tls_ca_certs=str(ca))
+    await backend._load_ca()
+
+    kwargs = backend._tls_kwargs
+    assert kwargs["ssl"] is True
+    assert kwargs["ssl_cert_reqs"] == "required"
+    assert "not-a-real-cert" in kwargs["ssl_ca_data"]
+    assert "ssl_ca_certs" not in kwargs, "a path would be read on the loop"
+
+
+async def test_the_ca_is_read_once_not_per_connect(tmp_path) -> None:
+    """This runs on every reconnect, and the CA does not change between them."""
+    ca = tmp_path / "ca.crt"
+    ca.write_text("first")
+    backend = RedisBackend(namespace="ns", host="h", use_tls=True, tls_ca_certs=str(ca))
+    await backend._load_ca()
+    ca.write_text("second")
+    await backend._load_ca()
+    assert backend._tls_ca_data == "first"
+
+
+async def test_an_unreadable_ca_falls_back_to_the_system_store(tmp_path) -> None:
+    """A real trade, and this is the right way round: verification still
+    happens, against a different root. Refusing to connect would turn a
+    mistyped path into a total outage rather than a handshake that fails
+    loudly if the server is genuinely untrusted."""
+    backend = RedisBackend(
+        namespace="ns", host="h", use_tls=True, tls_ca_certs=str(tmp_path / "absent.crt")
+    )
+    await backend._load_ca()
+    kwargs = backend._tls_kwargs
+    assert kwargs["ssl"] is True
+    assert kwargs["ssl_cert_reqs"] == "required", "never downgrade verification"
+    assert kwargs.get("ssl_ca_data") is None
+
+
+async def test_tls_off_carries_no_ca_at_all() -> None:
+    backend = RedisBackend(namespace="ns", host="h", use_tls=False, tls_ca_certs="/x")
+    await backend._load_ca()
+    assert backend._tls_kwargs == {"ssl": False, "ssl_ca_certs": None, "ssl_cert_reqs": None}

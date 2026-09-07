@@ -1,24 +1,24 @@
 {
   "domain": "cluster_state_sync",
   "name": "Cluster State Sync",
-  "version": "0.2.0",
-  "documentation": "https://github.com/boywiz/ha-cluster-state-sync",
-  "issue_tracker": "https://github.com/boywiz/ha-cluster-state-sync/issues",
+  "after_dependencies": [
+    "recorder"
+  ],
   "codeowners": [
     "@boywiz"
   ],
   "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/boywiz/ha-cluster-state-sync",
   "integration_type": "service",
   "iot_class": "local_push",
-  "quality_scale": "bronze",
+  "issue_tracker": "https://github.com/boywiz/ha-cluster-state-sync/issues",
   "loggers": [
     "redis"
   ],
+  "quality_scale": "no_score",
   "requirements": [
     "redis>=5.0.0,<7"
   ],
-  "dependencies": [],
-  "after_dependencies": [
-    "recorder"
-  ]
+  "version": "0.3.0"
 }

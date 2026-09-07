@@ -1,7 +1,4 @@
 {
   "name": "Cluster State Sync",
-  "content_in_root": false,
-  "render_readme": true,
-  "homeassistant": "2026.6.4",
-  "hacs": "2.0.0"
+  "homeassistant": "2026.6.4"
 }

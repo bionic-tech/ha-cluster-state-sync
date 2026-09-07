@@ -154,7 +154,7 @@ def test_records_slow_setup_warnings() -> None:
 
 
 def test_does_not_mistake_a_runtime_warning_for_a_slow_setup() -> None:
-    """"is taking over N seconds" also appears for entity updates at runtime.
+    """ "is taking over N seconds" also appears for entity updates at runtime.
 
     On node-a that phrase occurred 26,241 times against 194 real setups, so
     matching it loosely would bury the signal completely.
