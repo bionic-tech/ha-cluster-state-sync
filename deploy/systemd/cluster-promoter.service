@@ -1,0 +1,20 @@
+[Unit]
+Description=Cluster State Sync — take or renew the cluster lease, and promote or demote on a change of it
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/etc/cluster-sync/cluster-promoter.sh
+
+# A oneshot's own TimeoutStartSec defaults to infinity. Left unset, a tick
+# that hangs (a stuck notify script, a Valkey call that never returns) never
+# exits; systemd will not start the NEXT tick of a still-running oneshot; the
+# lease laps at its TTL while this node sits mid-promotion and can never
+# demote -- two masters, indefinitely. This is the backstop, not the primary
+# defence: the promoter bounds itself internally to well under this (a 5s
+# Valkey connect/socket timeout, a 120s notify-script timeout --
+# cluster_promoter.py's CONNECT_TIMEOUT_SECONDS and NOTIFY_TIMEOUT_SECONDS).
+# 150s is comfortably longer than both of those combined, so this only fires
+# if something outside the promoter's own control -- systemd, the kernel --
+# is also stuck.
+TimeoutStartSec=150s

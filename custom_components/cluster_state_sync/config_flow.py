@@ -32,7 +32,7 @@ from homeassistant.helpers.selector import (
 import voluptuous as vol
 
 from .backend import RedisBackend, default_node_id
-from .bundle import write_bundle
+from .bundle import UnsafeBundleValue, validate_shell_safe, write_bundle
 from .const import (
     BUNDLE_DIR_NAME,
     CONF_ACCEPT_RISK,
@@ -58,6 +58,8 @@ from .const import (
     CONF_HA_CONTAINER_IP,
     CONF_HA_START_MODE,
     CONF_HA_UID,
+    CONF_HISTORY_DATABASE,
+    CONF_HISTORY_MATTERS,
     CONF_INCLUDE_DOMAINS,
     CONF_INCLUDE_ENTITIES,
     CONF_IOT_SUBNETS,
@@ -78,6 +80,9 @@ from .const import (
     CONF_RESTORE_MAX_AGE,
     CONF_SETTLE_DELAY,
     CONF_SNAPSHOT_INTERVAL,
+    CONF_STATISTICS_ENABLED,
+    CONF_STATISTICS_INTERVAL_MINUTES,
+    CONF_STATISTICS_WINDOW_DAYS,
     CONF_TOPOLOGY_MODEL,
     DEFAULT_CLUSTER_NAMESPACE,
     DEFAULT_DOCKER_NETWORK,
@@ -97,12 +102,22 @@ from .const import (
     DEFAULT_RESTORE_MAX_AGE,
     DEFAULT_SETTLE_DELAY,
     DEFAULT_SNAPSHOT_INTERVAL,
+    DEFAULT_STATISTICS_INTERVAL_MINUTES,
+    DEFAULT_STATISTICS_WINDOW_DAYS,
     DEFAULT_TOPOLOGY_MODEL,
     DOCKER_NETWORK_MODES,
     DOMAIN,
     FILESET_EXTRA_CANDIDATES,
     HA_START_MODES,
+    HISTORY_DATABASES,
+    HISTORY_DB_DEDICATED,
     LEADERSHIP_SOURCES,
+    MAX_STATISTICS_INTERVAL_MINUTES,
+    MAX_STATISTICS_WINDOW_DAYS,
+    MIN_STATISTICS_INTERVAL_MINUTES,
+    MIN_STATISTICS_WINDOW_DAYS,
+    RECORDER_DOCS_URL,
+    TOPOLOGY_COLD,
     TOPOLOGY_MODELS,
     TOPOLOGY_WARM,
     validate_namespace,
@@ -563,16 +578,108 @@ def _domains_schema(d: dict[str, Any], hass: HomeAssistant | None = None) -> vol
     )
 
 
+def _cold_only(d: dict[str, Any]) -> bool:
+    """Is warm standby ruled out by the history answers?
+
+    True when history matters AND each node keeps its own database. Warm cannot
+    carry history across a promotion in that case, and a warm promotion that
+    swaps the file is strictly slower than a cold one because it adds a stop it
+    would not otherwise pay.
+    """
+    return (
+        bool(d.get(CONF_HISTORY_MATTERS)) and d.get(CONF_HISTORY_DATABASE) == HISTORY_DB_DEDICATED
+    )
+
+
+def _history_schema(d: dict[str, Any]) -> vol.Schema:
+    """ADR-010 §6: ask about history BEFORE offering standby models.
+
+    Deliberately early. The answer decides which models are even offered, and a
+    wizard that lets someone assemble a combination that cannot work has failed
+    them before they start.
+    """
+    return vol.Schema(
+        {
+            vol.Required(
+                CONF_HISTORY_MATTERS, default=bool(d.get(CONF_HISTORY_MATTERS, True))
+            ): bool,
+            vol.Required(
+                CONF_HISTORY_DATABASE,
+                default=d.get(CONF_HISTORY_DATABASE, HISTORY_DB_DEDICATED),
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=HISTORY_DATABASES,
+                    mode=SelectSelectorMode.LIST,
+                    translation_key="history_database",
+                )
+            ),
+        }
+    )
+
+
+def _statistics_schema(d: dict[str, Any]) -> vol.Schema:
+    """ADR-010: which parts of history actually cross, and how far back.
+
+    Offered only when history matters AND each node keeps its own database --
+    on a shared Postgres or MariaDB both nodes already read the same history
+    and there is nothing to replicate.
+    """
+    return vol.Schema(
+        {
+            vol.Required(
+                CONF_STATISTICS_ENABLED,
+                default=bool(d.get(CONF_STATISTICS_ENABLED, True)),
+            ): bool,
+            vol.Required(
+                CONF_STATISTICS_WINDOW_DAYS,
+                default=int(d.get(CONF_STATISTICS_WINDOW_DAYS) or DEFAULT_STATISTICS_WINDOW_DAYS),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=MIN_STATISTICS_WINDOW_DAYS,
+                    max=MAX_STATISTICS_WINDOW_DAYS,
+                    step=1,
+                    mode=NumberSelectorMode.BOX,
+                    unit_of_measurement="days",
+                )
+            ),
+            vol.Required(
+                CONF_STATISTICS_INTERVAL_MINUTES,
+                default=int(
+                    d.get(CONF_STATISTICS_INTERVAL_MINUTES) or DEFAULT_STATISTICS_INTERVAL_MINUTES
+                ),
+            ): NumberSelector(
+                NumberSelectorConfig(
+                    min=MIN_STATISTICS_INTERVAL_MINUTES,
+                    max=MAX_STATISTICS_INTERVAL_MINUTES,
+                    step=1,
+                    mode=NumberSelectorMode.BOX,
+                    unit_of_measurement="minutes",
+                )
+            ),
+        }
+    )
+
+
 def _topology_schema(d: dict[str, Any]) -> vol.Schema:
     """ADR-001 wizard step 2 + 3: standby model and leadership signal."""
     return vol.Schema(
         {
             vol.Required(
                 CONF_TOPOLOGY_MODEL,
-                default=d.get(CONF_TOPOLOGY_MODEL, DEFAULT_TOPOLOGY_MODEL),
+                default=(
+                    TOPOLOGY_COLD
+                    if _cold_only(d)
+                    else d.get(CONF_TOPOLOGY_MODEL, DEFAULT_TOPOLOGY_MODEL)
+                ),
             ): SelectSelector(
                 SelectSelectorConfig(
-                    options=TOPOLOGY_MODELS,
+                    # 🚨 FILTERED, not warned. History on a dedicated database
+                    # cannot survive a warm promotion -- swapping the recorder
+                    # needs Home Assistant stopped, and `recorder.disable` only
+                    # makes it drop events rather than closing the file. So warm
+                    # is not offered at all rather than offered with a caveat
+                    # nobody reads (ADR-010 §6).
+                    options=[TOPOLOGY_COLD] if _cold_only(d) else TOPOLOGY_MODELS,
                     mode=SelectSelectorMode.LIST,
                     translation_key="topology_model",
                 )
@@ -807,10 +914,19 @@ class ClusterStateSyncConfigFlow(ConfigFlow, domain=DOMAIN):
             # Validating here also gives the operator the friendly message that
             # was already sitting unused in strings.json, instead of an
             # exception.
+            # AR-0043 rides along here for the same two reasons: a callable in
+            # the schema is unserialisable for the frontend, and the operator
+            # deserves a message rather than a traceback. `validate_shell_safe`
+            # is also called inside `build_bundle`, which is the real guard --
+            # this is the half that is polite about it.
             try:
                 validate_namespace(user_input.get(CONF_CLUSTER_NAMESPACE, ""))
+                validate_shell_safe({**self._data, **user_input})
+            except UnsafeBundleValue:
+                errors["base"] = "unsafe_shell_value"
             except vol.Invalid:
                 errors["base"] = "invalid_namespace"
+            if errors:
                 defaults = {
                     CONF_NODE_ID: await _default_node_id(self.hass),
                     **self._data,
@@ -836,7 +952,7 @@ class ClusterStateSyncConfigFlow(ConfigFlow, domain=DOMAIN):
                 # form does not collect -- ha_config_path, ha_container,
                 # topology_model -- and the later steps pre-fill from them.
                 self._data = {**self._data, **data}
-                return await self.async_step_topology()
+                return await self.async_step_history()
 
         # `self._data` last, so a reconfigure shows the entry's own values
         # rather than a freshly-minted node id and a brand-new cluster
@@ -849,6 +965,51 @@ class ClusterStateSyncConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="sentinel" if use_sentinel else "direct",
             data_schema=schema,
             errors=errors,
+        )
+
+    # -- ADR-010 wizard step 1b: history, before the standby model ---------
+
+    async def async_step_history(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Does history matter, and where does it live?
+
+        Asked before the standby model because the answer **restricts** which
+        models are offered. Someone who wants their graphs to survive a failover
+        and keeps a database per node can only have cold standby -- swapping the
+        recorder requires Home Assistant stopped, so a warm promotion that did
+        it would be slower than a cold one.
+        """
+        if user_input is not None:
+            self._data.update(user_input)
+            # Only worth asking when there is something to replicate: on a
+            # shared database both nodes already read the same history.
+            if _cold_only(self._data):
+                return await self.async_step_statistics()
+            return await self.async_step_topology()
+
+        return self.async_show_form(
+            step_id="history",
+            data_schema=_history_schema(self._data),
+            description_placeholders={"recorder_docs": RECORDER_DOCS_URL},
+        )
+
+    async def async_step_statistics(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """What crosses, and the one thing that has to be done by hand.
+
+        The seed is the only manual step in this integration, and it is here
+        rather than hidden in a document because pretending otherwise would
+        leave someone with a standby that reports success and holds no history.
+        """
+        if user_input is not None:
+            # NumberSelector returns floats even in BOX mode with step=1.
+            for key in (CONF_STATISTICS_WINDOW_DAYS, CONF_STATISTICS_INTERVAL_MINUTES):
+                if key in user_input:
+                    user_input[key] = int(user_input[key])
+            self._data.update(user_input)
+            return await self.async_step_topology()
+
+        return self.async_show_form(
+            step_id="statistics",
+            data_schema=_statistics_schema(self._data),
         )
 
     # -- ADR-001 wizard step 2: topology model -----------------------------

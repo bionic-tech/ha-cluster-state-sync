@@ -149,13 +149,39 @@
           "compose_env_file": "Strongly recommended. Sourced and exported before compose runs.",
           "radio_watch": "Globs, e.g. sensor.*_rssi_numeric. Creates a 'radio silence' sensor showing seconds since any of them was last heard from. ⚠ Watch ONE radio's signals — the sensor reports the FRESHEST match, so mixing a Wi-Fi RSSI in with your Zigbee or RF sensors means the Wi-Fi masks the dead radio. Check the sensor's 'status' attribute, not just its value: 'no_reports' means the entities exist but no radio has ever been heard from, and that reads as unknown rather than a big number. Leave empty to skip."
         }
+      },
+      "history": {
+        "title": "Your history, and where it lives",
+        "description": "Home Assistant keeps a **history database** — the record of what happened and when: that you switched the kitchen light on at 19:04 last Tuesday, that an automation ran, that the temperature fell overnight. It is what every graph and the logbook are drawn from.\n\nEach machine normally keeps its **own** copy, so if the other one takes over, its graphs start blank from the day it was built.\n\n**Shared database** — both machines write to one PostgreSQL or MariaDB. Nothing to copy, history is simply continuous, and it works with either standby model. See Home Assistant's own guide: {recorder_docs}\n\n**Dedicated database** — each machine keeps its own SQLite file. Simpler, nothing extra to run. History can still follow a failover, but **only with cold standby**: swapping the file requires Home Assistant to be stopped, so a warm node cannot do it without a restart — which would make it slower than cold.",
+        "data": {
+          "history_matters": "Should history survive a failover?",
+          "history_database": "Where does the history database live?"
+        },
+        "data_description": {
+          "history_matters": "Say no if you only care that the house keeps working and do not mind a gap in the graphs.",
+          "history_database": "This choice decides which standby models you are offered on the next screen."
+        }
+      },
+      "statistics": {
+        "title": "History that survives a failover",
+        "description": "Only **long-term statistics** cross between nodes — the years of energy and climate data behind the Energy dashboard and long-range graphs. On this kind of estate that is about half a megabyte a day.\n\nRecent raw history — the logbook, the last ten days of detail — does **not** cross. It churns roughly sixty times faster, and replicating it was measured at 4 GB a day. After a failover your long graphs are intact and the logbook starts fresh.\n\n**One manual step.** Years of existing statistics cannot arrive half a megabyte at a time, so the standby needs a one-off seed file that you copy across yourself (on an estate this size, about 500 MB — a few seconds over a wired network). Once this is set up, press **Write statistics seed** on the Cluster page and follow the instructions it gives you.\n\nThis uses the same encryption key as the config replication, so leave that switched on.",
+        "data": {
+          "statistics_enabled": "Replicate long-term statistics",
+          "statistics_window_days": "How far back each update reaches",
+          "statistics_interval_minutes": "How often to publish"
+        },
+        "data_description": {
+          "statistics_window_days": "Also how long the standby may be switched off and still catch up completely. 30 days costs about 4.5 MB per update; 90 days about 12.5 MB.",
+          "statistics_interval_minutes": "How much history a failover can lose. Home Assistant compiles statistics every five minutes, so anything faster than that republishes the same data."
+        }
       }
     },
     "error": {
       "cannot_connect": "Could not reach the backend with these settings.",
       "invalid_namespace": "Namespace must be lowercase letters, digits, '_' or '-' only.",
       "fileset_needs_secret": "A cluster secret is required to encrypt the replicated fileset. Set one on the backend step before enabling this.",
-      "must_accept": "You must accept before continuing. This software carries no warranty."
+      "must_accept": "You must accept before continuing. This software carries no warranty.",
+      "unsafe_shell_value": "One of these values contains a character that cannot be used here — most likely a quote, a space, a backtick, or one of ; & | $ ( ). These values are written into scripts this host runs as root, so anything that could change what those scripts do is refused. Check the container name, config path, Valkey host, username and peer address."
     },
     "abort": {
       "already_configured": "This node is already configured for this cluster namespace.",
@@ -166,6 +192,22 @@
     "fileset_degraded": {
       "title": "Standby config fileset is degraded",
       "description": "The host-side swap could not put a fresh copy of the config fileset in place before this instance started (reason: {reason}). Decision D4 promotes anyway rather than refuse to boot, so Home Assistant is running, but integrations, devices, and the mobile app's login may be missing or out of date. Check the swap log on the host, and reload this integration once a fresh fileset has been staged and swapped in."
+    },
+    "statistics_schema_mismatch": {
+      "title": "Standby cannot store history: recorder schema mismatch",
+      "description": "The standby refused the replicated long-term statistics because its recorder schema is a different version from this node's ({detail}). It refuses rather than guessing, because writing rows shaped for one schema into another corrupts history in a way that opens cleanly and is wrong. Its history has stopped advancing and will have a hole from now until this is fixed. Bring both nodes to the same Home Assistant version, then start the standby's Home Assistant once so its recorder migrates."
+    },
+    "statistics_gap": {
+      "title": "Standby's history has a gap that will not close",
+      "description": "The standby has been out of contact for longer than the statistics window reaches back, so the history in between is on neither node and no later window will contain it ({detail}). Everything from here forward will replicate normally. To recover the missing stretch, widen the statistics window and wait one publish, or write a fresh seed and copy it across."
+    },
+    "statistics_not_seeded": {
+      "title": "Standby has no history to replicate into",
+      "description": "Long-term statistics are being published, but the standby has nowhere to put them ({detail}). Years of statistics cannot arrive through the window — it carries about half a megabyte a day — so the standby needs a one-off seed. Use the 'Write statistics seed' button, copy the file it names to the same path on the standby, and the next pull there will adopt it automatically."
+    },
+    "statistics_stalled": {
+      "title": "Standby's history replication has gone quiet",
+      "description": "The standby has not reported applying long-term statistics for several publish intervals ({detail})\n\nThis alarm exists because silence used to be indistinguishable from success: the standby's status expires, the warnings clear themselves, and replication that had stopped looked exactly like replication that was working."
     }
   },
   "options": {
@@ -230,6 +272,15 @@
       },
       "radio_silence": {
         "name": "Radio silence"
+      },
+      "oversized_entities": {
+        "name": "Oversized entities"
+      },
+      "recorder_snapshot_age": {
+        "name": "Recorder snapshot age"
+      },
+      "statistics_age": {
+        "name": "Statistics replication age"
       }
     },
     "binary_sensor": {
@@ -244,6 +295,11 @@
       },
       "maintenance_hold": {
         "name": "Maintenance hold"
+      }
+    },
+    "button": {
+      "statistics_seed": {
+        "name": "Write statistics seed"
       }
     }
   },
@@ -273,6 +329,12 @@
       "options": {
         "docker": "docker start / docker stop (default)",
         "compose": "docker compose (one service)"
+      }
+    },
+    "history_database": {
+      "options": {
+        "shared": "Shared — one database both machines use (PostgreSQL / MariaDB)",
+        "dedicated": "Dedicated — each machine keeps its own SQLite file"
       }
     }
   },

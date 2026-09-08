@@ -20,6 +20,9 @@ Architecture Decision Records capture the context, decision, and consequences of
 | [ADR-005](./ADR-005-generate-not-control.md) | Generate host configuration, do not control the host | ✅ Accepted | 2026-08-06 |
 | [ADR-006](./ADR-006-lease-promoter.md) | The lease promoter replaces Keepalived | ✅ Accepted | 2026-09-01 |
 | [ADR-007](./ADR-007-operator-surface.md) | The operator surface — a self-registering panel, and controls as flag files | ✅ Accepted | 2026-09-07 |
+| [ADR-008](./ADR-008-liveness-signals-must-prove-measurement.md) | A liveness signal must prove it measured something | ✅ Accepted | 2026-09-07 |
+| [ADR-009](./ADR-009-radio-custody-failure-modes.md) | Radio custody follows the lease only on host loss | ✅ Accepted *(records an open gap)* | 2026-09-07 |
+| [ADR-010](./ADR-010-recorder-history-continuity.md) | History continuity by whole-copy snapshots, not replication | ✅ Accepted *(partly built)* | 2026-09-08 |
 
 ## Status Key
 
@@ -40,7 +43,12 @@ docs/adr/
 ├── ADR-002-snapshot-integrity.md
 ├── ADR-003-leadership-resolution.md
 ├── ADR-004-snapshot-write-semantics.md
-└── ADR-005-generate-not-control.md
+├── ADR-005-generate-not-control.md
+├── ADR-006-lease-promoter.md
+├── ADR-007-operator-surface.md
+├── ADR-008-liveness-signals-must-prove-measurement.md
+├── ADR-009-radio-custody-failure-modes.md
+└── ADR-010-recorder-history-continuity.md
 ```
 
 ## Reading order
@@ -53,3 +61,8 @@ adversarial review forced.
 - **Reviewing security?** ADR-002, then 22 STRIDE.
 - **Deploying?** ADR-001 for the model, ADR-003 for the leadership signal,
   ADR-005 for what the wizard will and will not do for you.
+- **Have radios (Zigbee, 433 MHz, Z-Wave)?** **[ADR-009](./ADR-009-radio-custody-failure-modes.md)
+  before you buy hardware** — how a radio is attached decides whether it can fail over at all.
+- **Building alerting or reading a diagnostic?**
+  [ADR-008](./ADR-008-liveness-signals-must-prove-measurement.md) — why some of them read
+  `unknown` on purpose, and why a numeric threshold alone can be silent when it matters most.

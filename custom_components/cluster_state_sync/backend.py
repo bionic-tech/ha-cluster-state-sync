@@ -34,7 +34,11 @@ from .const import (
     meta_key,
     node_key,
     node_key_pattern,
+    promoter_key,
+    promoter_key_pattern,
     states_key,
+    statistics_key,
+    statistics_status_key,
 )
 from .lease import LEASE_SCRIPT as _LEASE_SCRIPT
 from .lease import RELEASE_SCRIPT as _RELEASE_SCRIPT
@@ -296,6 +300,36 @@ class ClusterBackend(ABC):
     @abstractmethod
     async def prune_blobs(self, keep: Collection[str]) -> int:
         """Delete every stored blob whose ref is not in `keep`. Returns the count."""
+
+    @abstractmethod
+    async def write_statistics(self, sealed: bytes) -> None:
+        """Store the sealed long-term-statistics window, replacing the last one.
+
+        A single key rather than the fileset's content-addressed blobs: the
+        window is one object that is entirely rewritten each pass, so there is
+        nothing to deduplicate and nothing to garbage collect. Raises on
+        failure, like `write_fileset` and unlike the reads -- a publisher
+        reporting a window it never stored is the AR-0040 shape.
+        """
+
+    @abstractmethod
+    async def read_statistics_status(self) -> bytes | None:
+        """Return the follower's last status, still sealed.
+
+        Bytes rather than a parsed dict because this channel is sealed
+        (AR-0045) and this class holds no key: opening it belongs to the
+        caller, which does. None on a miss or a backend failure.
+        """
+
+    @abstractmethod
+    async def read_promoter_nodes(self) -> set[str]:
+        """Node ids whose host-side promoter heartbeat is currently live.
+
+        The only signal that distinguishes "the standby is switched off" from
+        "the standby is up and its replication has stopped" -- two states that
+        look identical from the statistics channel alone, and need opposite
+        things from an operator (AR-0046).
+        """
 
 
 class RedisBackend(ClusterBackend):
@@ -828,6 +862,49 @@ class RedisBackend(ClusterBackend):
         except Exception:  # noqa: BLE001 — never crash HA on backend failure
             _LOGGER.warning("Failed to prune fileset blobs in Redis", exc_info=True)
             return 0
+
+    async def write_statistics(self, sealed: bytes) -> None:
+        """Base64 for the same reason `write_fileset` uses it: the client is
+        built with `decode_responses=True`, and sealed bytes pushed through a
+        UTF-8 round trip come back corrupted without complaint."""
+        if self._client is None:
+            raise RuntimeError("Cannot write statistics: backend is not connected")
+        await self._client.set(
+            statistics_key(self._namespace),
+            base64.b64encode(sealed).decode("ascii"),
+        )
+
+    async def read_statistics_status(self) -> bytes | None:
+        """Read the follower's sealed status line. Never raises -- class contract."""
+        if self._client is None:
+            return None
+        try:
+            raw = await self._client.get(statistics_status_key(self._namespace))
+            return base64.b64decode(raw) if raw is not None else None
+        except Exception:  # noqa: BLE001 — never crash HA on backend failure
+            _LOGGER.warning("Failed to read the statistics follower status", exc_info=True)
+            return None
+
+    async def read_promoter_nodes(self) -> set[str]:
+        """Whose promoter is beating. Empty on failure -- class contract.
+
+        Scanned rather than tracked: the heartbeat is written by a host-side
+        timer this integration never sees, on a node whose Home Assistant may
+        be stopped, which is exactly why it is the right signal here.
+        """
+        if self._client is None:
+            return set()
+        try:
+            prefix = promoter_key(self._namespace, "")
+            return {
+                _ref_of(key, prefix)
+                async for key in self._client.scan_iter(
+                    match=promoter_key_pattern(self._namespace), count=100
+                )
+            }
+        except Exception:  # noqa: BLE001 — never crash HA on backend failure
+            _LOGGER.warning("Failed to read promoter heartbeats from Redis", exc_info=True)
+            return set()
 
 
 def default_node_id() -> str:

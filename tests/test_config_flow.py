@@ -87,6 +87,10 @@ async def test_direct_backend_step_accepts_valid_input(hass: HomeAssistant) -> N
         result = await hass.config_entries.flow.async_configure(flow_id, direct_input())
 
     assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "history"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"history_matters": False, "history_database": "shared"}
+    )
     assert result["step_id"] == "topology"
 
 
@@ -446,3 +450,69 @@ def test_domain_options_include_what_the_instance_actually_runs() -> None:
     for d in DEFAULT_INCLUDE_DOMAINS:
         assert d in options, "a default must never vanish from the form"
     assert options == sorted(options), "stable order, so the form does not reshuffle"
+
+
+async def test_the_statistics_step_appears_only_when_there_is_history_to_replicate(
+    hass: HomeAssistant,
+) -> None:
+    """A dedicated database per node is the only case worth asking about.
+
+    On a shared Postgres or MariaDB both nodes already read the same history,
+    so the question is noise — and a wizard that asks it there teaches people
+    that its questions are optional.
+    """
+    flow_id = await start_direct_flow(hass)
+    with patch(
+        "custom_components.cluster_state_sync.config_flow._test_backend",
+        return_value=None,
+    ):
+        result = await hass.config_entries.flow.async_configure(flow_id, direct_input())
+
+    assert result["step_id"] == "history"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"history_matters": True, "history_database": "dedicated"}
+    )
+    assert result["step_id"] == "statistics", "the statistics step was skipped"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            "statistics_enabled": True,
+            "statistics_window_days": 30,
+            "statistics_interval_minutes": 30,
+        },
+    )
+    assert result["step_id"] == "topology"
+
+
+async def test_the_statistics_numbers_are_stored_as_integers(hass: HomeAssistant) -> None:
+    """`NumberSelector` hands back floats even with step=1.
+
+    They reach `timedelta(minutes=...)` and a systemd `OnUnitActiveSec=` line,
+    where `30.0min` is not a value systemd parses — the timer would fail to
+    load and the standby's history would quietly stop advancing.
+    """
+    flow_id = await start_direct_flow(hass)
+    with patch(
+        "custom_components.cluster_state_sync.config_flow._test_backend",
+        return_value=None,
+    ):
+        result = await hass.config_entries.flow.async_configure(flow_id, direct_input())
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"history_matters": True, "history_database": "dedicated"}
+    )
+    flow = next(
+        f for f in hass.config_entries.flow.async_progress() if f["flow_id"] == result["flow_id"]
+    )
+    await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            "statistics_enabled": True,
+            "statistics_window_days": 45.0,
+            "statistics_interval_minutes": 15.0,
+        },
+    )
+    handler = hass.config_entries.flow._progress[flow["flow_id"]]
+    assert handler._data["statistics_window_days"] == 45
+    assert handler._data["statistics_interval_minutes"] == 15
+    assert isinstance(handler._data["statistics_interval_minutes"], int)

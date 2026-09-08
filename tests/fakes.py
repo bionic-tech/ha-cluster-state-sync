@@ -40,6 +40,19 @@ class FakeBackend(ClusterBackend):
         self.read_result: tuple[dict[str, SnapshotEntry], dict[str, Any]] | None = None
         self.fileset_manifest: bytes | None = None
         self.blobs: dict[str, bytes] = {}
+        # The statistics window, and the line the follower writes back.
+        # `fail_writes` covers this too: the real `write_statistics`
+        # raises rather than returning quietly, and a fake that swallowed
+        # the failure would exercise the publisher's error path as a
+        # no-op -- the exact way an omitted field turns a guard into a
+        # test that cannot fail.
+        self.statistics: bytes | None = None
+        # SEALED bytes, as the real backend returns them -- a fake that
+        # handed back a parsed dict would exercise the leader's unsealing
+        # as a no-op, which is the shape that turns a guard into a test
+        # that cannot fail.
+        self.statistics_status: bytes | None = None
+        self.promoter_nodes: set[str] = set()
 
     async def connect(self) -> None:
         self.connected = True
@@ -125,6 +138,17 @@ class FakeBackend(ClusterBackend):
         for ref in doomed:
             del self.blobs[ref]
         return len(doomed)
+
+    async def write_statistics(self, sealed: bytes) -> None:
+        if self.fail_writes:
+            raise RuntimeError("fake backend: statistics write failed")
+        self.statistics = sealed
+
+    async def read_statistics_status(self) -> bytes | None:
+        return self.statistics_status
+
+    async def read_promoter_nodes(self) -> set[str]:
+        return set(self.promoter_nodes)
 
     # -- assertion helpers -------------------------------------------------
 

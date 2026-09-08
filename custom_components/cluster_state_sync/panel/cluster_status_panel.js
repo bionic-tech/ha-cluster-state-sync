@@ -149,6 +149,28 @@ class ClusterStatusPanel extends HTMLElement {
       </div>`;
   }
 
+  /* AR-0044. Everything below builds HTML as a template string and assigns it
+   * to `innerHTML`, so any value interpolated into it is markup unless it is
+   * escaped. That was fine while every value came from this node's own
+   * entities. It stopped being fine when the cluster view started rendering
+   * data the PEER writes: `sensor.<node>_cluster_leader` is
+   * `coordinator.data.leader`, read straight out of the shared Valkey store,
+   * and the node registry is not the sealed-blob channel. Valkey write access
+   * was therefore enough to put markup into a page running with an
+   * administrator's session.
+   *
+   * Escaping on the way in rather than switching to `textContent`: the card
+   * bodies are assembled as strings by half a dozen helpers, and a partial
+   * conversion is how you end up with one that was missed. */
+  _esc(value) {
+    return String(value == null ? "" : value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
   _fmtAge(st) {
     if (!st) return "—";
     const n = Number(st.state);
@@ -164,7 +186,7 @@ class ClusterStatusPanel extends HTMLElement {
     let cls = "";
     if (opts.goodWhen) cls = st.state === opts.goodWhen ? "good" : "bad";
     if (opts.warnWhen && opts.warnWhen(st)) cls = "warn";
-    return `<div class="row"><span>${label}</span><b class="${cls}">${val}</b></div>`;
+    return `<div class="row"><span>${this._esc(label)}</span><b class="${cls}">${this._esc(val)}</b></div>`;
   }
 
   /* The hold, as a control when the switch entity exists and as a readout when
@@ -177,7 +199,7 @@ class ClusterStatusPanel extends HTMLElement {
     const on = sw.state === "on";
     return `<div class="row"><span>Maintenance hold</span>
       <button class="toggle ${on ? "on" : ""}"
-              data-hold-entity="${sw.entity_id}" data-hold-on="${on}">
+              data-hold-entity="${this._esc(sw.entity_id)}" data-hold-on="${on}">
         ${on ? "SUSPENDED — click to resume" : "failover live — click to suspend"}
       </button></div>`;
   }
@@ -197,7 +219,7 @@ class ClusterStatusPanel extends HTMLElement {
     }
     return `<div class="row"><span>Hand over to peer</span>
       <button class="toggle ${pending ? "pending" : "danger"}"
-              data-hold-entity="${sw.entity_id}" data-hold-on="${pending}"
+              data-hold-entity="${this._esc(sw.entity_id)}" data-hold-on="${pending}"
               title="Releases the lease so the peer promotes, and stops Home Assistant on this node. The peer has no radios unless hardware custody hooks are installed.">
         ${pending ? "REQUESTED — click to withdraw" : "hand over now"}
       </button></div>`;
@@ -216,7 +238,7 @@ class ClusterStatusPanel extends HTMLElement {
             const held = e.maintenance_hold && e.maintenance_hold.state === "on";
             return `
       <div class="card ${leader ? "leader" : ""}">
-        <h2>${node}${leader ? ' <span class="tag">LEADER</span>' : ""}${
+        <h2>${this._esc(node)}${leader ? ' <span class="tag">LEADER</span>' : ""}${
               held ? ' <span class="tag hold">HOLD</span>' : ""
             }</h2>
         <div class="grid">

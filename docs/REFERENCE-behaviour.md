@@ -11,6 +11,58 @@ real outages, [GOTCHAS.md](GOTCHAS.md).
 
 ## Sizing & performance
 
+<details open>
+<summary><strong>Measured on a real 3,595-entity estate</strong> — start here if you have a big install</summary>
+
+The guidance below this box was written against a 200-entity assumption. Here is a
+**measured** instance that is 18× that, on 2026-09-08:
+
+| | |
+|---|---|
+| Total entities in Home Assistant | **3,595** |
+| Mirrored under the **default** domain list | **28** (4.6 KB, ~170 bytes each) |
+| If you mirrored **every** entity | **0.8 MB** |
+| `device_tracker` alone | **1,412** entities (opt-in, off by default) |
+| Fattest single entity | `sensor.watchman_missing_entities` — **100,911 bytes** of attributes |
+
+**Entity count is almost certainly not your constraint.** Even mirroring everything on that estate
+is under a megabyte, which is nothing to a Valkey. The 200-entity figure in the older text below
+understates reality by an order of magnitude and it still does not matter.
+
+**Individual fat entities are the risk, but only once you widen the domains.** `sensor` is **not**
+in the default list, so that 100 KB watchman entity is not tracked at all today. It becomes a
+problem the moment a large-estate operator adds `sensor` — which is exactly the tempting move.
+
+`MAX_ATTRIBUTE_BYTES` is **16 KB**. Anything above it is now dropped **on write** and refused on
+read, and the count is surfaced as the **Oversized entities** diagnostic with the offending entity
+IDs in its attributes. Until 2026-09-08 the cap was applied on *read only*, so such an entity was
+written on every flush and declined on every restore — full write cost, forever, for an entry
+guaranteed unusable.
+
+### What not to mirror, at any scale
+
+The question worth asking is not "how many" but "which".
+
+| Do not mirror | Why |
+|---|---|
+| `device_tracker`, `person` | The biggest domains on a large estate *and* the ones that tell a reader of the shared hash when the house is empty. Opt-in, off by default, and that default is right. |
+| `sensor` wholesale | Overwhelmingly device-backed. A temperature sensor corrects itself on its next poll; replicating it buys nothing and costs the most rows. |
+| Anything a diagnostic tool generates | Watchman, system monitors, "missing entities" reports. Large, derived, and worthless after a promotion — one such entity measured **100,911 bytes**. |
+| `update`, `button`, `event` | Stateless or trivially rebuilt. |
+
+| Do mirror | Why |
+|---|---|
+| `input_*`, `counter`, `timer` | **Helpers have no device to ask.** If they are not replicated they are simply lost, and they are usually what your automations branch on. |
+| `climate`, `water_heater`, `humidifier` | Device-backed, but a wrong setpoint acts on the physical world before the next poll corrects it. |
+| `vacuum` | Long-running state that does not re-derive quickly. |
+
+**The rule of thumb:** replicate what cannot re-derive itself. A helper cannot; a device-backed
+sensor can. That is why the default list is short and why lengthening it rarely helps.
+
+</details>
+
+
+
 * Each state takes roughly 200–500 bytes serialised.
 * A typical home with 200 tracked entities → ~80KB snapshot.
 * Write cost: one Redis `HSET` + `SET` per flush, and the flush is skipped

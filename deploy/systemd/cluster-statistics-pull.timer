@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the cluster statistics pull, so a follower's history keeps pace with the leader's
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

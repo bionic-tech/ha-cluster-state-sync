@@ -1,0 +1,7 @@
+[Unit]
+Description=Cluster State Sync — pull the replicated fileset onto this follower
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/etc/cluster-sync/cluster-fileset-pull.sh

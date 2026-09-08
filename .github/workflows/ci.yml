@@ -136,6 +136,45 @@ jobs:
             | tee runtime-requirements.txt
       - name: Audit runtime requirements
         run: pip-audit --requirement runtime-requirements.txt --strict --progress-spinner off
+      # The dev tree, split into what we can act on and what Home Assistant
+      # pins for us. A plain pip-audit here is permanently red for reasons
+      # nobody in this repository can fix, and a gate that is always red is a
+      # gate everyone learns to scroll past. Exits non-zero only on the
+      # actionable set. AR-0033: the script existed and was never wired in.
+      - name: Install dev requirements for the split audit
+        run: pip install -r requirements-dev.txt
+      - name: Audit development requirements (actionable vs upstream)
+        run: python scripts/audit_deps.py
+
+  sast:
+    name: Static analysis (bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install bandit
+        run: pip install "$(grep -E '^bandit==' requirements-dev.txt)"
+      # Reported in full every run, so nothing is hidden.
+      - name: Report every finding
+        run: bandit -r custom_components/ scripts/ -f screen || true
+      # 🚨 Gates on HIGH severity and HIGH confidence only, deliberately.
+      #
+      # At medium the current tree fails on three findings that are all
+      # false positives: two B105 "hardcoded password" hits on environment
+      # variable NAMES, and a B103 on a `chmod 0o750` that is intentional and
+      # commented. Gating on those would teach everyone to add `# nosec` until
+      # the tool says nothing, which is worse than not running it.
+      #
+      # And the honest limit, tested rather than assumed: bandit did NOT catch
+      # AR-0043. Run against the pre-fix bundle.py it found nothing about the
+      # shell injection, because no rule covers BUILDING a string that another
+      # machine executes hours later. This job is a regression net for the
+      # subprocess, SQL and crypto classes it does understand — not a claim
+      # that the largest privileged surface here is covered.
+      - name: Fail on high severity
+        run: bandit -r custom_components/ scripts/ --severity-level high --confidence-level high
 
   hassfest:
     name: Validate (hassfest)

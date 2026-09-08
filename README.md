@@ -2,8 +2,14 @@
 
 > **Status**: alpha — boots, listens, snapshots, restores, and has survived
 > measured failovers on a live two-node cluster. Not yet battle-tested by anyone
-> but its author. Built for a 2.5-minute failover budget against a Valkey/Redis
-> Sentinel cluster.
+> but its author.
+>
+> **Measured 2026-09-07 on real hardware: a standby fully initialised in ~102
+> seconds** against a 2.5-minute budget, after simulated host loss. (It answers
+> HTTP at 78.8 s, but the root path responds before integrations and automations
+> are up — the honest number is the later one.) Two honest
+> qualifications on that number, both explained below: it covers *host loss*
+> only, and the promoted node had **no radios**.
 
 > ## ⚠ No warranty — read before installing
 >
@@ -25,6 +31,40 @@
 > state, would matter to you, do not run this on a system you rely on until you
 > have proven it on one you do not.
 
+## In one minute, without jargon
+
+You run Home Assistant. If the machine it runs on dies, your house stops
+responding until you fix it — and when you do bring a second machine up, it
+knows nothing: no login, no history of what was on or off, none of your setup.
+
+This puts a **second machine on standby**. Both talk to a small shared
+noticeboard. The active one keeps writing what everything is doing; the standby
+keeps a copy of your logins and settings. If the active one dies, the standby
+notices within about half a minute and takes over — **working again in about a
+hundred seconds**, with your accounts, your integrations and your last known states
+already in place.
+
+**What it does not do**, plainly:
+
+- It is **not** a backup. Take backups as well.
+- It does **not** make Home Assistant itself more reliable — it makes *losing a
+  machine* survivable.
+- While both are briefly up, **both run your automations**, so anything that
+  sends a message or costs money can happen twice.
+- If your devices are on **USB sticks plugged into a machine**, they usually do
+  **not** follow. That is a plug, not software — read
+  **[the radio guide](docs/GUIDE-radios.md)** before you buy anything.
+
+**Is this for you?** If you have never run Home Assistant, no — get comfortable
+with it first; this replicates whatever you have, including your mistakes. If
+you run it in Docker on a machine you can get a root shell on, and losing it for
+an evening would genuinely bother you, then yes.
+
+> **New to any of this?** Every term used anywhere in these docs is defined in
+> **[the glossary](docs/GLOSSARY.md)** — no prior Home Assistant, Docker or
+> clustering knowledge assumed. If a word is missing from it, that is a bug in
+> the docs.
+
 ## Where to start
 
 Pick the row that matches what you are trying to do. Everything below this table
@@ -32,17 +72,19 @@ is reference — you do not need to read the README front to back.
 
 | I want to… | Go to |
 |---|---|
+| **Understand a word I don't know** | [GLOSSARY.md](docs/GLOSSARY.md) — every term, no assumed knowledge |
 | **Install it** | [RUNBOOK-installation.md](docs/RUNBOOK-installation.md) — requirements, which HA install types can run the failover half at all, and the order things must be done in |
+| **Work out whether my radios can fail over** | 🚨 [GUIDE-radios.md](docs/GUIDE-radios.md) — **read before buying hardware.** How a Zigbee or 433 MHz stick is attached decides whether it can move at all |
 | **Use the dashboard** | [GUIDE-dashboard.md](docs/GUIDE-dashboard.md) — every row and button, what the colours mean, and **when not to press each one** |
 | **Fix something that is broken** | [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — symptom-first, from real failures on a live cluster |
-| **Change the restore, the swap, or the bundle** | 🚨 [GOTCHAS.md](docs/GOTCHAS.md) **first** — 24 traps this project actually fell into, nearly all of which reported success while doing nothing |
+| **Change the restore, the swap, or the bundle** | 🚨 [GOTCHAS.md](docs/GOTCHAS.md) **first** — 26 traps this project actually fell into, nearly all of which reported success while doing nothing |
 | **Understand what it does at runtime** | [REFERENCE-behaviour.md](docs/REFERENCE-behaviour.md) — restore semantics, leadership, sizing, actions |
 | **Keep the mobile app working through a failover** | GUIDE-ingress.md — the cluster can promote in 15 seconds and still leave the app dead |
 | **Bring a standby up from cold** | [RUNBOOK-standby-bringup.md](docs/RUNBOOK-standby-bringup.md) |
 | **Know why it is built this way** | [the ADRs](docs/adr/README.md), with a suggested reading order |
 | **Work on the code** | CONTRIBUTING.md |
 | **Re-litigate a closed decision** | [DECISIONS-SETTLED.md](docs/DECISIONS-SETTLED.md) — check here first; several of these keep being rediscovered as blockers |
-| **See what changed** | v0.3.1 · v0.3.0 |
+| **See what changed** | v0.3.5 · v0.3.1 · v0.3.0 |
 
 ## What this is
 
@@ -101,6 +143,10 @@ graph LR
 
 ## Failover topology & standby models
 
+<details>
+<summary><strong>Intermediate — cold vs warm, and the gating layers</strong> (click to expand)</summary>
+
+
 The two nodes run **shared-nothing** (independent drives, no NFS) with three replication tiers —
 slow config via `rsync`, live entity state via this integration, and history via shared Postgres —
 and a **selectable standby posture**:
@@ -117,6 +163,8 @@ leadership actually changes — so there is no VIP, no VRRP, and no second elect
 the first. The setup **wizard** picks the model and generates the host-side bundle. See
 **[ADR-001 — Active-passive topology](docs/adr/ADR-001-active-passive-topology.md)** for the full
 decision, the Docker firewall recipe, and the trade-offs.
+
+</details>
 
 ## Installation
 
@@ -157,6 +205,8 @@ done in. The short version:
 | Snapshot interval | 5s | How often the buffer flushes to Redis. Lower = less data loss on failover, more write pressure. |
 | Restore max age | 1800s (30m) | Snapshots older than this are ignored on startup. Stops a node coming back after a week from restoring ancient garbage. |
 | Include domains | see `const.py` | Entity domains we mirror. Defaults to `input_*`, `counter`, `timer`, `vacuum`, `climate`, `humidifier`, `water_heater`. **`person`, `device_tracker` and `alarm_control_panel` are opt-in** — see `SENSITIVE_DOMAINS`. Edit `DEFAULT_INCLUDE_DOMAINS` to extend. |
+| Gate automations | `off` | Warm standby only. Stops the *automation engine* on a follower, so both nodes do not fire your automations during an overlap. Off by default — turning it on means a promoted node needs its automations re-enabled by the promotion path. |
+| Gate recorder | `off` | Warm standby only. Stops a follower writing history, so two nodes do not interleave rows into a shared recorder database. |
 | Entities that prove a radio is receiving | *(empty — off)* | Globs, e.g. `sensor.*_rssi_numeric`. Creates a **Radio silence** sensor: seconds since the freshest of them last changed. See [Diagnostics](#diagnostics). |
 
 ## What you get in Home Assistant
@@ -199,6 +249,9 @@ Every way this integration fails is quiet by design, so it exposes its own
 health as entities. Backend errors are deliberately swallowed — a Redis outage
 must never crash Home Assistant — which makes these the *only* place that
 failure becomes visible.
+
+<details>
+<summary><strong>All fourteen diagnostic entities, grouped by what they tell you</strong> (click to expand)</summary>
 
 **Replication health**
 
@@ -244,9 +297,15 @@ two of them read `unknown`:
 | `no_reports` | entities matched, none has ever reported — **the radio is deaf** |
 
 `no_reports` is the loudest condition the sensor can find and it is deliberately
-not a large number, because "never" has no age. On this fleet an alert
-thresholded on the value alone would have sat quietly through **thirty hours**
-of completely deaf RFXtrx receivers.
+not a large number, because "never" has no age — a value threshold alone can
+never fire on it.
+
+⚠ **This measurement needs a device that transmits unprompted.** If every
+entity you watch belongs to a switch or a remote, you are measuring human
+activity, not radio liveness: after a restart it reads `no_reports` until
+somebody presses something. Check your own longest normal gap between packets
+before setting any threshold — on the fleet this was built for it is **nine
+hours**.
 
 🚨 **Watch one radio's signals per list.** The sensor reports the *freshest*
 match, which is right within a radio and wrong across radios: a Wi-Fi RSSI
@@ -258,6 +317,8 @@ It also reads near-zero for the first few minutes after a Home Assistant
 restart — Home Assistant writes every entity's state as it starts, so a low
 value there says nothing about whether a packet has actually arrived. Set any
 alert threshold longer than your instance's boot time.
+
+</details>
 
 Radio silence is the answer to a gap the failover design does not close and
 still will not: Home Assistant can be perfectly healthy while every radio behind
@@ -314,6 +375,9 @@ The v1 adversarial review rated this integration's original security posture
 and alarm state mirrored by default, in plaintext, into a shared keyspace
 protected by one password, then applied verbatim on restore with no integrity
 check. Each leg is addressed below.
+
+<details>
+<summary><strong>Intermediate / advanced — the full security posture</strong> (click to expand)</summary>
 
 ### Cluster secret (required)
 
@@ -387,6 +451,8 @@ leaked credential does not become the run of your Valkey.
   window. See the known limitations.
 * **Tombstones.** A deleted entity lingers in the shared hash until overwritten.
 
+</details>
+
 ## Setup wizard & the host bundle
 
 The config flow is a five-step wizard (ADR-001 §4). Steps 4 and 5 only appear
@@ -414,6 +480,9 @@ an invitation to install both and end up with two elections racing each other.
 Regenerating prunes artifacts that no longer apply, so switching warm → cold
 does not leave orphaned firewall rules behind claiming to be live.
 
+<details>
+<summary><strong>Advanced — the generated firewall rules and how not to lock yourself out</strong></summary>
+
 > ### The firewall rules are generated blind
 >
 > They are written from your wizard answers without any access to the machines
@@ -438,6 +507,8 @@ If you don't know your Docker network mode, pick "Not sure" and all three
 variants are generated; the notify scripts then call a dispatcher with a single
 `NETWORK_MODE=` setting for you to fill in once, rather than guessing.
 
+</details>
+
 ## Known limitations
 
 * Two HA instances both running automations will double-fire during the
@@ -447,6 +518,47 @@ variants are generated; the notify scripts then call a dispatcher with a single
 * Each flush writes the full tracked map rather than a delta. Fine for
   hundreds of entities; would need rethinking at tens of thousands.
 * HomeKit/Matter cryptographic identity is out of scope.
+* **Radios move late when Home Assistant alone dies.** Host loss releases them
+  in ~17s; an HA-only failure releases them via the node's own demote path,
+  which waits out the full 600s probe grace first — so ~10 minutes. A narrower
+  case (the *promoter* dies while the machine and its USB/IP client stay alive)
+  releases nothing at all.
+  [ADR-009](docs/adr/ADR-009-radio-custody-failure-modes.md).
+* **A directly-attached USB radio can never fail over**, by construction. Nor
+  can a radio whose consumer is a separate container that does not itself fail
+  over (deCONZ, Zigbee2MQTT). [GUIDE-radios.md](docs/GUIDE-radios.md).
+* **An HA-only failure cannot meet the 2.5-minute budget by design.** The leader
+  keeps renewing for the full 600s probe grace before releasing, so that path is
+  ~10.5 minutes. Deliberate — the grace exists to ride out restarts — but it is
+  a property of the design, not a bug to be fixed.
+* 🚨 **If Valkey goes away, the cluster silently stops being able to fail
+  over.** Both instances keep running and the house is unaffected — but no node
+  can take or renew the lease, so a real failure afterwards has nothing to
+  promote it. From the dashboard, "my cluster is fine" and "my cluster cannot
+  fail over" look identical. The lease has to live somewhere; that is what
+  Sentinel is offered for. Watch `binary_sensor.<node>_backend` and alert on
+  it, because it is the only thing that distinguishes those two states.
+* **Long-term statistics replicate; raw history does not.** Turn on statistics
+  replication and the years of energy and climate data behind the Energy
+  dashboard survive a failover. The logbook and the last ten days of detail do
+  not — they churn about sixty times faster, and carrying them was measured at
+  4 GB a day against half a megabyte for the part worth having. Point both
+  nodes at a shared Postgres or MariaDB and everything survives, which is what
+  the wizard steers toward. [ADR-010](docs/adr/ADR-010-recorder-history-continuity.md).
+* **Statistics replication needs one manual step, once.** Six and a half
+  million existing rows cannot arrive at half a megabyte a day, so the standby
+  needs a seed file you copy across yourself — press **Write statistics seed**
+  and follow what it tells you. About 500 MB on an estate this size; seconds
+  over a wired network.
+* 🚨 **Single-connection local integrations fight under a cluster.** LocalTuya,
+  the ESPHome native API and some Z-Wave sticks permit **one** local connection
+  per device. Where a cloud integration degrades gracefully when both nodes
+  connect, these actively evict each other — so during an overlap window a
+  device flaps `unavailable` and can come back reporting a state nobody
+  commanded. Measured on this fleet: one LocalTuya light spent **153 of 202
+  recorded states** unavailable. If you run such an integration, treat the
+  overlap window as genuinely destructive rather than merely untidy, and keep
+  it short.
 
 ## Settled decisions
 
@@ -458,7 +570,7 @@ rebuild, Sentinel, the Valkey placement, the cold-standby default and secret sto
 
 | Document | Covers |
 |---|---|
-| [ADR index](docs/adr/README.md) | All seven architecture decisions, with a suggested reading order |
+| [ADR index](docs/adr/README.md) | All nine architecture decisions, with a suggested reading order |
 | [ADR-001 — Active-passive topology](docs/adr/ADR-001-active-passive-topology.md) | Cold vs warm standby, the four gating layers, three replication tiers |
 | [ADR-002 — Snapshot integrity](docs/adr/ADR-002-snapshot-integrity.md) | Why entries are signed, what is signed, and why no secret means no restore |
 | [ADR-003 — Leadership resolution](docs/adr/ADR-003-leadership-resolution.md) | The three signals, the atomic lease, and failing closed |
@@ -466,6 +578,10 @@ rebuild, Sentinel, the Valkey placement, the cold-standby default and secret sto
 | [ADR-005 — Generate, don't control](docs/adr/ADR-005-generate-not-control.md) | Why the integration emits host config instead of applying it |
 | [ADR-006 — Lease promoter](docs/adr/ADR-006-lease-promoter.md) | Why Keepalived went, and why one election beats two |
 | [ADR-007 — Operator surface](docs/adr/ADR-007-operator-surface.md) | The panel, the switches, and what is deliberately not a button |
+| [ADR-008 — Liveness signals](docs/adr/ADR-008-liveness-signals-must-prove-measurement.md) | Why some diagnostics read `unknown` on purpose, and why a numeric alert can be silent when it matters most |
+| [ADR-009 — Radio custody](docs/adr/ADR-009-radio-custody-failure-modes.md) | Radios follow the lease only on host loss — read before buying hardware |
+| [GLOSSARY](docs/GLOSSARY.md) | Every term used anywhere, no assumed Home Assistant / Docker / clustering knowledge |
+| [GUIDE-radios](docs/GUIDE-radios.md) | Zigbee, 433 MHz, Z-Wave — what can fail over, what cannot, and why |
 
 The adversarial review that drove most of this
 is kept in the repo, along with the closure record

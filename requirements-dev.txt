@@ -51,3 +51,8 @@ pip-audit==2.9.0
 # as "Unable to load custom panel" -- with no clue that the cause is the
 # file rather than the delivery.
 esprima
+
+# Static security analysis (AR-0033). Gates on HIGH severity only, and reports
+# everything else — see the `sast` job. Its limits are documented there: it did
+# NOT catch AR-0043, and pretending otherwise would be worse than not running it.
+bandit==1.8.6

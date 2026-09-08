@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import ast
 from datetime import datetime
+import os
 import pathlib
 import sys
+import time
 
 import pytest
 
@@ -38,13 +40,24 @@ NODE = "tiger1-abc123"
 
 
 class FakeClient:
-    """Records eval() calls and returns a canned lease answer."""
+    """Records eval() calls and returns a canned lease answer.
+
+    Heartbeats are recorded SEPARATELY from lease operations. They are an
+    observability signal written on every tick regardless of the decision, so
+    folding them into `calls` would make every lease assertion in this file
+    depend on a diagnostic -- and a test that breaks when a log line is added
+    is testing the wrong thing.
+    """
 
     def __init__(self, holds: bool = True) -> None:
         self.holds = holds
         self.calls: list[tuple[str, list[str], list[str]]] = []
+        self.heartbeats: list[tuple[str, list[str], list[str]]] = []
 
     def eval(self, script: str, keys: list[str], args: list[str]) -> int:
+        if "promoters:" in (keys[0] if keys else ""):
+            self.heartbeats.append((script, keys, args))
+            return 1
         self.calls.append((script, keys, args))
         return 1 if self.holds else 0
 
@@ -898,8 +911,8 @@ def test_releasing_the_lease_says_why(tmp_path: pathlib.Path, capsys) -> None:
 
 
 def test_a_held_down_node_says_why_it_is_not_taking(tmp_path: pathlib.Path, capsys) -> None:
-    """A node sitting at BACKUP beside a free lease looks identical to one that
-    has not noticed. The hold-down is the whole explanation, so it must say so."""
+    """A node sitting at BACKUP and not taking looks identical to one that has
+    not noticed. The hold-down is the whole explanation, so it must say so."""
     state = tmp_path / "vrrp-state"
     state.write_text("BACKUP\n")
     holddown = tmp_path / "release-holddown"
@@ -919,8 +932,48 @@ def test_a_held_down_node_says_why_it_is_not_taking(tmp_path: pathlib.Path, caps
     )
     assert rc == 0
     err = capsys.readouterr().err
-    assert "NOT taking the free lease" in err
+    assert "NOT attempting to take the lease" in err
     assert "--adopt" in err
+    # It must NOT claim the lease is free: this branch fires on the hold-down
+    # marker alone and never looks at the holder.
+    assert "free lease" not in err
+
+
+def test_the_holddown_message_never_claims_the_lease_is_free(
+    tmp_path: pathlib.Path, capsys
+) -> None:
+    """It fires without checking, so it must not assert what it did not check.
+
+    On 2026-09-07 this line printed "NOT taking the free lease" on node-b
+    while node-a demonstrably held it -- confirmed by `--adopt`, which
+    answered "lease held by 'node-a'". An operator read that as a
+    leaderless cluster and went hunting a split-brain that did not exist.
+
+    The branch condition is `previous != "MASTER" and _recently_touched(...)`.
+    There is no holder lookup anywhere in it, so no wording derived from one
+    is honest.
+    """
+    state = tmp_path / "vrrp-state"
+    state.write_text("BACKUP\n")
+    holddown = tmp_path / "release-holddown"
+    holddown.touch()
+
+    # The peer holds the lease: this node cannot take it and has not looked.
+    rc = run(
+        FakeClient(holds=False),
+        namespace=NAMESPACE,
+        node_id=NODE,
+        ttl=30,
+        state_path=state,
+        install_dir=tmp_path,
+        force_path=tmp_path / "force-master",
+        runner=_runner([]),
+        holddown_path=holddown,
+        probe=lambda _u, _t: False,
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "free" not in err, f"asserted an unchecked fact: {err!r}"
 
 
 def test_a_recent_release_holds_down_the_next_take(tmp_path: pathlib.Path) -> None:
@@ -1334,13 +1387,22 @@ def test_adopt_reports_failure_rather_than_leaving_no_state(
 
 
 class HoldClient:
-    """Records which script was evaluated, so a test can prove which path ran."""
+    """Records which script was evaluated, so a test can prove which path ran.
+
+    Heartbeats are excluded from `scripts`: they fire on every tick regardless
+    of the decision, and these tests exist to prove WHICH lease path ran. A
+    diagnostic write is not a lease path.
+    """
 
     def __init__(self, holder: str | None) -> None:
         self.holder = holder
         self.scripts: list[str] = []
+        self.heartbeats: list[str] = []
 
     def eval(self, script: str, keys: list[str], args: list[str]) -> int:
+        if "promoters:" in (keys[0] if keys else ""):
+            self.heartbeats.append(script)
+            return 1
         self.scripts.append(script)
         if script == RENEW_ONLY_SCRIPT:
             return 1 if self.holder == args[0] else 0
@@ -1784,3 +1846,253 @@ def test_a_handover_request_on_a_follower_is_ignored(tmp_path: pathlib.Path) -> 
         probe=lambda _u, _t: False,
     )
     assert "notify_backup.sh" not in [c[0].rsplit("/", 1)[-1] for c in recorded]
+
+
+# --- adaptive probe grace (2026-09-07) -------------------------------------
+#
+# The flat 600s grace applied the slowest-cold-boot worst case to every
+# failure, so a wedged Home Assistant cost ten minutes before the peer could
+# promote -- and the same 600s is why an HA-only failure misses the 2.5-minute
+# budget and why radios move late (ADR-001, ADR-009). One setting, three
+# symptoms. The base drops to 120s; the full 600s is granted only while the
+# container is demonstrably coming back.
+
+
+def _inspector(**state):
+    return lambda: dict(state)
+
+
+def test_a_restarting_container_is_returning() -> None:
+    """The strongest single signal, and unambiguous."""
+    returning, reason = cluster_promoter.container_is_returning(_inspector(Restarting=True))
+    assert returning is True
+    assert "restarting" in reason
+
+
+def test_exit_100_is_a_deliberate_restart_not_a_crash() -> None:
+    """Home Assistant asks to be restarted with exit 100 after a config change
+    or an upgrade. Demoting on that would fail over on every reconfiguration."""
+    returning, reason = cluster_promoter.container_is_returning(
+        _inspector(Restarting=False, Running=False, ExitCode=100)
+    )
+    assert returning is True
+    assert "100" in reason
+
+
+def test_a_container_that_just_started_is_still_booting() -> None:
+    """Measured cold boots on this fleet: 24.0s and 62.9s to `initialized`.
+    A probe failing 30s after start means booting, not wedged."""
+    returning, reason = cluster_promoter.container_is_returning(
+        _inspector(Restarting=False, Running=True, StartedAtEpoch=1000.0),
+        now=1030.0,
+    )
+    assert returning is True
+    assert "booting" in reason
+
+
+def test_a_wedged_container_is_NOT_returning() -> None:
+    """The case D3 exists for: running, old, and answering nothing.
+
+    This is the whole reason the adaptive path may not weaken D3 -- a Home
+    Assistant that is up and useless must still lose the lease.
+    """
+    returning, _ = cluster_promoter.container_is_returning(
+        _inspector(Restarting=False, Running=True, StartedAtEpoch=1000.0),
+        now=1000.0 + 3600,
+    )
+    assert returning is False
+
+
+def test_no_docker_means_no_extension() -> None:
+    """Bare metal, Core, or a missing CLI falls back to the flat behaviour.
+
+    An inspector that cannot answer must never extend, because a node that
+    silently refuses to demote is worse than one that demotes early.
+    """
+    assert cluster_promoter.container_is_returning(lambda: None) == (False, "")
+
+
+def test_a_crash_loop_does_NOT_extend_forever(tmp_path: pathlib.Path) -> None:
+    """🚨 The cap. A crash loop reports `Restarting` on every tick, so without
+    a ceiling the adaptive path would build the one mode TODO forbids: a
+    failover that silently never happens.
+
+    Past `probe_grace` the container's opinion stops counting.
+    """
+    state = tmp_path / "vrrp-state"
+    state.write_text("MASTER\n")
+    # Age the state file well past the ceiling.
+    old = time.time() - 10_000
+    os.utime(state, (old, old))
+    assert (
+        cluster_promoter._grace_extended(
+            state_path=state,
+            base_grace=120.0,
+            probe_grace=600.0,
+            inspect_container=_inspector(Restarting=True),  # loops forever
+            reason_path=None,
+        )
+        is False
+    ), "a crash loop extended past the cap — failover would never happen"
+
+
+def test_within_the_cap_a_restarting_container_does_extend(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The other half: between base and cap, a returning container is spared."""
+    state = tmp_path / "vrrp-state"
+    state.write_text("MASTER\n")
+    recent = time.time() - 200  # past the 120s base, inside the 600s cap
+    os.utime(state, (recent, recent))
+    reason = tmp_path / "grace-reason"
+    assert (
+        cluster_promoter._grace_extended(
+            state_path=state,
+            base_grace=120.0,
+            probe_grace=600.0,
+            inspect_container=_inspector(Restarting=True),
+            reason_path=reason,
+        )
+        is True
+    )
+    assert "restarting" in reason.read_text(), "the reason must reach the operator surface"
+
+
+def test_the_reason_file_is_cleared_when_no_longer_extending(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A stale explanation is worse than none — it would claim the promoter is
+    still waiting for a boot that finished."""
+    state = tmp_path / "vrrp-state"
+    state.write_text("MASTER\n")
+    recent = time.time() - 200
+    os.utime(state, (recent, recent))
+    reason = tmp_path / "grace-reason"
+    reason.write_text("container is restarting\n")
+    cluster_promoter._grace_extended(
+        state_path=state,
+        base_grace=120.0,
+        probe_grace=600.0,
+        inspect_container=_inspector(Restarting=False, Running=True),
+        reason_path=reason,
+    )
+    assert not reason.exists(), "a stale grace reason was left behind"
+
+
+def test_a_broken_inspector_never_blocks_demotion(tmp_path: pathlib.Path) -> None:
+    """If asking Docker raises, demote. The failure this branch defends against
+    is a node that will not give up the lease."""
+    state = tmp_path / "vrrp-state"
+    state.write_text("MASTER\n")
+    recent = time.time() - 200
+    os.utime(state, (recent, recent))
+
+    def boom():
+        raise RuntimeError("docker: command not found")
+
+    assert (
+        cluster_promoter._grace_extended(
+            state_path=state,
+            base_grace=120.0,
+            probe_grace=600.0,
+            inspect_container=boom,
+            reason_path=None,
+        )
+        is False
+    )
+
+
+# --- the promoter heartbeat (ADR-009 residual gap, 2026-09-08) --------------
+#
+# The custody gap that survives: the promoter stops while the machine keeps
+# running. Nothing releases the USB claims, and no server reaps a live client.
+# The integration cannot see it -- on a cold standby Home Assistant is
+# deliberately stopped, so `cluster_members` reads 1 on a HEALTHY cluster and
+# would read 1 on a broken one too. The promoter is the only thing alive there,
+# so it is the only thing that can report.
+
+
+def test_the_heartbeat_fires_even_when_the_node_is_held(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A maintenance hold is exactly when an operator is watching.
+
+    Every branch in `run()` can return early. A heartbeat that only fired on
+    the happy path would go quiet for the very states worth seeing -- held,
+    holding down, probe failing -- and a quiet heartbeat is how this signal
+    says "that promoter is gone".
+    """
+    state = tmp_path / "vrrp-state"
+    state.write_text("MASTER\n")
+    hold = tmp_path / "hold"
+    hold.write_text("planned work\n")
+    client = HoldClient(holder=NODE)
+
+    rc = run(
+        client,
+        namespace=NAMESPACE,
+        node_id=NODE,
+        ttl=30,
+        state_path=state,
+        install_dir=tmp_path,
+        force_path=tmp_path / "force-master",
+        runner=_runner([]),
+        hold_path=hold,
+    )
+    assert rc == 0
+    assert client.heartbeats, "a held node published no heartbeat — it looks dead"
+
+
+def test_the_heartbeat_fires_on_a_follower(tmp_path: pathlib.Path) -> None:
+    """The follower's heartbeat is the whole point.
+
+    A cold standby's Home Assistant is stopped, so nothing else on that machine
+    can say it is alive and able to promote.
+    """
+    state = tmp_path / "vrrp-state"
+    state.write_text("BACKUP\n")
+    client = FakeClient(holds=False)
+    run(
+        client,
+        namespace=NAMESPACE,
+        node_id=NODE,
+        ttl=30,
+        state_path=state,
+        install_dir=tmp_path,
+        force_path=tmp_path / "force-master",
+        runner=_runner([]),
+        probe=lambda _u, _t: False,
+    )
+    assert client.heartbeats, "a follower published no heartbeat"
+    key = client.heartbeats[0][1][0]
+    assert key == f"ha:cluster_state_sync:{NAMESPACE}:promoters:{NODE}", key
+
+
+def test_a_failed_heartbeat_never_changes_a_decision(tmp_path: pathlib.Path) -> None:
+    """🚨 Observability may not alter behaviour.
+
+    A promoter that skipped a promotion because it could not write a diagnostic
+    would be a far worse bug than a missing diagnostic.
+    """
+    state = tmp_path / "vrrp-state"
+    state.write_text("BACKUP\n")
+
+    class Exploding(FakeClient):
+        def eval(self, script, keys, args):
+            if "promoters:" in (keys[0] if keys else ""):
+                raise RespError("heartbeat exploded")
+            return super().eval(script, keys, args)
+
+    recorded: list[list[str]] = []
+    rc = run(
+        Exploding(holds=True),
+        namespace=NAMESPACE,
+        node_id=NODE,
+        ttl=30,
+        state_path=state,
+        install_dir=tmp_path,
+        force_path=tmp_path / "force-master",
+        runner=_runner(recorded, state_path=state),
+    )
+    assert rc == 0, "a broken heartbeat failed the whole tick"
+    assert recorded, "the promotion did not happen because a diagnostic failed"

@@ -10,6 +10,7 @@ register can never take the integration down with it.
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import pytest
 
@@ -309,3 +310,102 @@ def test_the_custom_element_definition_is_guarded() -> None:
     )
     define_line = next(line for line in js.splitlines() if "customElements.define(" in line)
     assert define_line.startswith("  "), "the define should sit inside the guard, not beside it"
+
+
+# --- AR-0044: peer-supplied data must not become markup ------------------
+
+
+def _esc_like_the_panel(value: object) -> str:
+    """A port of the panel's `_esc`, so its contract is pinned in the suite.
+
+    There is no JavaScript runtime in CI (see `_parse_like_the_panel`, which
+    exists for the same reason), so the escaping rule is asserted here and the
+    structural test below proves the shipped file actually applies it.
+    """
+    text = "" if value is None else str(value)
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "must_not_contain"),
+    [
+        ("<img src=x onerror=alert(1)>", "<img"),
+        ("</b><script>alert(1)</script>", "<script"),
+        ('" onmouseover="alert(1)', '"'),
+        ("'><svg onload=alert(1)>", "<svg"),
+    ],
+)
+def test_the_escaper_neutralises_markup(payload: str, must_not_contain: str) -> None:
+    """🚨 AR-0044. `sensor.<node>_cluster_leader` is peer-supplied.
+
+    Its value is `coordinator.data.leader`, read straight out of the shared
+    Valkey store and written by the OTHER node — and the cluster registry is
+    not the sealed-blob channel. Valkey write access alone was therefore
+    enough to put markup into a page running with an administrator's session.
+    """
+    assert must_not_contain not in _esc_like_the_panel(payload)
+
+
+def test_the_escaper_leaves_ordinary_values_readable() -> None:
+    """An escaper that mangles `node-a_f5d04f` would be swapped out."""
+    assert _esc_like_the_panel("node-a_f5d04f") == "node-a_f5d04f"
+    assert _esc_like_the_panel("42.0") == "42.0"
+    assert _esc_like_the_panel(None) == ""
+
+
+def test_every_value_interpolated_into_the_panel_html_is_escaped() -> None:
+    """The port above proves the rule; this proves the file applies it.
+
+    Structural rather than behavioural because there is no JS runtime here —
+    but it is the half that catches the real regression, which is someone
+    adding a seventh interpolation and not knowing about the sixth.
+
+    The rule: a `${...}` holding a **bare value** — an identifier or a dotted
+    path, no call — is raw data and must be escaped. An interpolation that
+    calls one of the panel's own helpers (`this._row(...)`, `this._holdRow(...)`)
+    is already-escaped HTML by construction and is left alone; escaping it
+    again would render the markup as text.
+    """
+    #: Bare interpolations that are NOT data: locals computed from literals in
+    #: this file. Each is listed deliberately, so a new one has to be argued
+    #: for rather than assumed.
+    SAFE_LOCALS = {
+        "cls",  # "" | "good" | "bad" | "warn", chosen from literals above
+        "on",  # boolean
+        "pending",  # boolean
+        "leader",  # boolean
+        "held",  # boolean
+        "FRESH",  # a module constant
+        # HTML this file assembled itself, from the escaping helpers above.
+        # Escaping it again would render the markup as text.
+        "body",
+        # NOT markup: an object KEY in `bucket[`${metric}__switch`]`.
+        # Escaping it would corrupt the lookup. If `metric` is ever
+        # interpolated into HTML, it must be escaped there and removed
+        # from this list.
+        "metric",
+    }
+    js = PANEL_JS.read_text(encoding="utf-8")
+    bare = re.findall(r"\$\{\s*([A-Za-z_$][\w.$]*)\s*\}", js)
+    unescaped = sorted({expr for expr in bare if expr not in SAFE_LOCALS})
+    assert not unescaped, (
+        f"raw values interpolated into innerHTML: {unescaped}. Every value that reaches "
+        "the panel's HTML must go through `this._esc(...)` — AR-0044."
+    )
+
+
+def test_the_panel_has_exactly_one_innerhtml_assignment() -> None:
+    """`_esc` must exist, and a second innerHTML sink must not appear unnoticed."""
+    js = PANEL_JS.read_text(encoding="utf-8")
+    assert "_esc(value)" in js, "the panel's escape helper is gone"
+    assignments = re.findall(r"\.innerHTML\s*=", js)
+    assert len(assignments) == 1, (
+        f"{len(assignments)} innerHTML assignments; a new one needs the same "
+        "escaping review as the first"
+    )

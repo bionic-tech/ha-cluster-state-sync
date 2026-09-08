@@ -510,90 +510,245 @@ docker exec homeassistant sh -c "ls -l /proc/$PID/fd" | grep -c ttyUSB   # expec
 
 (and §19: `docker inspect .State.Pid` gives you the container's init, not this.)
 
-### 18a. It found a real one, then lied about the size of it
+### 18a. The sensor's first finding was not a finding, and I published it twice
 
-Not a drill. Deploying the sensor needed one Home Assistant restart on the
-leader. Afterwards, every check this fleet has ever used said the radios were
-fine — ports open, devices claimed in VirtualHere, container healthy,
-integration loaded, nothing logged — and the new sensor reported a plausible,
-steadily-rising silence:
+**Retracted.** This section previously said the RFXtrx receivers had been deaf
+for at least seven days, and then that VirtualHere had been exonerated as the
+cause. There was no outage. Both write-ups are kept in the git history; what
+follows is what the data actually said.
 
-```
-sensor reads              : 60 s ... 120 s ... 191 s ... 360 s
-distinct ages across 37   : 2          <- one batch write, no organic traffic
-RFXtrx debug, 150 s       : 0 lines
-serial fds held by HA     : 3 (ttyUSB0, ttyUSB1, ttyUSB4)
-```
+**What I measured, and what was wrong with it.** I queried Home Assistant's
+history for two entities — `sensor.temp_inside_temperature` and
+`sensor.radiator_aircon_rssi_numeric` — found zero real values in seven days,
+and generalised to all 37 watched entities. Those two are long-dead battery
+devices. Sampling two and concluding about thirty-seven is not a measurement.
 
-`reload_config_entry` on the three rfxtrx entries produced an immediate,
-successful handshake — `Status [subtype=433.92MHz, firmware=28,
-output_power=28]` — so the hardware was fine and the read loop came back.
-**At that point I wrote that the sensor had caught an outage and the reload
-had fixed it. Both halves were wrong, in opposite directions.**
-
-The reload fixed nothing, because nothing had broken at 13:11. And the outage
-was far bigger than a Home Assistant restart:
+**What the recorder actually holds**, queried properly over `event.*` entities,
+whose state is a timestamp that advances only on a genuinely received packet
+and which do *not* restore on restart:
 
 ```
-history, 30 hours, sensor.radiator_aircon_rssi_numeric:
-    1 recorded state -> "unknown", set 2026-09-06 06:33 UTC
-
-current states of the 37 watched entities : {'unknown': 37}
-current states of the 59 rfxtrx event.*   : {'unknown': 57, 'unavailable': 2}
-every Recv line in 28 hours of log        : a status/handshake packet
-air packets received, ever, in that log   : zero
+last received packet : 2026-09-07 06:22:10 UTC  -> event.kitchen_middle
+gap at time of writing:  8.9 h and still open
+longest gaps in the previous 4 days:
+     9.3h   ending 09-06 08:41 UTC
+     7.5h   ending 09-05 07:53 UTC
+     7.3h   ending 09-07 05:41 UTC
 ```
 
-**The RFXtrx receivers had been deaf for at least thirty hours.** Not since my
-restart — since the previous morning. That is the outage behind the kitchen
-switch that "stopped working", and behind the light that appeared to come on by
-itself: the wall switch transmits, nothing receives it, so the automation it
-should trigger never runs.
+**8.9 hours against a 4-day maximum of 9.3 hours.** The current gap is inside
+the normal range. Nothing is established as broken. The radios were receiving
+continuously for the whole recorder window and may be receiving now — the house
+simply has not transmitted since breakfast.
 
-#### And the sensor reported a healthy-looking number throughout
+#### The real defect is the watch set, and it is instructive
 
-This is the part to keep. **Home Assistant stamps `last_reported` on an entity
-whose state is `unknown` exactly as it does on a real reading.** All 37 watched
-entities were `unknown`; every time Home Assistant rewrote them — a restore, a
-reload, a restart — their timestamps advanced, and the sensor faithfully
-reported the age of Home Assistant's own bookkeeping. 60 s. 120 s. 191 s.
-Numbers indistinguishable from a working radio.
+Every `sensor.*_rssi_numeric` on this fleet belongs to a **switch, remote or
+cover** — devices that transmit when a person operates them. Not one 433 MHz
+device here reports on a schedule; the Oregon sensors that would have are dead.
+Ranked by how many distinct hours they appear in, the busiest entity covers 35
+hours out of 96.
 
-A sensor built specifically to stop "green everywhere, and the house did
-nothing" reproduced it on its first day, inside itself.
+So on this house the sensor is not measuring radio liveness. **It is measuring
+human activity.** After any restart every watched entity is `unknown` until
+somebody presses something, which the baseline says can be nine hours — so
+`no_reports` after a restart is the expected reading, not a diagnosis.
 
-**Fixed by excluding entities that carry no reading**, and by separating the
-two cases that both have to read `unknown`:
+`sensor.*_rssi_numeric` is the wrong watch set here, and the sensor's premise —
+"time since last packet" — needs a device that transmits *unprompted*: an
+Oregon or similar periodic sensor, a Zigbee LQI or last-seen, a coordinator's
+own diagnostic. **Where nothing transmits on a schedule, this measurement
+cannot distinguish a dead radio from a quiet house, and configuring it anyway
+produces a red light every morning.**
 
-| `status`     | means                                                |
-|--------------|------------------------------------------------------|
-| `ok`         | at least one radio has reported; the number is real  |
-| `no_matches` | the globs match nothing — a configuration problem    |
-| `no_reports` | entities matched, none has ever reported — **deaf**  |
+#### The lesson is the one this file exists for, aimed the other way
 
-`no_reports` is the loudest state this sensor has and it is deliberately *not*
-a big number, because "never" has no age. **Alert on the attribute, not only on
-the value** — a threshold on the value alone would have sat quietly through all
-thirty hours of this.
+§18 and AR-0040 are about reading absence as success. This was absence read as
+*failure* — the same error with the sign flipped, and it cost an unnecessary
+container restart, two VirtualHere reclaims on a live house, and two confident
+write-ups of an outage that never happened.
 
-Pinned by `test_an_unknown_entity_is_not_evidence_of_reception`, verified to
-fail against the shipped behaviour.
+**Before calling silence a fault, measure the baseline.** One query for the
+longest normal gap would have stopped this at the first step, and it was the
+same query I eventually ran. §18's own text says a quiet house at 4am
+legitimately produces no RF for a long while. I wrote that sentence and then
+did not apply it.
 
-#### The remediation automation is written and deliberately not installed
+The one-second test that settles it, and which no amount of log analysis
+replaces: **press a switch and see whether the event fires.**
 
-[`docs/examples-rfxtrx-reload-automation.yaml`](examples-rfxtrx-reload-automation.yaml)
-replaces the inert `RFXtrx reload on failure`. It is **not** installed, because
-while the receivers are actually deaf it would reload the three entries every
-thirty minutes forever and fix nothing. Install it once the radios receive
-again.
+## 18b. 🚨 `STOP USING` silently clears a device's Auto-Use flag
 
-Two things in it are worth copying into any alert built on this sensor:
+**Looked like:** a clean unclaim and reclaim. Both commands returned `OK`, and
+`LIST` showed the devices `In-use by you` again.
 
-- **A `numeric_state` trigger cannot fire on `no_reports`**, because that state
-  is `unknown`. A threshold on the value alone is exactly what sat quietly
-  through seven days here. It needs a second trigger on the attribute.
-- **Never remediate on `no_matches`.** The globs match nothing; reloading
-  radios cannot fix a typo.
+**Actually:** the `*` was gone.
+
+```
+before:   *--> RFXtrx433 (officeant.113) (In-use by you)     <- * = Auto-Use
+after:     --> RFXtrx433 (officeant.113) (In-use by you)     <- claimed, NOT auto
+```
+
+Identical in every respect an operator checks — claimed, present, working —
+except the one that matters on the day the cluster fails over. **Auto-Use is
+what the promotion hooks rely on to take custody of a radio.** Without it the
+device is claimed by *this* node and will not be claimed by the peer, so the
+first failover after any manual unclaim comes up with no radios and no error
+explaining why.
+
+**Rule: after any `STOP USING`, re-arm Auto-Use before you do anything else.**
+
+```bash
+vhclientx86_64 -t "STOP USING,officeant.113"
+vhclientx86_64 -t "USE,officeant.113"
+vhclientx86_64 -t "AUTO USE DEVICE,officeant.113"   # <- the step that is easy to miss
+vhclientx86_64 -t "LIST" | grep RFXtrx              # confirm the * came back
+```
+
+Verify with the `*`, not with `In-use by you` — the second is true in both the
+working and the broken case.
+
+🚨 And never re-arm, claim, or unclaim the **USB 10/100 LAN** devices
+(`officeant.114`, `ctuhouseant.114`). See §15 — that interface is PoE and
+carries the network the VirtualHere server itself is reached over.
+
+**The shipped example hooks do not have this bug, and that is deliberate.**
+`examples/hardware-custody/virtualhere-release.sh` stops the whole
+`virtualhereclient.service` rather than issuing `STOP USING` per device, so the
+claims drop without any per-device flag being rewritten and Auto-Use survives.
+The trap is the manual command an operator reaches for, not the automation —
+which is the harder kind to notice, because the automation keeps working and
+teaches you the operation is safe.
+
+## 18c. §17 confirmed live: a reclaimed radio came back on a different node
+
+Reclaiming the Office RFXtrx over VirtualHere moved it, and the container could
+not follow:
+
+```
+before unclaim   host: ...A1K33YZ... -> ttyUSB4    container /dev: 0 1 2 4   ✅
+after reclaim    host: ...A1K33YZ... -> ttyUSB3    container /dev: 0 1 2 4   ❌
+```
+
+The by-id symlink is correct and live — `/dev/serial` is bind-mounted, so it
+tracks the host — but it now points at `/dev/ttyUSB3`, and **the container's
+`/dev` is a snapshot taken when the container started**, holding 0, 1, 2 and 4.
+The link resolves to a node that does not exist inside the container, and every
+open fails `Errno 2`.
+
+Linux hands out the lowest free number, so a reclaim usually *does* return the
+same one — which is exactly why this is a trap rather than a rule. It worked
+for the House radio in the same operation and failed for the Office one.
+
+**A container restart is the fix and there is no lighter one.** Reloading the
+config entry re-reads the same absent path. Set the maintenance hold first if
+the node is the leader: the restart is a failover otherwise.
+
+## 18d. 🚨 A partial failure promotes a standby with no radios
+
+**Measured 2026-09-07**, while timing cold-boot RTO on the real pair.
+
+Killing Home Assistant and stopping the promoter on the leader looks like a
+dead node from the lease's point of view — the peer promoted in 78.8s, well
+inside budget. It came up with **no radios at all**:
+
+```
+19:58:37  timed out waiting for: usb-RFXCOM_RFXtrx433 usb-dresden_elektronik
+19:58:37  Attached serial devices: 0
+19:58:37  3 config entr(ies) reference absent hardware -> Disabled 3
+```
+
+The pre-flight did the right thing — disabling entries whose hardware is absent
+is what lets Home Assistant start at all — but the house had nothing to talk to.
+
+**The cause is the failure mode, not the code.** The promotion hook
+`10-virtualhere-claim.sh` waits `DEADLINE=45s` for the radios to appear. They
+never did, because **the "failed" node was still running its VirtualHere
+client** and still holding its USB claims. Nothing reaps a claim from a client
+that is alive.
+
+Proven by finishing the simulation: stopping `virtualhereclient.service` on the
+failed node had the peer claim the radios via Auto-Use in **~12 seconds**.
+
+> 🚨 **CORRECTED, same day.** This first said radios do not follow when "Home Assistant dies, host
+> alive". Wrong, and wrong the same way as §18a — generalised from a simulation that did not
+> reproduce the case it claimed to. The simulation stopped the **promoter** too, and that is what
+> prevented the release.
+>
+> Verified by reading the installed chain rather than inferring it: `cluster_promoter.py:661` runs
+> `notify_backup.sh` on demotion → it stops the container, then runs `post-stop.d/` →
+> `90-virtualhere-release.sh` stops the USB/IP client. **That hook is installed on both nodes.**
+
+| Failure | What releases the claims | Radios follow? |
+|---|---|---|
+| Host loss / power cut | the server **reaps a dead client** (~17s) | ✅ inside the 45s deadline |
+| Home Assistant dies, host alive | the node's **own demote path**, after the 600s grace | ✅ **~10 min late** |
+| **Promoter dies, host and USB/IP client alive** | **nothing** | ❌ the real gap |
+
+So the case a cluster most obviously exists for — one service dying while the
+machine stays up — is exactly the case where the radios do not move. A longer
+deadline does not fix it; the claims are held indefinitely, not slowly.
+
+**Unfixed.** Three candidate approaches, none built: have the demote path
+force-release the claims; have the promoting node ask the VirtualHere *server*
+to reap a named claim; or accept it and document that partial failures need an
+operator. See TODO.
+
+**Do not "fix" this by lengthening `DEADLINE`.** It would convert a fast,
+honest, radio-less promotion into a slow one that is still radio-less.
+
+## 18e. 🚨 A single-connection integration flaps when two nodes run it
+
+**Looked like:** a kitchen light turning itself on, repeatedly, including twice after midnight.
+Reported as a ghost. Home Assistant was blamed, then the radios, then the cluster.
+
+**Actually:** none of those. The context triple settles it — six of the last ten activations of
+`light.cooker_new` had **no user, no parent, and shared context with nothing**, which is
+device-originated. One was the genuine automation (context shared with
+`automation.lights_main_kitchen_lights_on_2` and its three sibling lights); three were a **person**
+pressing it three times in four seconds, which is what fighting an unresponsive light looks like.
+
+**The number that matters is the state histogram:**
+
+```
+light.cooker_new, 202 recorded states
+   unavailable : 153      <- offline most of the time
+   off         :  31
+   on          :  18      <- five of these arrive 1-3s after reconnecting
+   platform    : localtuya
+```
+
+**LocalTuya permits exactly one local connection per device.** So does the ESPHome native API, and
+so do some Z-Wave sticks. Where a *cloud* integration degrades politely when two nodes both
+connect, these **actively evict each other** — and a device that is being kicked off and
+reconnecting will report whatever state it powers up in.
+
+**Which makes this a cluster hazard class, not a device fault.** The README's original wording —
+"both nodes will try to connect to the same Hue bridge, Sonos, Plex" — understates it, because
+those degrade. These do not.
+
+**But do not blame the cluster before checking the dates.** On this fleet the flapping was:
+
+```
+08-31  1     09-04  60   <- failover tests
+09-01  1     09-05  69   <- a 127-restart loop, and a duplicated localtuya component (§20)
+09-02  2     09-06   6
+09-03  3     09-07  11   <- more testing
+```
+
+**84% of all disconnects fell on the two days of restart storms and failover testing** — our own
+work, not an ongoing two-node fight. The standby's Home Assistant had run for *minutes*. The
+tempting story (both nodes competing) was checked against the timeline and did not survive it.
+
+**Rules:**
+
+1. Before calling a device haunted, read the **context triple** on its state changes. `user_id`
+   names a person; `parent_id` names an automation; neither means the device said so itself.
+2. Keep the overlap window short if you run a single-connection integration. It is genuinely
+   destructive there, not merely untidy.
+3. A device that reconnects into an unexpected state is reporting, not being commanded. The fix is
+   at the device (power-on behaviour) or wherever else can reach it — a cloud scene still runs even
+   when the cloud integration is disabled in Home Assistant.
 
 ## 19. `docker inspect .State.Pid` is the container's init, not your application
 
@@ -849,3 +1004,45 @@ Then fix it at the source rather than by clearing caches:
 * **Syntax-check shipped JavaScript in CI.** A panel that fails to parse and a
   panel that fails to download produce the identical message. `esprima` is a
   pure-python parser and needs no JS runtime.
+
+## 25. A statistics database that opens perfectly, and is not a recorder
+
+`statistics_meta` and `statistics` are the only tables long-term statistics live in, so the
+obvious seed is a file containing those two tables. That file opens in SQLite, answers every
+query you throw at it, and holds every row you wanted.
+
+Home Assistant's recorder queries **thirteen** tables on startup. Given a file missing eleven of
+them it does not report a bad seed — it attempts a migration, or the recorder dies. A house whose
+recorder is down looks entirely normal until somebody opens a graph.
+
+**Rule:** a seed carries the **whole schema** and only the rows worth carrying. Copy every
+`CREATE TABLE` and `CREATE INDEX` from `sqlite_master` (skipping `sqlite_%`, which SQLite owns and
+rejects), then populate only what you mean to. The check that proves it is not "does it open" but
+**"does its schema match the source's, table for table and index for index"** — measured on the
+live pair: 13/13 tables, 20/20 indexes, and the recorder in the running image reporting schema 53,
+current, no migration needed.
+
+Two related traps in the same area:
+
+* **`statistics.metadata_id` is local to each database.** Copying rows with their numeric ids
+  attaches one node's readings to another node's sensors. Everything must key on `statistic_id` —
+  the stable string — and resolve the number on arrival. The resulting graph looks fine and is
+  wrong, which is the worst failure shape there is.
+* **A half-copied 484 MB file is a valid SQLite database.** It opens, and it is missing history.
+  `PRAGMA quick_check` catches the structural damage a truncated copy leaves, without spending
+  minutes re-reading every index the way `integrity_check` does.
+
+## 26. A replica that is healthy, current, and permanently missing a year
+
+A rolling window is the right shape for a cold standby: republish the last N days every pass,
+`INSERT OR IGNORE` on arrival, and a standby that has been off for a fortnight catches up from one
+fetch. The failure is what happens when it has been off for *longer* than N days.
+
+It fetches the window. It applies every row. Every row it applied is correct. Its newest row is
+today's. It reports success, and the stretch between where it stopped and where the window begins
+exists on neither node — no later window will ever contain it, because later windows only move
+forward.
+
+**Rule:** a windowed payload must state **the floor it covers**, not just the rows it carries.
+The receiver compares that floor against its own newest row and says so when there is a hole.
+Without it, "nothing new" and "a year is missing" are the same observation.

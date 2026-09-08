@@ -65,6 +65,24 @@ FILESET_INFO: Final[bytes] = b"cluster_state_sync:fileset:v2"
 #: manifest key, nor the manifest into a blob key.
 MANIFEST_AAD: Final[bytes] = b"cluster_state_sync:fileset:manifest"
 
+#: The statistics window's own label, distinct from the manifest's for the
+#: same reason each blob is sealed under its own ref: a ciphertext moved
+#: from one key to another must fail to open rather than be applied as
+#: something it is not. Moving a manifest onto the statistics key needs
+#: Valkey write access and no secret at all.
+STATISTICS_AAD: Final[bytes] = b"cluster_state_sync:statistics:window"
+
+#: The follower's status line, sealed under its own label so the window's
+#: ciphertext cannot be replayed onto the status key or the reverse.
+#: AR-0045: this channel was plain JSON, on the reasoning that a follower
+#: with no cluster key must still be able to say "I could not apply". That
+#: does not survive contact with the code -- the puller reads the key file
+#: before it connects, so a keyless follower never reaches the point of
+#: having anything to report. What the plain channel actually bought was a
+#: way for anyone with Valkey write access, and no secret at all, to put
+#: chosen text on the leader's repairs panel.
+STATISTICS_STATUS_AAD: Final[bytes] = b"cluster_state_sync:statistics:follower"
+
 _KEY_BYTES: Final = 32
 _NONCE_BYTES: Final = 12
 

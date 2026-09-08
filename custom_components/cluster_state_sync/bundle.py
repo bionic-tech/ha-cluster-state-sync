@@ -17,6 +17,7 @@ looks machine-generated reads as tested, and this is not.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import pathlib
 import shlex
 from typing import Any
@@ -39,6 +40,7 @@ from .const import (
     CONF_HA_UID,
     CONF_IOT_SUBNETS,
     CONF_NODE_ID,
+    CONF_PEER_HOST,
     CONF_REDIS_DB,
     CONF_REDIS_HOST,
     CONF_REDIS_PASSWORD,
@@ -47,12 +49,16 @@ from .const import (
     CONF_REDIS_USE_TLS,
     CONF_REDIS_USERNAME,
     CONF_SETTLE_DELAY,
+    CONF_STATISTICS_ENABLED,
+    CONF_STATISTICS_INTERVAL_MINUTES,
     CONF_TOPOLOGY_MODEL,
     DEFAULT_FILESET_STALE_AFTER,
     DEFAULT_HA_CONFIG_PATH,
     DEFAULT_REDIS_DB,
     DEFAULT_REDIS_PORT,
     DEFAULT_SETTLE_DELAY,
+    DEFAULT_STATISTICS_ENABLED,
+    DEFAULT_STATISTICS_INTERVAL_MINUTES,
     DEGRADED_MARKER_NAME,
     DOCKER_ALL,
     DOCKER_BRIDGE,
@@ -60,7 +66,10 @@ from .const import (
     DOCKER_MACVLAN,
     HA_START_COMPOSE,
     LEASE_TTL_SECONDS,
+    MAX_STATISTICS_INTERVAL_MINUTES,
+    MIN_STATISTICS_INTERVAL_MINUTES,
     STAGED_DIR_NAME,
+    STATISTICS_DB_NAME,
     TOPOLOGY_WARM,
 )
 from .crypto import derive_fileset_key
@@ -343,8 +352,96 @@ def _config_path(cfg: dict[str, Any]) -> str:
     return str(cfg.get(CONF_HA_CONFIG_PATH) or DEFAULT_HA_CONFIG_PATH).rstrip("/")
 
 
+# --- AR-0043: nothing operator-supplied reaches root-run shell unchecked ---
+#
+# Every artefact this module emits is executed by systemd **as root, every ten
+# seconds, on both hosts**. Config values are interpolated into that shell, and
+# until 2026-09-08 none of them was quoted or validated. Verified by execution,
+# not by reading:
+#
+#     CONTAINER="homeassistant"; touch /tmp/PWNED; #"    -> ran
+#     --redis valkey.lan$(touch /tmp/PWNED):6379         -> ran
+#
+# The boundary that crosses is **Home Assistant admin -> root on the host**, in
+# a project whose whole premise is that the host does not need touching. There
+# is a human `sudo cp` between the wizard and `/etc/cluster-sync/`, which is why
+# this was P1 and not P0 -- but it is a blind `cp *` nobody inspects.
+#
+# 🚨 **A chokepoint, not a hunt.** The obvious fix is to wrap each of the ~40
+# interpolation sites in `shlex.quote`, and the obvious fix is wrong: the next
+# person to add a site will forget, and the failure is silent and root. So
+# every value is validated **once, here, before any artefact is built**, and a
+# value that could change the meaning of a shell word never reaches a template
+# at all. Quoting at the sites is defence in depth on top of this, not instead.
+
+#: Characters that can end a word, start a command, or expand to one. A value
+#: containing any of these is rejected outright rather than escaped: none of
+#: the fields below has a legitimate use for them, so an appearance is either a
+#: mistake or an attack, and both deserve to stop the build.
+_SHELL_METACHARACTERS = frozenset("\"'`$\\;&|<>()[]{}!*?~ \n\r\t")
+
+#: The operator-typed fields that reach generated shell. Kept explicit rather
+#: than derived, so adding a config key is a decision about whether it is safe
+#: rather than an accident of naming.
+SHELL_EXPOSED_FIELDS = (
+    CONF_HA_CONTAINER,
+    CONF_HA_CONFIG_PATH,
+    CONF_HA_CONTAINER_IP,
+    CONF_REDIS_HOST,
+    CONF_REDIS_USERNAME,
+    CONF_REDIS_TLS_CA_CERTS,
+    CONF_CLUSTER_NAMESPACE,
+    CONF_NODE_ID,
+    CONF_PEER_HOST,
+    CONF_COMPOSE_FILE,
+    CONF_COMPOSE_SERVICE,
+    CONF_COMPOSE_PROFILE,
+    CONF_COMPOSE_ENV_FILE,
+)
+
+
+class UnsafeBundleValue(ValueError):
+    """A config value could change the meaning of the shell it lands in."""
+
+
+def validate_shell_safe(cfg: dict[str, Any]) -> None:
+    """Reject any operator-supplied value that shell would not treat as a word.
+
+    Raises `UnsafeBundleValue`. The config flow calls this too, so the operator
+    meets a form error rather than a traceback -- but this runs on every build
+    regardless of how the config got here, including a hand-edited
+    `core.config_entries` replicated from a peer.
+    """
+    for field in SHELL_EXPOSED_FIELDS:
+        value = cfg.get(field)
+        if value is None or value == "":
+            continue
+        text = str(value)
+        bad = sorted(set(text) & _SHELL_METACHARACTERS)
+        if bad:
+            raise UnsafeBundleValue(
+                f"{field} contains {''.join(bad)!r}, which cannot appear in a value "
+                "that is written into scripts this host runs as root. Remove it."
+            )
+
+
+def sh(value: Any) -> str:
+    """Quote a value for the shell. Belt to `validate_shell_safe`'s braces.
+
+    Normal values -- container names, absolute paths, hostnames -- contain no
+    metacharacters, so `shlex.quote` returns them unchanged and the generated
+    artefacts are byte-identical to before. It earns its place the day someone
+    adds a field to a template and forgets to add it to SHELL_EXPOSED_FIELDS.
+    """
+    return shlex.quote(str(value))
+
+
 def build_bundle(cfg: dict[str, Any]) -> dict[str, str]:
     """Render every artifact for this deployment as {filename: content}."""
+    # AR-0043. Before anything is rendered: a value that could change the
+    # meaning of a shell word must never reach a template, and failing here
+    # is how that stays true no matter which site forgets to quote.
+    validate_shell_safe(cfg)
     warm = cfg.get(CONF_TOPOLOGY_MODEL) == TOPOLOGY_WARM
     fileset = bool(cfg.get(CONF_FILESET_ENABLED))
     bundle: dict[str, str] = {
@@ -400,6 +497,16 @@ def build_bundle(cfg: dict[str, Any]) -> dict[str, str]:
         bundle["cluster-fileset-pull.sh"] = _fileset_pull(cfg)
         bundle["cluster-fileset-pull.service"] = _fileset_pull_service()
         bundle["cluster-fileset-pull.timer"] = _fileset_pull_timer()
+        # Statistics replication rides on the fileset's opt-in because it
+        # reuses its key, its Valkey credentials and its follower gate --
+        # but it is separately switchable, because an estate on a shared
+        # Postgres recorder needs the go-bag and not this.
+        if cfg.get(CONF_STATISTICS_ENABLED, DEFAULT_STATISTICS_ENABLED):
+            bundle["statistics_pull.py"] = _statistics_pull_program()
+            bundle["statistics_sync.py"] = _statistics_sync_module()
+            bundle["cluster-statistics-pull.sh"] = _statistics_pull(cfg)
+            bundle["cluster-statistics-pull.service"] = _statistics_pull_service()
+            bundle["cluster-statistics-pull.timer"] = _statistics_pull_timer(cfg)
         bundle["cluster-fileset-swap.sh"] = _fileset_swap(cfg)
         # Shipped beside the swap script, because the swap finds it with
         # `$(dirname "$0")` -- the same way notify_master.sh finds the device
@@ -918,7 +1025,35 @@ def _valkey_password(cfg: dict[str, Any]) -> str:
     return str(cfg.get(CONF_REDIS_PASSWORD) or "")
 
 
-def _fileset_pull(cfg: dict[str, Any]) -> str:
+@dataclass(frozen=True)
+class _PullContext:
+    """The shell fragments both container-borrowing pulls need.
+
+    Two programs run inside the borrowed Home Assistant image on a follower --
+    the fileset pull and the statistics pull -- and both need the same Valkey
+    address, the same credential handling, the same TLS flags and the same
+    refusal to run anywhere but a confirmed follower. Computed once so the two
+    cannot drift: a TLS flag that reached one script and not the other would
+    show up as a statistics stream that silently stopped, on the node whose
+    Home Assistant is off and therefore has nobody watching.
+    """
+
+    container: str
+    config: str
+    redis_host: str
+    redis_port: int
+    namespace: str
+    db: int
+    password_block: str
+    password_flag: str
+    ca_mount: str
+    username_flag: str
+    tls_flags: str
+
+
+def _pull_context(cfg: dict[str, Any]) -> _PullContext:
+    """Everything `_fileset_pull` and `_statistics_pull` share."""
+
     container = cfg.get(CONF_HA_CONTAINER, "homeassistant")
     redis_host = cfg.get(CONF_REDIS_HOST, "valkey.lan")
     redis_port = cfg.get(CONF_REDIS_PORT, DEFAULT_REDIS_PORT)
@@ -969,6 +1104,29 @@ def _fileset_pull(cfg: dict[str, Any]) -> str:
     username_flag = f"        --username {username} \\\n" if username else ""
     tls_flags = "        --tls \\\n" if use_tls else ""
     tls_flags += "        --tls-ca-file /ca \\\n" if ca_certs else ""
+
+    return _PullContext(
+        container=container,
+        config=_config_path(cfg),
+        redis_host=redis_host,
+        redis_port=redis_port,
+        namespace=namespace,
+        db=db,
+        password_block=password_block,
+        password_flag=password_flag,
+        ca_mount=ca_mount,
+        username_flag=username_flag,
+        tls_flags=tls_flags,
+    )
+
+
+def _fileset_pull(cfg: dict[str, Any]) -> str:
+    ctx = _pull_context(cfg)
+    container = ctx.container
+    redis_host, redis_port = ctx.redis_host, ctx.redis_port
+    namespace, db = ctx.namespace, ctx.db
+    password_block, password_flag = ctx.password_block, ctx.password_flag
+    ca_mount, username_flag, tls_flags = ctx.ca_mount, ctx.username_flag, ctx.tls_flags
 
     return (
         f"{SHEBANG}{STRICT}"
@@ -1062,6 +1220,134 @@ def _fileset_pull(cfg: dict[str, Any]) -> str:
         "    || { logger -t cluster-sync 'fileset pull failed; staged copy unchanged'; exit 1; }\n"
         "\n"
         "logger -t cluster-sync 'Fileset pull complete'\n"
+        "\n"
+    )
+
+
+def _statistics_pull_program() -> str:
+    """`statistics_pull.py`, shipped as its own file for the same reason
+    `fileset_pull.py` is: a hand-copied string here would be a second copy
+    nothing tests, and the one that ships is the one that must be right."""
+    return (pathlib.Path(__file__).parent / "scripts" / "statistics_pull.py").read_text(
+        encoding="utf-8"
+    )
+
+
+def _statistics_sync_module() -> str:
+    """`statistics_sync.py`, shipped beside the puller.
+
+    It is stdlib-only by design and stays that way precisely so it can be
+    mounted into a throwaway container that has never run `pip`. The puller
+    imports it with the same two-arm fallback everything else in the bundle
+    uses, which resolves only because Python puts a script's own directory on
+    `sys.path[0]` -- so omitting this mount fails the pull on every run with an
+    ImportError, on the node standing by to take over.
+    """
+    return (pathlib.Path(__file__).parent / "statistics_sync.py").read_text(encoding="utf-8")
+
+
+def _statistics_pull(cfg: dict[str, Any]) -> str:
+    """The follower's statistics apply. Its own script, its own timer.
+
+    Deliberately NOT appended to `cluster-fileset-pull.sh`, for two reasons.
+    The fileset pull runs once a minute because a go-bag that is a minute stale
+    is a promotion that loses a minute; the statistics window is republished
+    every half hour and applying it means an `INSERT OR IGNORE` of ~200,000
+    rows, which on the flash storage `storage.py` exists to worry about is
+    thirty times the write wear for nothing. And the two must fail
+    independently: a fileset pull that cannot reach Valkey exits non-zero, and
+    sharing a script would silently stop history replication as a side effect
+    of an unrelated fault.
+    """
+    ctx = _pull_context(cfg)
+    return (
+        f"{SHEBANG}{STRICT}"
+        "# Long-term statistics replication — pull. Follower only.\n"
+        "#\n"
+        "# Runs on the HOST inside the Home Assistant image, exactly like the fileset\n"
+        "# pull and for the same reason: in the cold model this node's Home Assistant\n"
+        "# is stopped, so there is no integration here to receive anything.\n"
+        "#\n"
+        "# It writes .cluster_sync_statistics.db, NEVER home-assistant_v2.db. On a warm\n"
+        "# standby the real recorder is open by a live Home Assistant, and this program\n"
+        "# runs outside it with no way to know. cluster-fileset-swap.sh installs the\n"
+        "# accumulated store under the real name at promotion, when the container is\n"
+        "# provably stopped.\n"
+        "\n"
+        'STATE_FILE="${CLUSTER_SYNC_STATE_FILE:-/run/cluster-sync/vrrp-state}"\n'
+        f"CONFIG={ctx.config}\n"
+        f'CONTAINER="{ctx.container}"\n'
+        "\n"
+        "# Follower only, failing closed on an unknown state — the same positive\n"
+        "# match on BACKUP or FAULT the fileset pull uses. A leader applying its\n"
+        "# peer's window would write the peer's history into its own live estate.\n"
+        'STATE="$(cat "$STATE_FILE" 2>/dev/null || true)"\n'
+        'if [[ "$STATE" != "BACKUP" ]] && [[ "$STATE" != "FAULT" ]]; then\n'
+        "    exit 0\n"
+        "fi\n"
+        "\n"
+        f"{ctx.password_block}"
+        "IMAGE=$(docker inspect -f '{{.Config.Image}}' \"$CONTAINER\")\n"
+        "\n"
+        "docker run --rm \\\n"
+        "    --entrypoint python3 \\\n"
+        '    -v "$CONFIG:/config" \\\n'
+        f"    -v {INSTALL_DIR}/cluster-fileset.key:/key:ro \\\n"
+        f"    -v {INSTALL_DIR}/statistics_pull.py:{PULL_MOUNTPOINT}/statistics_pull.py:ro \\\n"
+        f"    -v {INSTALL_DIR}/statistics_sync.py:{PULL_MOUNTPOINT}/statistics_sync.py:ro \\\n"
+        f"    -v {INSTALL_DIR}/crypto.py:{PULL_MOUNTPOINT}/crypto.py:ro \\\n"
+        f"    -v {INSTALL_DIR}/resp.py:{PULL_MOUNTPOINT}/resp.py:ro \\\n"
+        f"{ctx.ca_mount}"
+        f"{ctx.password_flag}"
+        "    --network host \\\n"
+        '    "$IMAGE" \\\n'
+        f"    {PULL_MOUNTPOINT}/statistics_pull.py \\\n"
+        f"        --redis {ctx.redis_host}:{ctx.redis_port} \\\n"
+        f"        --namespace {ctx.namespace} \\\n"
+        "        --key-file /key \\\n"
+        "        --config /config \\\n"
+        f"        --db {ctx.db} \\\n"
+        f"{ctx.username_flag}"
+        f"{ctx.tls_flags}"
+        "    || { logger -t cluster-sync 'statistics pull failed; history not advanced'; "
+        "exit 1; }\n"
+        "\n"
+    )
+
+
+def _statistics_pull_service() -> str:
+    return (
+        "[Unit]\n"
+        "Description=Cluster State Sync — apply the leader's long-term statistics\n"
+        "After=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        "ExecStart=/etc/cluster-sync/cluster-statistics-pull.sh\n"
+    )
+
+
+def _statistics_pull_timer(cfg: dict[str, Any]) -> str:
+    """Matched to the publisher's cadence: a faster timer re-applies a window
+    that has not changed, and a slower one throws away history the leader has
+    already published and may not still hold when this node next looks."""
+    minutes = int(cfg.get(CONF_STATISTICS_INTERVAL_MINUTES) or DEFAULT_STATISTICS_INTERVAL_MINUTES)
+    minutes = max(MIN_STATISTICS_INTERVAL_MINUTES, min(MAX_STATISTICS_INTERVAL_MINUTES, minutes))
+    return (
+        "[Unit]\n"
+        "Description=Run the cluster statistics pull, so a follower's history keeps "
+        "pace with the leader's\n"
+        "\n"
+        "[Timer]\n"
+        # Not OnBootSec=0: a node that has just booted is competing with Home
+        # Assistant's own start-up for the same disk, and half an hour of
+        # statistics is not worth winning that race.
+        "OnBootSec=5min\n"
+        f"OnUnitActiveSec={minutes}min\n"
+        "AccuracySec=1min\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
     )
 
 
@@ -1353,6 +1639,80 @@ def _fileset_swap(cfg: dict[str, Any]) -> str:
         "    exit 0\n"
         "fi\n"
         "\n"
+        "# 5b. Recorder history hand-over (ADR-010).\n"
+        "#\n"
+        "#     Here because Home Assistant is STOPPED at this point, and that is the\n"
+        "#     only moment this is possible at all: `recorder.disable` merely makes\n"
+        "#     the recorder drop events, it does not close the database, and there is\n"
+        "#     no reload service. Swapping it under a running instance cannot be done.\n"
+        "#\n"
+        "#     Before the staleness check on purpose: a stale go-bag still beats none,\n"
+        "#     and so does old history. Never fatal -- a house with no graphs beats no\n"
+        "#     house (D4).\n"
+        "#\n"
+        "#     🚨 It LOGS, it never calls mark(). The degraded marker is first-reason-\n"
+        '#     wins and means "your identity may be wrong" -- a signal an operator acts\n'
+        "#     on. Letting a missing history file claim it would pre-empt `stale`, which\n"
+        "#     is strictly more important, and dilute the one marker that matters at\n"
+        "#     3am. Recorder health has its own diagnostic sensor.\n"
+        f'STATS_STORE="$CONFIG/{STATISTICS_DB_NAME}"\n'
+        f'RECORDER="$CONFIG/{RECORDER_DB_NAME}"\n'
+        "#     Two possible sources, in this order:\n"
+        "#\n"
+        "#       1. The replicated statistics store, kept current by\n"
+        "#          cluster-statistics-pull.timer. A full recorder schema holding\n"
+        "#          years of long-term statistics and none of the ten-day churn --\n"
+        "#          the Energy dashboard and every long climate graph survive, the\n"
+        "#          recent logbook does not. This is the one that is actually\n"
+        "#          replicated, so it is preferred.\n"
+        "#       2. A whole-database copy an operator placed here by hand. Nothing\n"
+        "#          ships one automatically: at 1.59 GB it cannot travel through\n"
+        "#          Valkey, and node-to-node rsync was removed rather than make this\n"
+        "#          the one feature that needs the standby to reach the leader over\n"
+        "#          SSH. Honoured if present because someone went to the trouble.\n"
+        "#\n"
+        "#     MOVE, for the store only: once it is installed as this node's\n"
+        "#     recorder, leaving a copy behind would freeze at today's date and be\n"
+        "#     re-installed, stale, at some later promotion. Consumed instead, and\n"
+        "#     statistics_pull.py rebuilds it from the live recorder when this node\n"
+        "#     goes back to standby -- so a failover and a failback need no manual\n"
+        "#     re-seed.\n"
+        'if [[ -f "$STATS_STORE" ]]; then\n'
+        '    SNAPSHOT="$STATS_STORE"\n'
+        "    INSTALL=(mv -f)\n"
+        "else\n"
+        f'    SNAPSHOT="$CONFIG/{RECORDER_SNAPSHOT_NAME}"\n'
+        "    # Copy rather than move: an operator's hand-placed database is still\n"
+        "    # there for the next attempt if the promotion fails after this point.\n"
+        "    INSTALL=(cp -a)\n"
+        "fi\n"
+        'if [[ -f "$SNAPSHOT" ]]; then\n'
+        '    if [[ -f "$RECORDER" && "$RECORDER" -nt "$SNAPSHOT" ]]; then\n'
+        "        # The local database is NEWER than the copy we were sent, so\n"
+        "        # installing it would discard more history than it restores.\n"
+        "        logger -t cluster-sync \\\n"
+        "            'recorder: local history newer than the peer snapshot; keeping local'\n"
+        "    else\n"
+        "        # 🚨 The old -wal and -shm MUST go. SQLite would otherwise try to\n"
+        "        #    recover the PREVIOUS database's write-ahead log against the new\n"
+        "        #    file, which is a corrupt database rather than a failed swap.\n"
+        '        rm -f "$RECORDER-wal" "$RECORDER-shm"\n'
+        '        if [[ -f "$RECORDER" ]]; then\n'
+        '            mv -f "$RECORDER" "$RECORDER.superseded" || true\n'
+        "        fi\n"
+        '        if "${INSTALL[@]}" "$SNAPSHOT" "$RECORDER"; then\n'
+        '            logger -t cluster-sync "recorder history installed from $SNAPSHOT"\n'
+        "        else\n"
+        "            logger -t cluster-sync 'recorder: installing peer history FAILED'\n"
+        "        fi\n"
+        "    fi\n"
+        "else\n"
+        "    # Nothing ever arrived. Promote regardless; the graphs will have a\n"
+        "    # hole, and a house with no graphs still beats no house (D4).\n"
+        "    logger -t cluster-sync 'recorder: no replicated history present; graphs will "
+        "have a gap'\n"
+        "fi\n"
+        "\n"
         "# 6. Stale still beats nothing, so the swap above happened either way. The\n"
         "#    only question left is whether to raise the alarm.\n"
         "if (( AGE > STALE_AFTER )); then\n"
@@ -1454,6 +1814,40 @@ def _promoter_ha_url(cfg: dict[str, Any]) -> str:
 #: than left to `cluster_promoter.DEFAULT_TTL_SECONDS`.
 PROMOTER_PROBE_GRACE_SECONDS = 600
 
+#: Mirrors `cluster_promoter.DEFAULT_BASE_GRACE_SECONDS`, repeated here for the
+#: same reason as the ceiling above: the generated wrapper states its own
+#: timings rather than inheriting whatever default the installed script happens
+#: to carry.
+#:
+#: The base is what a WEDGED Home Assistant costs before its peer may promote.
+#: The ceiling above is reached only while the container is demonstrably
+#: restarting, and extension stops there regardless -- so a crash loop still
+#: demotes (ADR-001's budget, ADR-009's radio latency).
+PROMOTER_BASE_GRACE_SECONDS = 120
+
+#: Mirrors `recorder_snapshot.SNAPSHOT_NAME` and Home Assistant's own database
+#: name. Repeated rather than imported for the same reason every constant in
+#: the generated shell is: it runs on a host with no Python package present.
+RECORDER_SNAPSHOT_NAME = ".cluster_sync_recorder.db"
+RECORDER_DB_NAME = "home-assistant_v2.db"
+
+#: (removed 2026-09-08) Shipping the recorder snapshot by rsync-over-SSH would
+#: have been the FIRST direct node-to-node dependency this project has.
+#: Everything else reaches Valkey and nothing else -- a node has never needed to
+#: talk to its peer, which is why the failure modes are as simple as they are.
+#: It was also not native to Home Assistant, which this integration is required
+#: to be: rsync-over-SSH works on Docker, might work on a Supervised install,
+#: and cannot work on Home Assistant OS at all.
+#:
+#: What replaced it: only long-term `statistics` cross, as ROWS through the
+#: same Valkey and the same sealed envelope as everything else (ADR-010). That
+#: is half a megabyte a day rather than 1.59 GB, it needs no new transport, no
+#: new port and no new trust, and it works identically on every install shape.
+#: The price is honest and stated: raw `states` -- the recent logbook and
+#: history graphs -- does not cross. Long-term statistics do, and those are the
+#: years of energy and climate data people actually grieve losing.
+RECORDER_SNAPSHOT_LOCK_NAME = ".cluster_sync_recorder.writing"
+
 #: Mirrors `cluster_promoter.DEFAULT_RELEASE_HOLDDOWN_SECONDS`, for the same
 #: reason and with the same caveat as the grace above. Used only by
 #: `install.sh`, to say how long a failed D3 probe keeps Home Assistant stopped
@@ -1498,6 +1892,13 @@ def _promoter_sh(cfg: dict[str, Any]) -> str:
     # see hold.py. This is the host's view of it.
     hold_file = _host_path(cfg, f"{CONTAINER_CONFIG_DIR}/{HOLD_FILENAME}")
     handover_file = _host_path(cfg, f"{CONTAINER_CONFIG_DIR}/{HANDOVER_FILENAME}")
+    # Why a demotion is being deferred, for the operator surface. Under /run
+    # like the other volatile promoter state: an explanation from a previous
+    # boot would be a claim nobody checked (ADR-008 §3).
+    grace_reason_file = "/run/cluster-sync/grace-reason"
+    # The container the adaptive grace inspects. Empty disables it and falls
+    # back to the flat ceiling, which is right wherever docker cannot answer.
+    container = str(cfg.get(CONF_HA_CONTAINER) or "")
 
     # host, username, the CA path and the probe URL all reach this shell
     # verbatim -- unlike `namespace` (validated by `validate_namespace` at
@@ -1600,6 +2001,9 @@ def _promoter_sh(cfg: dict[str, Any]) -> str:
         f"    --hold-file {shlex.quote(hold_file)} \\\n"
         f"    --handover-file {shlex.quote(handover_file)} \\\n"
         f"    --probe-grace {PROMOTER_PROBE_GRACE_SECONDS} \\\n"
+        f"    --base-grace {PROMOTER_BASE_GRACE_SECONDS} \\\n"
+        f"    --ha-container {shlex.quote(container)} \\\n"
+        f"    --grace-reason-file {shlex.quote(grace_reason_file)} \\\n"
         "    $NO_PROBE_FLAG \\\n"
         # Forwarded so `install.sh` can run this same wrapper with `--adopt`
         # and inherit every connection flag above, rather than restating the
@@ -2586,6 +2990,14 @@ MANAGED_FILENAMES: frozenset[str] = frozenset(
         "cluster-fileset-pull.sh",
         "cluster-fileset-pull.service",
         "cluster-fileset-pull.timer",
+        # Emitted only when statistics replication is on, and listed here so
+        # that turning it back OFF prunes the installed copies rather than
+        # leaving a timer running against a key nobody publishes (ADR-005).
+        "statistics_pull.py",
+        "statistics_sync.py",
+        "cluster-statistics-pull.sh",
+        "cluster-statistics-pull.service",
+        "cluster-statistics-pull.timer",
         "cluster-fileset-swap.sh",
         "cluster-fileset-identity.py",
         "cluster-fileset.key",

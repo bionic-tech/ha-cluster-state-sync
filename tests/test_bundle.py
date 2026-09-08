@@ -2369,8 +2369,28 @@ def test_the_tier_one_rsync_is_never_emitted() -> None:
         assert "cluster-config-sync.service" not in bundle
         assert "cluster-config-sync.timer" not in bundle
         # Nothing else in the bundle grew its own copy of the push either.
+        #
+        # This guard did its job on 2026-09-08. A recorder-history feature added
+        # `rsync` here to ship a 1.59 GB snapshot between nodes, and the guard
+        # caught it. The exception was NOT taken: rsync runs on the host, which
+        # cannot work on Home Assistant OS at all, and it would have restored
+        # the SSH trust between hosts that removing tier 1 deliberately ended.
+        # The feature was reworked instead. See ADR-010.
         assert not [
             name for name, body in bundle.items() if name.endswith(".sh") and "rsync -" in body
+        ]
+        # Same reasoning, stated for the transport rather than the tool: nothing
+        # in the bundle may require one node to reach the other directly. The
+        # whole design goes through Valkey.
+        assert not [
+            name
+            for name, body in bundle.items()
+            if name.endswith(".sh")
+            and any(
+                line.strip().startswith("ssh ") or " ssh " in line
+                for line in body.splitlines()
+                if not line.strip().startswith("#")
+            )
         ]
 
 

@@ -122,6 +122,14 @@ async def reach_topology_step(hass: HomeAssistant, **backend_overrides: object) 
         return_value=None,
     ):
         result = await hass.config_entries.flow.async_configure(result["flow_id"], backend_input)
+    # ADR-010 inserted a history step between backend and topology: the answer
+    # decides which standby models topology may even offer, so it has to come
+    # first. Default here is the permissive combination (shared database), so
+    # existing tests still see both models on the next screen.
+    assert result["step_id"] == "history", result
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"history_matters": False, "history_database": "shared"}
+    )
     assert result["step_id"] == "topology", result
     return result["flow_id"]
 
@@ -542,6 +550,15 @@ async def test_every_wizard_step_survives_the_frontend(hass: HomeAssistant, mode
     flow_id = result["flow_id"]
     with patch("custom_components.cluster_state_sync.config_flow._test_backend", return_value=None):
         result = await hass.config_entries.flow.async_configure(flow_id, BACKEND_INPUT)
+    render(result)  # history (ADR-010)
+
+    # A shared database keeps BOTH standby models on offer, which this test
+    # needs -- it is parameterised over cold and warm. The dedicated-database
+    # path deliberately hides warm, and is covered by its own test below.
+    assert result["step_id"] == "history", result
+    result = await hass.config_entries.flow.async_configure(
+        flow_id, {"history_matters": True, "history_database": "shared"}
+    )
     render(result)  # topology
 
     result = await hass.config_entries.flow.async_configure(flow_id, topology_input(model))
@@ -760,6 +777,12 @@ async def test_reconfigure_can_fix_a_host_path_without_deleting_the_entry(
         return_value=None,
     ):
         result = await hass.config_entries.flow.async_configure(flow_id, BACKEND_INPUT)
+    # ADR-010: history is asked before topology, on reconfigure too, because it
+    # decides which standby models topology may offer.
+    assert result["step_id"] == "history"
+    result = await hass.config_entries.flow.async_configure(
+        flow_id, {"history_matters": False, "history_database": "shared"}
+    )
     assert result["step_id"] == "topology"
 
     fixed = {**topology_input(TOPOLOGY_COLD), CONF_HA_CONFIG_PATH: "/mnt/data/homeassistant"}
@@ -820,6 +843,12 @@ async def test_reconfigure_regenerates_the_bundle(hass: HomeAssistant) -> None:
         return_value=None,
     ):
         await hass.config_entries.flow.async_configure(flow_id, BACKEND_INPUT)
+    # ADR-010's history step sits between backend and topology on reconfigure
+    # too -- the answer restricts which standby models topology offers, so it
+    # cannot be skipped just because the entry already exists.
+    await hass.config_entries.flow.async_configure(
+        flow_id, {"history_matters": False, "history_database": "shared"}
+    )
     fixed = {**topology_input(TOPOLOGY_COLD), CONF_HA_CONFIG_PATH: "/mnt/data/homeassistant"}
     await hass.config_entries.flow.async_configure(flow_id, fixed)
     await hass.config_entries.flow.async_configure(flow_id, DOMAINS_INPUT)
@@ -958,3 +987,122 @@ async def test_the_ssh_answers_never_reach_the_config_entry(
     stored = json.dumps(result["data"])
     assert "secret-host.lan" not in stored
     assert "/root/.ssh/id_rsa" not in stored
+
+
+# -- ADR-010: the history step FILTERS the standby models --------------------
+
+
+async def test_dedicated_database_plus_history_offers_ONLY_cold(
+    hass: HomeAssistant,
+) -> None:
+    """🚨 The combination that cannot work is not offered at all.
+
+    Warm standby cannot carry history on a per-node database: swapping the
+    recorder file requires Home Assistant stopped, and `recorder.disable` only
+    makes it drop events rather than closing the file. A warm promotion that
+    did the swap would be SLOWER than cold, because it adds a stop it would not
+    otherwise pay.
+
+    So the wizard removes the option rather than warning about it. Nobody has
+    to understand why, and nobody can assemble a broken cluster by clicking
+    past a caveat.
+    """
+    from homeassistant.helpers import config_validation as cv
+    import voluptuous_serialize
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    flow_id = result["flow_id"]
+    await hass.config_entries.flow.async_configure(flow_id, {"accept_risk": True})
+    await hass.config_entries.flow.async_configure(flow_id, {"next_step_id": "direct"})
+    with patch("custom_components.cluster_state_sync.config_flow._test_backend", return_value=None):
+        result = await hass.config_entries.flow.async_configure(flow_id, BACKEND_INPUT)
+    assert result["step_id"] == "history"
+
+    result = await hass.config_entries.flow.async_configure(
+        flow_id, {"history_matters": True, "history_database": "dedicated"}
+    )
+    # These same two answers are what makes statistics replication worth
+    # offering, so the wizard asks about it here before reaching topology.
+    assert result["step_id"] == "statistics"
+    result = await hass.config_entries.flow.async_configure(
+        flow_id,
+        {
+            "statistics_enabled": True,
+            "statistics_window_days": 30,
+            "statistics_interval_minutes": 30,
+        },
+    )
+    assert result["step_id"] == "topology"
+
+    rendered = voluptuous_serialize.convert(
+        result["data_schema"], custom_serializer=cv.custom_serializer
+    )
+    field = next(f for f in rendered if f["name"] == "topology_model")
+    # The selector nests its options under `selector.select.options` once
+    # serialised for the frontend, which is the shape the UI actually receives.
+    sel = field.get("selector", {}).get("select", {})
+    raw = sel.get("options", field.get("options", []))
+    offered = {o["value"] if isinstance(o, dict) else o for o in raw}
+    assert offered == {"cold"}, f"warm was offered with a dedicated database: {offered}"
+
+
+async def test_a_shared_database_keeps_both_models_available(
+    hass: HomeAssistant,
+) -> None:
+    """One database both nodes use has nothing to swap, so warm is fine."""
+    from homeassistant.helpers import config_validation as cv
+    import voluptuous_serialize
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    flow_id = result["flow_id"]
+    await hass.config_entries.flow.async_configure(flow_id, {"accept_risk": True})
+    await hass.config_entries.flow.async_configure(flow_id, {"next_step_id": "direct"})
+    with patch("custom_components.cluster_state_sync.config_flow._test_backend", return_value=None):
+        await hass.config_entries.flow.async_configure(flow_id, BACKEND_INPUT)
+    result = await hass.config_entries.flow.async_configure(
+        flow_id, {"history_matters": True, "history_database": "shared"}
+    )
+    rendered = voluptuous_serialize.convert(
+        result["data_schema"], custom_serializer=cv.custom_serializer
+    )
+    field = next(f for f in rendered if f["name"] == "topology_model")
+    # The selector nests its options under `selector.select.options` once
+    # serialised for the frontend, which is the shape the UI actually receives.
+    sel = field.get("selector", {}).get("select", {})
+    raw = sel.get("options", field.get("options", []))
+    offered = {o["value"] if isinstance(o, dict) else o for o in raw}
+    assert offered == {"cold", "warm"}, offered
+
+
+async def test_not_caring_about_history_leaves_both_models_available(
+    hass: HomeAssistant,
+) -> None:
+    """The restriction exists to protect history. No history, no restriction."""
+    from homeassistant.helpers import config_validation as cv
+    import voluptuous_serialize
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    flow_id = result["flow_id"]
+    await hass.config_entries.flow.async_configure(flow_id, {"accept_risk": True})
+    await hass.config_entries.flow.async_configure(flow_id, {"next_step_id": "direct"})
+    with patch("custom_components.cluster_state_sync.config_flow._test_backend", return_value=None):
+        await hass.config_entries.flow.async_configure(flow_id, BACKEND_INPUT)
+    result = await hass.config_entries.flow.async_configure(
+        flow_id, {"history_matters": False, "history_database": "dedicated"}
+    )
+    rendered = voluptuous_serialize.convert(
+        result["data_schema"], custom_serializer=cv.custom_serializer
+    )
+    field = next(f for f in rendered if f["name"] == "topology_model")
+    # The selector nests its options under `selector.select.options` once
+    # serialised for the frontend, which is the shape the UI actually receives.
+    sel = field.get("selector", {}).get("select", {})
+    raw = sel.get("options", field.get("options", []))
+    offered = {o["value"] if isinstance(o, dict) else o for o in raw}
+    assert offered == {"cold", "warm"}, offered

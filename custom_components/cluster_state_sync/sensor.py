@@ -28,7 +28,9 @@ from .const import (
     DATA_DEGRADED_MARKER,
     DATA_FILESET,
     DATA_MIRROR,
+    DATA_STATISTICS,
     DATA_STATS,
+    MAX_ATTRIBUTE_BYTES,
 )
 from .coordinator import BackendHealthCoordinator, ClusterViewCoordinator, SyncStats
 from .entity import ClusterSyncDiagnosticEntity, ClusterViewEntity, MirrorBackedEntity
@@ -74,6 +76,16 @@ async def async_setup_entry(
             ClusterMembersSensor(cluster_view, entry),
             ClockSkewSensor(cluster_view, entry),
             UnreplicatedReferencesSensor(coordinator, entry, hass.config.path()),
+            OversizedEntitiesSensor(coordinator, entry, runtime[DATA_STATS]),
+            RecorderSnapshotAgeSensor(coordinator, entry, runtime[DATA_STATS]),
+            # Only where statistics replication is actually configured. An
+            # age sensor for a mechanism that is switched off would read as
+            # a broken mechanism, which is worse than no sensor at all.
+            *(
+                [StatisticsAgeSensor(coordinator, entry, runtime.get(DATA_STATISTICS))]
+                if runtime.get(DATA_STATISTICS) is not None
+                else []
+            ),
             # Only when the operator has said what a radio looks like
             # here. An entity that watches nothing is worse than absent:
             # it reads as a working check.
@@ -249,6 +261,58 @@ class FilesetAgeSensor(ClusterSyncDiagnosticEntity, SensorEntity):
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=UTC)
         return max(0.0, (datetime.now(tz=UTC) - parsed).total_seconds())
+
+
+class StatisticsAgeSensor(ClusterSyncDiagnosticEntity, SensorEntity):
+    """Seconds since the long-term statistics window was last published.
+
+    A gauge, not a status: it keeps climbing if the publish loop stops, which
+    is the failure this project has actually had (AR-0040) and the one a
+    "last result: OK" field cannot show. Unknown before the first successful
+    publish, because zero would claim a freshness never earned.
+
+    Its attributes carry what the last pass did, including a refusal — the
+    number alone cannot distinguish "nothing to publish" from "refused to
+    publish because the window is over the cap", and those need opposite
+    responses from an operator.
+    """
+
+    _attr_translation_key = "statistics_age"
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfTime.SECONDS
+    _attr_suggested_display_precision = 0
+
+    def __init__(
+        self,
+        coordinator: BackendHealthCoordinator,
+        entry: ConfigEntry,
+        publisher: Any,
+    ) -> None:
+        super().__init__(coordinator, entry, "statistics_age")
+        self._publisher = publisher
+
+    @property
+    def native_value(self) -> float | None:
+        at = getattr(self._publisher, "last_success_at", None)
+        if at is None:
+            return None
+        return (datetime.now(tz=UTC) - at).total_seconds()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        result = getattr(self._publisher, "last_result", None)
+        if result is None:
+            return {"status": "no publish attempted yet"}
+        return {
+            "rows": result.rows,
+            "statistics_tracked": result.metadata,
+            "published_bytes": result.bytes_written,
+            "export_seconds": round(result.seconds, 2),
+            # Spelled out rather than left as a bare reason code: this is the
+            # field that says the standby's history has stopped advancing.
+            "status": result.skipped_reason or "publishing",
+        }
 
 
 class ClusterLeaderSensor(ClusterViewEntity, SensorEntity):
@@ -599,4 +663,86 @@ class RadioSilenceSensor(ClusterSyncDiagnosticEntity, SensorEntity):
             "entities_matched": matched,
             "entities_reporting": len(stamps),
             "status": status,
+        }
+
+
+class OversizedEntitiesSensor(ClusterSyncDiagnosticEntity, SensorEntity):
+    """Entities that will never replicate because their attributes are too big.
+
+    `MAX_ATTRIBUTE_BYTES` is 16 KB. An entity above it is dropped from the
+    snapshot on write and refused on read, permanently and silently -- the only
+    trace was a WARNING nobody reads.
+
+    Measured on a real 3,595-entity estate: `sensor.watchman_missing_entities`
+    carried **100,911 bytes**, twelve percent of the whole payload, for an
+    entity whose value is a derived report that means nothing after a
+    promotion. That is the shape worth surfacing: not "the snapshot is large"
+    but "this specific thing you think is protected is not".
+
+    Zero is the normal reading, and zero here is *earned* rather than assumed --
+    it means the flush looked and found nothing over the cap (ADR-008).
+    """
+
+    _attr_translation_key = "oversized_entities"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator, entry, stats) -> None:
+        super().__init__(coordinator, entry, "oversized_entities")
+        self._stats = stats
+
+    @property
+    def native_value(self) -> int:
+        return len(self._stats.oversized)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "entities": sorted(self._stats.oversized),
+            "cap_bytes": MAX_ATTRIBUTE_BYTES,
+        }
+
+
+class RecorderSnapshotAgeSensor(ClusterSyncDiagnosticEntity, SensorEntity):
+    """Seconds since the last successful recorder snapshot, or `unknown`.
+
+    The feature it reports on is the one that decides whether your graphs
+    survive a failover, and it is the kind of thing that stops working quietly:
+    a full disk, a database that moved, a recorder pointed at PostgreSQL after
+    a reconfiguration. None of those raise; all of them mean the standby's
+    history is silently frozen at whenever this last worked.
+
+    `unknown` when no snapshot has ever succeeded, never `0`. Zero would read
+    as "just did one", which is the opposite of the truth (ADR-008).
+    """
+
+    _attr_translation_key = "recorder_snapshot_age"
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfTime.SECONDS
+
+    def __init__(self, coordinator, entry, stats) -> None:
+        super().__init__(coordinator, entry, "recorder_snapshot_age")
+        self._stats = stats
+
+    @property
+    def native_value(self) -> int | None:
+        result = getattr(self._stats, "last_recorder_snapshot", None)
+        if result is None or not getattr(result, "ok", False):
+            return None
+        taken = getattr(result, "taken_at", None)
+        if taken is None:
+            return None
+        return max(0, int(dt_util.utcnow().timestamp() - taken.timestamp()))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        result = getattr(self._stats, "last_recorder_snapshot", None)
+        if result is None:
+            return {"status": "never run"}
+        if not getattr(result, "ok", False):
+            return {"status": "last attempt failed", "error": getattr(result, "error", None)}
+        return {
+            "status": "ok",
+            "size_gb": round(getattr(result, "bytes_written", 0) / 1e9, 2),
+            "took_seconds": round(getattr(result, "seconds", 0.0), 1),
         }

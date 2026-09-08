@@ -97,6 +97,93 @@ CONF_COMPOSE_ENV_FILE: Final = "compose_env_file"
 # updates on every packet received; elsewhere it is a link-quality sensor, a
 # last-seen timestamp, or a coordinator's own diagnostic.
 CONF_RADIO_WATCH: Final = "radio_watch"
+
+
+# -- recorder history continuity (ADR-010) ---------------------------------
+#
+# Off by default. It writes a whole compacted copy of the history database on
+# every tick, which is real disk wear on flash, and a great many installs will
+# not care whether graphs survive a failover. Opting in is the honest default.
+CONF_RECORDER_SNAPSHOT_ENABLED: Final = "recorder_snapshot_enabled"
+DEFAULT_RECORDER_SNAPSHOT_ENABLED: Final = False
+
+#: Minutes between snapshots. The wizard proposes a value from the detected
+#: disk (see `storage.py`) rather than a fixed default, because the cost of a
+#: short interval is write endurance and that depends entirely on the hardware.
+CONF_RECORDER_SNAPSHOT_MINUTES: Final = "recorder_snapshot_minutes"
+
+#: Floor and ceiling for the interval. The floor is not a performance limit --
+#: a snapshot takes ~10s on a 2.2 GB database -- it is a wear limit. Five
+#: minutes on flash is 455 GB/day, which no default should permit by accident.
+MIN_RECORDER_SNAPSHOT_MINUTES: Final = 5
+MAX_RECORDER_SNAPSHOT_MINUTES: Final = 1440
+
+#: Does the operator care whether history survives a failover, and where does
+#: that history live? Asked EARLY, because the answer restricts which standby
+#: models are even offered (ADR-010 §6) -- and a wizard that lets someone build
+#: a combination which cannot work has failed them before they start.
+CONF_HISTORY_MATTERS: Final = "history_matters"
+CONF_HISTORY_DATABASE: Final = "history_database"
+
+#: One database, both nodes. Nothing to replicate; works in cold AND warm.
+HISTORY_DB_SHARED: Final = "shared"
+#: A SQLite recorder per node. Only cold can carry history across a failover,
+#: because swapping the file needs Home Assistant stopped.
+HISTORY_DB_DEDICATED: Final = "dedicated"
+HISTORY_DATABASES: Final = [HISTORY_DB_SHARED, HISTORY_DB_DEDICATED]
+
+#: Home Assistant's own recorder documentation. Linked rather than paraphrased:
+#: their page is the authority on `db_url` and stays current when we do not.
+RECORDER_DOCS_URL: Final = "https://www.home-assistant.io/integrations/recorder/"
+
+# --- Long-term statistics replication (ADR-010) ---------------------------
+#
+# Measured on a 3,595-entity estate, 2026-09-08: long-term `statistics` grows
+# ~5,500 rows a day (~0.5 MB), while raw `states` churns ~324,000 a day and
+# block-replicating it cost 4 GB a day through Valkey. So only statistics
+# cross, and they cross as rows rather than as a database file.
+CONF_STATISTICS_ENABLED: Final = "statistics_enabled"
+DEFAULT_STATISTICS_ENABLED: Final = False
+
+#: How far back each publish reaches. The whole window is republished every
+#: pass, so this is also **how long the standby may be offline and still catch
+#: up completely**. Measured against the live database: 7 days = 0.99 MB
+#: gzipped, 30 days = 4.48 MB, 90 days = 12.51 MB. Thirty days is the default
+#: because it covers a holiday with room to spare and still costs under 5 MB in
+#: a Valkey the runbook caps at 1 GB.
+CONF_STATISTICS_WINDOW_DAYS: Final = "statistics_window_days"
+DEFAULT_STATISTICS_WINDOW_DAYS: Final = 30
+MIN_STATISTICS_WINDOW_DAYS: Final = 1
+MAX_STATISTICS_WINDOW_DAYS: Final = 365
+
+#: Publish cadence. Statistics are compiled by Home Assistant once every five
+#: minutes and hourly rows land on the hour, so anything under five minutes
+#: republishes an unchanged window. Thirty minutes bounds the loss at half an
+#: hour of history -- against a failover budget of 2.5 minutes, that is the
+#: cheapest part of the whole design.
+CONF_STATISTICS_INTERVAL_MINUTES: Final = "statistics_interval_minutes"
+DEFAULT_STATISTICS_INTERVAL_MINUTES: Final = 30
+MIN_STATISTICS_INTERVAL_MINUTES: Final = 5
+MAX_STATISTICS_INTERVAL_MINUTES: Final = 1440
+
+#: Refuse to publish above this. A window that has grown past the cap means
+#: the estate outgrew the setting; publishing a truncated one would look like
+#: success. Sized well above the 90-day measurement so it never trips by
+#: accident, and low enough that it cannot fill a 1 GB Valkey.
+CONF_STATISTICS_MAX_BYTES: Final = "statistics_max_bytes"
+DEFAULT_STATISTICS_MAX_BYTES: Final = 64 * 1024 * 1024
+
+#: The standby's accumulating history, in ITS config directory. Deliberately
+#: not `home-assistant_v2.db`: on a warm standby that file is open by a live
+#: recorder, and this is written by a program running outside Home Assistant.
+#: `cluster-fileset-swap.sh` installs it under the real name at promotion.
+STATISTICS_DB_NAME: Final = ".cluster_sync_statistics.db"
+
+#: Where an operator drops the one-off seed. Named as an inbox rather than as
+#: the store itself so that "the copy is still running" and "the copy
+#: finished" are distinguishable states -- a half-copied 484 MB file renamed
+#: into place would be a corrupt database that opens.
+STATISTICS_SEED_NAME: Final = ".cluster_sync_statistics_seed.db"
 CONF_SETTLE_DELAY: Final = "settle_delay"
 CONF_LEADERSHIP_ENTITY: Final = "leadership_entity"
 CONF_SNAPSHOT_INTERVAL: Final = "snapshot_interval"
@@ -296,6 +383,40 @@ def node_key_pattern(namespace: str) -> str:
     return f"ha:cluster_state_sync:{namespace}:nodes:*"
 
 
+def promoter_key(namespace: str, node_id: str) -> str:
+    """This node's PROMOTER heartbeat — written by the host-side timer.
+
+    Distinct from `node_key` on purpose, because the two answer different
+    questions and one of them cannot be answered by the integration at all.
+
+    `nodes:*` is refreshed by the integration, so a **cold standby never
+    appears in it** — its Home Assistant is deliberately stopped, which is why
+    `cluster_members` reads 1 on a healthy two-node cold cluster. That is
+    correct and useless for the question "is the other machine still able to
+    promote?".
+
+    The promoter is the only thing running on a cold standby, so it is the only
+    thing that can answer. It writes this key on every tick regardless of
+    leadership, which makes the residual custody gap visible: a promoter that
+    has been stopped -- by an operator, or by a failed unit -- goes quiet here
+    while everything else looks perfectly healthy (ADR-009).
+    """
+    return f"ha:cluster_state_sync:{namespace}:promoters:{node_id}"
+
+
+def promoter_key_pattern(namespace: str) -> str:
+    """Every promoter's heartbeat, for the scan that finds a quiet one."""
+    return f"ha:cluster_state_sync:{namespace}:promoters:*"
+
+
+#: How long a promoter heartbeat survives without a refresh. The timer ticks
+#: every 10s, so this tolerates five missed ticks before the key disappears --
+#: long enough that a slow Valkey round trip is not reported as a dead
+#: promoter, short enough that a genuinely stopped one is obvious within a
+#: minute.
+PROMOTER_HEARTBEAT_TTL_SECONDS: Final = 60
+
+
 #: How long a member's registry entry survives without being refreshed.
 #:
 #: Comfortably more than two `HEALTH_POLL_INTERVAL`s, so a node that misses a
@@ -371,7 +492,31 @@ DEFAULT_FILESET_HOT_INTERVAL: Final = 60
 # Measured on node-a 2026-08-29. `*.bak-*` is 81 MB of nine hand-made
 # entity-registry copies. `core.restore_state` belongs to tier 2 — replicating
 # it would have the file fighting the Valkey restore over the same entities.
-DEFAULT_FILESET_EXCLUSIONS: Final = ("*.bak-*", "core.restore_state")
+#: 🚨 The recorder snapshot is excluded by default and must stay excluded.
+#:
+#: It is a whole compacted copy of the history database -- measured at 1.58 GB
+#: against a 512 MB fileset cap, so carrying it would break the go-bag outright.
+#: Worse, the go-bag is swapped **synchronously during a promotion**, so a
+#: database in it would sit on the RTO critical path (~102s measured) for data
+#: that is not needed to bring the house back. It travels by its own slower
+#: path instead; see `recorder_snapshot.py`.
+DEFAULT_FILESET_EXCLUSIONS: Final = (
+    "*.bak-*",
+    "core.restore_state",
+    ".cluster_sync_recorder.db",
+    ".cluster_sync_recorder.writing",
+    ".cluster_sync_recorder.tmp",
+    # The statistics store and its seed, for the same reason as the three
+    # above. Nothing in `_candidates` reaches the config root today -- it
+    # walks fixed lists plus what `configuration.yaml` includes -- but an
+    # operator who adds the config directory itself to the extra paths would
+    # otherwise sweep up a 484 MB seed and a growing store, blow the 512 MB
+    # cap, and have the fileset publisher REFUSE every publish from then on.
+    # That is AR-0041's shape exactly: a payload that can silently grow.
+    ".cluster_sync_statistics.db",
+    ".cluster_sync_statistics_seed.db",
+    ".cluster_sync_statistics_seed.db.tmp",
+)
 # Tier 1 measured 268 MB gross, ~187 MB after the .bak- exclusion. The cap is
 # the AR-0041 lesson: a payload that can silently grow is how you ship 92.5 GB
 # to copy 108 MB.
@@ -385,6 +530,27 @@ STAGED_DIR_NAME: Final = ".cluster_sync_staged"
 #: Written by the host-side swap script before the container starts; read by
 #: the integration at startup to raise a repair issue.
 DEGRADED_MARKER_NAME: Final = ".cluster_sync_degraded.json"
+
+
+def statistics_key(namespace: str) -> str:
+    """Return the key holding the encrypted long-term statistics window."""
+    return f"ha:cluster_state_sync:{namespace}:statistics:window"
+
+
+def statistics_status_key(namespace: str) -> str:
+    """Return the key the FOLLOWER writes its apply result to.
+
+    The one place in this integration where data flows standby -> leader. It
+    has to: only the follower can discover a recorder schema mismatch (it is
+    the only node that sees both schemas), and in the cold model the follower
+    has no Home Assistant to raise a repair on. So it leaves the finding here
+    and the leader surfaces it -- otherwise the standby's history quietly
+    stops advancing and nobody learns until a promotion.
+
+    Carries no secret and is not sealed: it is a status line, and a follower
+    with no cluster key must still be able to say "I could not apply".
+    """
+    return f"ha:cluster_state_sync:{namespace}:statistics:follower"
 
 
 def fileset_manifest_key(namespace: str) -> str:
@@ -416,6 +582,7 @@ SERVICE_CLEAR_DEGRADED: Final = "clear_degraded"
 DATA_LEADERSHIP: Final = "leadership"
 DATA_GATE: Final = "gate"
 DATA_FILESET: Final = "fileset"
+DATA_STATISTICS: Final = "statistics"
 # The parsed degraded marker (or None), read once at setup. Fixed at boot,
 # not live: the host-side swap writes the marker before the container starts
 # and a clean swap removes it, so nothing changes the answer again until the

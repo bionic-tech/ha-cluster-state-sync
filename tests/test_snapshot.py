@@ -181,3 +181,86 @@ async def test_snapshot_entries_carry_the_source_node(
     await advance_one_flush(hass)
 
     assert all(e.source_node == NODE_ID for e in backend.last_write.values())
+
+
+# --- the attribute budget on the WRITE path (2026-09-08) --------------------
+
+
+async def test_an_oversized_entity_is_not_written_at_all(hass) -> None:
+    """The budget used to be applied on READ only.
+
+    That meant an oversized entity was written on every flush and refused on
+    every restore -- paying full write cost, forever, for something guaranteed
+    unusable. Measured on a real estate: one entity carried 100,911 bytes
+    against a 16,384 byte cap.
+    """
+    from custom_components.cluster_state_sync import StateMirror
+    from custom_components.cluster_state_sync.coordinator import SyncStats
+
+    class _Backend:
+        def __init__(self):
+            self.written = None
+
+        async def write_snapshot(self, payload, node_id):
+            self.written = payload
+            return True
+
+    backend = _Backend()
+    stats = SyncStats()
+    cfg = {"include_domains": ["input_boolean"]}
+    mirror = StateMirror(hass, backend, cfg, "node-a", stats=stats)
+
+    hass.states.async_set("input_boolean.small", "on", {"note": "fine"})
+    hass.states.async_set(
+        "input_boolean.huge",
+        "on",
+        {"blob": "x" * 40000},  # well past 16 KB
+    )
+    await hass.async_block_till_done()
+    mirror.seed_from_current_states()
+    await mirror.async_flush()
+
+    assert backend.written is not None, "nothing was written at all"
+    assert "input_boolean.small" in backend.written
+    assert "input_boolean.huge" not in backend.written, (
+        "an oversized entity reached the backend — write cost for an entry the "
+        "restore will always refuse"
+    )
+    assert "input_boolean.huge" in stats.oversized, (
+        "the skip was silent; an entity that never replicates must say so"
+    )
+
+
+async def test_an_all_oversized_flush_writes_nothing_rather_than_an_empty_map(
+    hass,
+) -> None:
+    """Publishing an empty map claims 'this node tracks nothing'.
+
+    That is a different and much worse statement than 'some entries did not
+    fit', and a peer restoring from it would come up blank.
+    """
+    from custom_components.cluster_state_sync import StateMirror
+    from custom_components.cluster_state_sync.coordinator import SyncStats
+
+    class _Backend:
+        def __init__(self):
+            self.calls = 0
+
+        async def write_snapshot(self, payload, node_id):
+            self.calls += 1
+            return True
+
+    backend = _Backend()
+    mirror = StateMirror(
+        hass,
+        backend,
+        {"include_domains": ["input_boolean"]},
+        "node-a",
+        stats=SyncStats(),
+    )
+    hass.states.async_set("input_boolean.huge", "on", {"blob": "x" * 40000})
+    await hass.async_block_till_done()
+    mirror.seed_from_current_states()
+
+    assert await mirror.async_flush() is False
+    assert backend.calls == 0, "an empty snapshot was published"

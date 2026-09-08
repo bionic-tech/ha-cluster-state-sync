@@ -34,9 +34,38 @@ class SyncStats:
     restored_count: int = 0
     last_restore_at: datetime | None = None
 
+    #: Entities dropped from the snapshot for exceeding `MAX_ATTRIBUTE_BYTES`,
+    #: newest-first, capped so a pathological config cannot grow this without
+    #: bound. A set rather than a count: "which ones" is the actionable half,
+    #: and the same entity is skipped on every single flush.
+    #:
+    #: Why this exists. On a real 3,595-entity estate exactly one entity --
+    #: `sensor.watchman_missing_entities`, 100,911 bytes -- was 12% of the
+    #: whole payload and was silently dropped on every flush. The skip logged
+    #: at WARNING and nobody read it, which is the shape this project keeps
+    #: finding: a thing that never replicates, and no surface saying so
+    #: (ADR-008).
+    oversized: set[str] = field(default_factory=set)
+
     def record_restore(self, count: int) -> None:
         self.restored_count = count
         self.last_restore_at = datetime.now(tz=UTC)
+
+    #: The last recorder snapshot attempt, or None if one has never run.
+    #: Kept whole rather than as a timestamp: "it failed, and here is why" is
+    #: the part an operator needs, and a bare age cannot carry it (ADR-008).
+    last_recorder_snapshot: Any = None
+
+    def record_recorder_snapshot(self, result: Any) -> None:
+        """Remember the outcome of a snapshot attempt, success or not."""
+        self.last_recorder_snapshot = result
+
+    def record_oversized(self, entity_id: str) -> None:
+        """Remember an entity that will never replicate until it slims down."""
+        # Bounded on purpose: this is a diagnostic, not an inventory, and an
+        # unbounded set fed by a per-flush loop is a slow leak.
+        if len(self.oversized) < 200:
+            self.oversized.add(entity_id)
 
 
 class BackendHealthCoordinator(DataUpdateCoordinator[bool]):

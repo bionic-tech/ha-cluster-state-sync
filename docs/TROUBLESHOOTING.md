@@ -130,8 +130,68 @@ at a node that does not exist on your side of the mount.
 triggers a failover.
 
 **If your radios are USB-over-IP**, they must be attached to the promoted node
-*before* its container starts. See the hardware-custody design in
-`docs/superpowers/specs/`.
+*before* its container starts. See **[GUIDE-radios.md](GUIDE-radios.md)**.
+
+---
+
+### The promoted node has NO radios at all, and `Attached serial devices: 0`
+
+**Symptom.** The promotion log says:
+
+```
+timed out waiting for: usb-RFXCOM_RFXtrx433 usb-dresden_elektronik
+Attached serial devices: 0
+N config entr(ies) reference absent hardware -> Disabled N
+```
+
+Home Assistant is serving normally; it just cannot reach anything by radio.
+
+**Why.** The old node is *still running* and still holding its USB-over-IP
+claims. **No server reaps a claim from a client that is alive**, so the claim
+hook waited its 45 seconds and gave up.
+
+This is narrower than it looks. A full host loss releases the claims in ~17s and
+works fine. A Home-Assistant-only failure also works — the old node's own demote
+path stops its USB/IP client — but only after the 600s probe grace, so the
+radios arrive about ten minutes late. **You only see `Attached serial devices: 0`
+persist when the promoter itself stopped** while the machine kept running, so
+nothing ran the release.
+
+**Fix — on the OLD node**, release the claims:
+
+```bash
+sudo systemctl stop virtualhereclient.service     # or your USB/IP client
+```
+
+The new leader claims them within about 12 seconds. Then **restart Home
+Assistant on the new leader** so its `/dev` picks up the arrivals (the snapshot
+problem above), and re-enable any config entries the pre-flight disabled.
+
+**Do not fix this by lengthening the claim deadline.** The claims are held
+indefinitely, not slowly — a longer wait gives you a slower promotion that is
+still radio-less. Background:
+[ADR-009](adr/ADR-009-radio-custody-failure-modes.md), GOTCHAS §18d.
+
+---
+
+### My radios look dead but nothing is wrong
+
+Before concluding a receiver has failed, **measure the baseline**. On this fleet
+the normal gap between received 433 MHz packets reaches **nine hours** — every
+watched entity belongs to a switch or remote, so a quiet house produces no
+traffic at all and looks identical to a dead radio.
+
+Two ways to get a real answer without waiting:
+
+- **Enable the `undecoded` protocol** on the transceiver, then watch the debug
+  log. It will then report *any* packet it can frame, including a neighbour's
+  weather station — one such line proves the receiver works. Without it, a radio
+  only reports protocols you configured, so ambient traffic is invisible.
+- **Transmit from one radio and watch another** receive it. Reload each config
+  entry first so every read loop demonstrably answers a status query — otherwise
+  a silence afterwards proves nothing.
+
+Full method and the incident that produced it: GOTCHAS §18a.
 
 ---
 
@@ -216,6 +276,119 @@ takes a free one. Both nodes read the same flag file, from the container and
 from the host.
 
 ---
+
+## Everything looks fine, but is the cluster actually protecting me?
+
+The failure worth knowing about is the quiet one: **Valkey is a single point of
+failure for leadership, by design.** Every other component either moves the
+house or raises an alarm. Valkey going away does neither.
+
+If it is unreachable, both Home Assistants carry on exactly as before — lights,
+automations, radios, all normal — and no node can take or renew the lease. A
+host failure after that point promotes nobody. The protection is gone and the
+dashboard looks the same.
+
+**How to tell.** `binary_sensor.<node>_backend` is the signal. It is the only
+entity that distinguishes "the cluster is healthy" from "the cluster is running
+without any ability to fail over", and it is worth an actual notification
+rather than a card you would have to be looking at.
+
+**What to do.** Bring Valkey back; nothing on either node needs restarting, and
+the promoter resumes on its next tick. If this happens often enough to matter,
+the lease can run behind Sentinel — that is what the Sentinel option in the
+wizard is for.
+
+## History (long-term statistics) is not replicating
+
+Every state below appears as a **repair** on the leader, under Settings →
+System → Repairs. They are listed here because each one has a different fix and
+two of them have a *wrong* fix that looks reasonable.
+
+**First, the thing worth knowing before any of them:** only long-term
+statistics cross between nodes — the years of energy and climate data behind
+the Energy dashboard and long-range graphs. The recent logbook and the last ten
+days of detail do **not**. After a failover your long graphs are intact and the
+logbook starts fresh. That is by design (ADR-010), not a fault to report.
+
+### "Standby has no history to replicate into" (`not_seeded`)
+
+**What it means.** The standby has nowhere to put the statistics being
+published. Six and a half million existing rows cannot arrive at half a
+megabyte a day, so the standby needs a one-off seed you copy across yourself.
+
+**What to do.** On the **leader**, press **Write statistics seed** (Settings →
+Devices & Services → Cluster State Sync). It writes a file and shows a
+notification naming it and the command. Copy it to the same filename in the
+standby's Home Assistant config directory. On this kind of estate it is about
+500 MB and a few seconds over a wired network.
+
+You do not need to tell anything that the copy has finished. The standby checks
+the file with SQLite's own integrity check on its next pull, adopts it if it is
+whole, and refuses it if the copy was still running — so running the copy and
+the pull at the same time is safe.
+
+### "Standby's history has a gap that will not close" (`gap`)
+
+**What it means.** The standby was out of contact for longer than the
+replication window reaches back. The stretch in between is on neither node, and
+**no future update will contain it**, because each update only carries the last
+N days.
+
+**What to do — and this is the one with a wrong answer.**
+
+* If the missing stretch **matters**, write a fresh seed and copy it across, as
+  above. This is the only action that recovers the missing history.
+* If it does not, **widen the window** (Settings → reconfigure → *How far back
+  each update reaches*) so it will not happen again, and accept the hole.
+
+Widening the window **does not** recover history that has already been missed —
+it only prevents the next one. Choosing it because it is the easier button is
+how the gap becomes permanent. Sizing guide: 30 days costs about 4.5 MB per
+update, 90 days about 12.5 MB.
+
+### "Standby cannot store history: recorder schema mismatch" (`schema_mismatch`)
+
+**What it means.** The two nodes are running different Home Assistant versions,
+so their recorder databases have different schemas. The standby refuses the
+data rather than guessing, because writing rows shaped for one schema into
+another corrupts history in a way that opens cleanly and is wrong.
+
+**What to do.** Bring both nodes to the same Home Assistant version, then
+**start the standby's Home Assistant once** so its recorder performs its own
+migration. Replication resumes on the next pull. Nothing is lost in the
+meantime beyond the gap, which the `gap` advice above covers if it grows long.
+
+### "Standby's history replication has gone quiet" (`statistics_stalled`)
+
+**What it means.** The standby has not reported for several publish intervals.
+The message distinguishes two very different causes — read which one it says:
+
+* **"the standby is up — its promoter is beating"** — the machine is fine and
+  the replication itself has stopped. Check the timer on that host:
+  `systemctl status cluster-statistics-pull.timer` and
+  `journalctl -u cluster-statistics-pull.service -n 50`.
+* **"no peer promoter heartbeat is present"** — the standby is most likely
+  switched off. Nothing else is implied about the cluster.
+
+This alarm exists because silence used to be indistinguishable from success:
+the status expires, the warnings clear themselves, and replication that had
+stopped looked exactly like replication that was working.
+
+### The pull log says the seed was refused
+
+Expected, and not an error, if the copy was still running: a partially copied
+SQLite file is a valid-looking database that is missing history, so it is
+refused rather than adopted. It will be picked up on the following pass once
+the copy finishes. If it persists after the copy has definitely completed, the
+file is genuinely damaged — copy it again.
+
+### Nothing appears at all, and there are no repairs
+
+Statistics replication is **off by default**, including after an upgrade.
+Reconfigure the integration; the question appears only when you have said that
+history matters and that each node keeps its own database. On a shared
+Postgres or MariaDB both nodes already read the same history and none of this
+is needed.
 
 ## Getting help
 

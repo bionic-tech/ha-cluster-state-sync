@@ -129,3 +129,85 @@ alive to this probe. That remains a separate question and a separate design.
 Proven in `tools/rehearsal/rehearse.py fileset`, which hard-kills the leader and asserts the standby
 promotes **on its own**, with no manual step anywhere in the path. That harness used to drive
 promotion by hand, and that is precisely what hid the original defect from a 50-check green run.
+
+---
+
+## Addendum — 2026-09-07: two behaviours found by the first real fail-back
+
+Recorded here rather than as a new ADR: neither changes the decision, and both surprise operators.
+
+### A promoter restart looks like a release
+
+Restarting `cluster-promoter.service` on a node that was leading causes it to record a release and
+write the M3 hold-down marker. It then **refuses to retake the lease for `--release-holddown`
+(900s)**, which during a hand-driven fail-back means the node you are trying to return to sits at
+BACKUP with a free lease and an idle house.
+
+This is the hold-down doing its job — it cannot distinguish "restarted deliberately" from
+"released after failing" — but it is not obvious mid-incident.
+
+**`--adopt` is the answer, and it does two useful things at once:** it clears the marker, and it
+prints the **real lease holder**. That second half is the fastest way to answer "who leads?"
+without reading two journals:
+
+```
+$ sudo /etc/cluster-sync/cluster-promoter.sh --adopt
+cluster promoter: adopted BACKUP (/run/cluster-sync/vrrp-state); lease held by 'node-a'
+```
+
+### The hold-down message asserted a fact it never checked
+
+The branch printed `NOT taking the free lease` while the peer demonstrably held it, because it
+fires on `previous != "MASTER"` and the marker alone — there is no holder lookup anywhere in it.
+An operator read that as a leaderless cluster and went hunting a split-brain that did not exist.
+
+Fixed to state only what the branch knows, and to point at `--adopt` for the holder. Guarded by
+`test_the_holddown_message_never_claims_the_lease_is_free`, verified to fail against the old
+wording. The general rule is [ADR-008](./ADR-008-liveness-signals-must-prove-measurement.md) §3:
+**a log line may not assert a fact the code did not establish.**
+
+---
+
+## Addendum — 2026-09-08: the probe grace became adaptive
+
+ADR-006 fixed the grace at 600 s, chosen to exceed the slowest cold boot on the slowest node. It
+does — and it applied that worst case to *every* failure, which turned out to be one setting with
+three symptoms:
+
+- a genuinely wedged Home Assistant cost **ten minutes** before its peer could promote;
+- an HA-only failure therefore **could not meet the 2.5-minute budget** ([ADR-001](./ADR-001-active-passive-topology.md));
+- and the radios, released by the demote path, arrived **ten minutes late** ([ADR-009](./ADR-009-radio-custody-failure-modes.md)).
+
+**Decision: split the grace in two.** A **base** of 120 s — roughly twice the slowest boot measured
+on this fleet (24.0 s and 62.9 s to `Home Assistant initialized`) — and the original 600 s retained
+as a **ceiling**, reached only while the container is demonstrably coming back.
+
+Three signals extend, read from `docker inspect` and nothing else:
+
+| Signal | Why it counts |
+|---|---|
+| `State.Restarting == true` | Docker is actively restarting it. Unambiguous. |
+| Exited with code **100** | Home Assistant's own "restart me", after a config change or upgrade. A deliberate restart, not a crash. |
+| `StartedAt` within 120 s | It booted recently, so a failed probe means *still starting*. |
+
+**A fourth was deliberately rejected: an increasing restart count.** That is a crash loop, and a
+crash loop is precisely when the peer *should* take over.
+
+🚨 **The ceiling is the load-bearing part.** Extension stops at 600 s no matter what the container
+reports, so a container that loops forever still demotes on schedule. Without it the adaptive path
+would build the one mode this must never have — a failover that silently never happens. Guarded by
+`test_a_crash_loop_does_NOT_extend_forever`, verified to fail when the cap is removed.
+
+**This does not weaken D3.** A wedged-but-running Home Assistant reports `Restarting == false` with
+an old `StartedAt`, so it demotes on the base grace. ADR-006 rejected `docker inspect` as a
+*replacement* for the HTTP probe, which was right; this uses it only to tell "down and coming back"
+from "down".
+
+**Where Docker cannot answer — bare metal, Core, no CLI — there is no extension**, which is exactly
+the flat pre-adaptive behaviour. The generator emits `--ha-container` empty in that case, and a
+promoter that refuses to demote because a CLI is missing would be worse than one that demotes early.
+
+**The deferral is published, not silent.** The promoter logs why it extended and writes the reason
+to `/run/cluster-sync/grace-reason` for the operator surface — because "no failover yet" and "no
+failover ever" look identical from outside, and the difference is the whole explanation
+([ADR-008](./ADR-008-liveness-signals-must-prove-measurement.md) §3).

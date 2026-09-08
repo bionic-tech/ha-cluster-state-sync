@@ -4,7 +4,37 @@
 **Date:** 2026-05-27
 **Last reviewed:** 2026-08-06
 
-> **Implementation status:** the wizard (§4) and gating layer 2 are built; layers 1, 3 and 4 are not. Cold-boot RTO — the acceptance test this ADR names as deciding cold vs warm — is **still unmeasured**. See the internal readiness assessment.
+> **Implementation status:** the wizard (§4) and gating layer 2 are built; layers 1, 3 and 4 are not.
+>
+> **Cold-boot RTO — the acceptance test this ADR names as deciding cold vs warm — was MEASURED on
+> the real pair on 2026-09-07, and cold PASSES.** Host loss simulated on node-a, timed by a
+> recorder running on the standby:
+>
+> ```
+> T0  host loss                 +0.0s
+>     lease taken              +30.6s   (exactly the 30s TTL)
+>     container running        +76.6s
+>     HTTP 200 answering       +78.8s   <- NOT yet working
+>     fully initialized        +102s    <- integrations and automations up
+> ```
+>
+> **~102 s against the 150 s budget — 48 s of margin.**
+>
+> 🚨 **Measure to "initialized", not to HTTP 200.** The root path answers while the bootstrap is
+> still running, so the first-response time understates the real RTO by ~23 s. The first published
+> version of this measurement used 78.8 s and was measuring the wrong event. Cold standby stands as the recommended
+> default; warm is not forced, and the firewall bundle's risks stay off the critical path.
+>
+> 🚨 **Two qualifications this ADR's original budget language did not carry, and now must:**
+>
+> 1. **That number is for host loss only.** A leader whose Home Assistant dies while the *host*
+>    stays up keeps renewing its lease for the full `--probe-grace 600`, so that failure mode is
+>    ~10.5 minutes by construction and **cannot** meet a 2.5-minute budget. Deliberate — D3 exists
+>    to ride out restarts — but it is a property of the design, not an implementation gap.
+> 2. **The promoted node had no radios.** See [ADR-009](./ADR-009-radio-custody-failure-modes.md).
+>    An RTO to "HTTP 200" is not an RTO to "a working house" on any estate whose switches are RF.
+>
+> See the internal readiness assessment.
 **Deciders:** mmanning (project owner)
 
 ## Context
@@ -110,7 +140,7 @@ graph TD
 | Standby HA process | stopped until promotion | running, neutered |
 | Side-effect suppression | achieved by *not running* | nftables network gating + flush-loop gating + automation gating |
 | Firewall needed? | no | yes |
-| RTO | cold-boot time (~60–180s — **must be tested vs 2.5-min budget**) | seconds |
+| RTO | cold-boot time — **measured 2026-09-07: ~102s to initialised, host loss** (ADR-009 for the radio caveat) | seconds |
 | Corruption-safe with today's code? | ✅ yes | ⚠️ only with the leader-lease/flush-gating in AR-0017 (interim: block follower's Redis) |
 | Promotion action | start container → boot replicated config → restore from Valkey | swap nftables to leader set → settle → enable flush loop, recorder, automations |
 
@@ -200,7 +230,7 @@ host scripts because the container is unprivileged.
 - **Split-brain** if VRRP dual-masters — mitigated by gating the leader ruleset on the Valkey lease (AR-0017).
 - **Torn rsync** of live `.storage`/SQLite → corruption — mitigated by snapshot-then-rsync and excluding the recorder DB.
 - **Crypto-identity collision** (HomeKit/Matter) if both nodes ever transmit on one fabric — mitigated by single-load (cold: not running; warm: nftables blocks mDNS + the integration must not be configured to load them on the follower).
-- **Cold-boot RTO** unknown until measured on the real hardware — this is the gating acceptance test for choosing Cold vs Warm.
+- ~~**Cold-boot RTO** unknown until measured~~ — **measured 2026-09-07 at ~102s to initialised (host loss), inside the 150s budget.** Cold stands. Remaining unknowns moved to ADR-009 (radios follow an HA-only failure ~10 min late) and the 600s probe grace (an HA-only failure cannot meet the budget by design).
 
 ## References
 

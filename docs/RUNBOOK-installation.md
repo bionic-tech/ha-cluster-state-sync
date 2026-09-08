@@ -4,6 +4,28 @@ Two scenarios — new to Home Assistant, or already running it — and the
 requirements that decide whether this will work for you at all. **Read section 1
 before anything else.** It rules some setups out.
 
+> **Unfamiliar with a term used here?** [GLOSSARY.md](GLOSSARY.md) defines every
+> one, assuming no Home Assistant, Docker or clustering background.
+
+## 0. The shortest useful version
+
+If you read nothing else:
+
+1. **Get a working Home Assistant first** and use it for a week. This replicates
+   what you have; replicating something you do not yet understand teaches you
+   nothing (§3).
+2. **Back it up and copy the backup off the machine** (§4 Step 2).
+3. **Put Valkey somewhere that is neither Home Assistant machine** (§6). On one
+   of them, it dies exactly when you need it.
+4. **Do the levels in order and stop between them** (§2). Level 1 is useful on
+   its own and takes ten minutes.
+5. **The primary joins before the standby.** Always. The go-bag flows leader →
+   standby, so the node with real data must lead first (§5).
+6. 🚨 **If any of your devices are on USB sticks, read
+   [GUIDE-radios.md](GUIDE-radios.md) before buying hardware.** How a radio is
+   attached decides whether it can fail over at all, and a directly-attached
+   stick never can.
+
 ---
 
 ## 1. Will this work for me?
@@ -21,7 +43,7 @@ This ships in two halves, and they have very different requirements.
 |---|---|---|---|
 | **Container / Docker** | ✅ | ✅ | What this is built and tested against. |
 | **Supervised** | ✅ | ⚠️ | You have host root, so the bundle *can* install — but the Supervisor also manages the Home Assistant container and will fight anything that stops it behind its back. Untested. |
-| **Home Assistant OS** | ✅ | ❌ | No host shell, no `systemd` access, no `docker` CLI. You get state mirroring and restore-on-boot; **automatic failover is not possible.** |
+| **Home Assistant OS** | ✅ | ⚠️ | No host shell, so the bundle *as generated today* cannot install. **This is a packaging gap, not a limitation of HA OS** — see below. |
 | **Core (venv / bare metal)** | ✅ | ⚠️ | Not supported *today*, but nothing fundamental is in the way — see below. |
 
 ### Core on bare metal — why it is ⚠️ and not ❌
@@ -45,8 +67,49 @@ choice, alongside the existing `NETWORK_MODE`), not a property of bare metal. If
 you are on Core and want Level 4, that gap is the thing to raise — and it is
 small.
 
-**If you are on Home Assistant OS, stop at Level 2 below.** Everything up to
-that point works and is useful. Nothing beyond it will.
+### Home Assistant OS — corrected 2026-09-08
+
+**This runbook previously said automatic failover was "not possible" on HA OS.
+That was wrong**, and it had been steering people away from a supported install
+type for no good reason.
+
+The Supervisor REST API documents exactly what a promoter needs:
+
+```
+POST /core/stop      Stop the Home Assistant core container
+POST /core/start     Start it again
+POST /host/reboot    /host/shutdown
+```
+
+An add-on can request `hassio_api: true` with `hassio_role: homeassistant` and
+`map: homeassistant_config` for read/write config access. **And add-ons are
+separate containers managed by Supervisor, so a promoter add-on keeps running
+while Core is stopped** — which is exactly the property a promoter must have.
+
+So the real position is: **failover on HA OS needs the promoter delivered as an
+add-on rather than as systemd units, and that add-on does not exist yet.**
+Arguably it is the *more* native delivery vehicle for every install type, not
+just this one.
+
+**Until it exists, stop at Level 2 on HA OS.** Everything up to that point works
+and is useful. Level 4 needs a packaging change, not a different operating
+system.
+
+### Do you have radios? (Zigbee, 433 MHz, Z-Wave)
+
+**This decides more than the installation type does**, and it is the part people
+discover too late.
+
+| How the radio is attached | Fails over? |
+|---|---|
+| Plugged into one Home Assistant machine | ❌ **never** — no software moves a plug |
+| USB-over-IP (VirtualHere, `usbip`) | ✅ on host loss; ❌ on a Home-Assistant-only failure |
+| Behind its own network daemon (Zigbee2MQTT, deCONZ, Z-Wave JS) | ⚠️ only if that daemon is itself highly available |
+| No radios — all Wi-Fi / cloud | ✅ nothing to do |
+
+If any row above is not the last one, read **[GUIDE-radios.md](GUIDE-radios.md)**
+before you go further. It also covers the `/dev/serial` bind mount you will need
+on **both** nodes, without which every radio fails to open with `[Errno 2]`.
 
 ### You also need
 
@@ -88,8 +151,9 @@ not yet understand teaches you nothing and hides its own mistakes.
 
 1. **Install Home Assistant normally.** If failover is your goal, choose the
    **Container/Docker** installation — today it is the only one the whole thing
-   works on out of the box. **Avoid Home Assistant OS if failover matters to
-   you**: it is the one option that closes Level 4 permanently, because there is
+   works on out of the box. **Home Assistant OS cannot reach Level 4 today**
+   — not because it is incapable, but because the promoter is not yet packaged
+   as an add-on (§1): it is the one option that closes Level 4 permanently, because there is
    no host shell to install anything into. Core on bare metal is a reasonable
    second choice — it needs one generator change, not a migration (§1).
 2. **Use it for a week.** Add your devices. Build a dashboard. Take a backup and
@@ -372,6 +436,10 @@ match before you debug anything else.**
 
 ## 8. How to find the values the wizard asks for
 
+<details>
+<summary><strong>Expand — every wizard field, and where its value comes from</strong></summary>
+
+
 Most of the form is obvious. These are the ones people get stuck on, with the
 command that answers each. Run them on the **host**, not inside Home Assistant.
 
@@ -522,3 +590,5 @@ one identity.
 Required by the form and currently **read by nothing** — a leftover from the
 tier-1 rsync that ADR-006 retired. Put the other node's hostname; the form will
 not submit while it is blank.
+
+</details>

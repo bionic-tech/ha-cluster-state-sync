@@ -146,6 +146,28 @@ PROBE_TIMEOUT_SECONDS = 5.0
 #: rather than a slow one.
 DEFAULT_PROBE_GRACE_SECONDS = 600.0
 
+#: The BASE grace, used when nothing says Home Assistant is on its way back.
+#:
+#: 600s was chosen to exceed the slowest cold boot on the slowest node, and it
+#: does -- but it applies that worst case to every failure, so a genuinely
+#: wedged instance costs ten minutes before the peer may promote. Measured cold
+#: boots on the fleet this was built for: 24.0s and 62.9s to
+#: `Home Assistant initialized`. 120s is roughly twice the slowest, which is the
+#: margin the old flat value was really buying.
+#:
+#: The full `DEFAULT_PROBE_GRACE_SECONDS` is still granted, but only while the
+#: container is *demonstrably* restarting -- see `container_is_returning`.
+DEFAULT_BASE_GRACE_SECONDS = 120.0
+
+#: How recently a container must have started for "it is still booting" to be a
+#: fair reading. Matched to the base grace deliberately: a start older than the
+#: window we would have waited anyway is not evidence of a boot in progress.
+RETURNING_STARTED_WITHIN_SECONDS = 120.0
+
+#: Home Assistant's own "restart me" exit code. A container that exited 100 was
+#: asked to restart -- by a config reload or an upgrade -- and is not a crash.
+HA_RESTART_EXIT_CODE = 100
+
 #: How long after releasing a lease for a silent probe this node refuses to
 #: take a free one back (design M3). Without this: release writes BACKUP
 #: (`docker stop`), the very next tick sees `previous == "BACKUP"`, takes
@@ -212,6 +234,13 @@ def _leader_key(namespace: str) -> str:
     return f"ha:cluster_state_sync:{namespace}:leader"
 
 
+def _promoter_key(namespace: str, node_id: str) -> str:
+    """Mirrors `const.promoter_key`. Repeated rather than imported for the same
+    reason every other constant here is: this file is emitted as standalone
+    text onto a host that has no `custom_components` on its path (ADR-005)."""
+    return f"ha:cluster_state_sync:{namespace}:promoters:{node_id}"
+
+
 def read_state(path: pathlib.Path) -> str:
     """The previous tick's decision, or `""` when it cannot be known.
 
@@ -252,6 +281,70 @@ def decide(*, holds_lease: bool, previous: str) -> str | None:
     """
     current = "MASTER" if holds_lease else "BACKUP"
     return None if current == previous else current
+
+
+#: Publish this promoter's heartbeat. `SET key ts PX ttl` -- unconditional,
+#: because the question it answers is "is this promoter running at all", not
+#: "does it lead". A follower's heartbeat is the interesting one: on a cold
+#: standby the promoter is the ONLY thing running, so it is the only thing that
+#: can report the machine is still able to promote (ADR-009).
+HEARTBEAT_SCRIPT = "return redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])"
+
+
+def _beat(client: Any, key: str, ttl_ms: int) -> None:
+    """Best effort, always. A failed heartbeat must never change a decision.
+
+    Deliberately swallows everything: this is an observability signal, and a
+    promoter that skipped a promotion because it could not write a diagnostic
+    would be a far worse bug than a missing diagnostic.
+    """
+    try:
+        client.eval(HEARTBEAT_SCRIPT, [key], [str(int(time.time())), str(ttl_ms)])
+    except Exception:  # noqa: BLE001 - see docstring
+        pass
+
+
+def container_is_returning(
+    inspect: Callable[[], dict[str, Any] | None],
+    *,
+    now: float | None = None,
+    started_within: float = RETURNING_STARTED_WITHIN_SECONDS,
+) -> tuple[bool, str]:
+    """Is Home Assistant *coming back*, as opposed to simply not answering?
+
+    Returns `(returning, reason)`. The reason is carried into the log line and
+    the operator surface, because "no failover yet" and "no failover ever" look
+    identical from outside and the difference is the whole explanation
+    (ADR-008 §3: a message may not assert a fact the code did not establish).
+
+    Three signals, and deliberately **not** a fourth. An increasing restart
+    count means a crash loop, and a crash loop is precisely when the peer
+    *should* take over -- treating it as "coming back" would build the mode
+    this must never have, where failover silently never happens.
+
+    This does not weaken D3. A wedged-but-running Home Assistant reports
+    `Restarting == false` with an old `StartedAt`, so it still demotes on the
+    base grace. ADR-006 rejected `docker inspect` as a *replacement* for the
+    HTTP probe, which was right; this uses it only to tell "down and coming
+    back" from "down".
+
+    `inspect` returning `None` -- no Docker, no such container, a CLI that is
+    not there -- means **no extension**, which is the pre-existing behaviour on
+    every platform that cannot answer the question.
+    """
+    state = inspect()
+    if not state:
+        return False, ""
+    if state.get("Restarting") is True:
+        return True, "container is restarting"
+    if state.get("ExitCode") == HA_RESTART_EXIT_CODE and state.get("Running") is not True:
+        return True, f"container exited {HA_RESTART_EXIT_CODE} (Home Assistant asked to restart)"
+    started = state.get("StartedAtEpoch")
+    if isinstance(started, (int, float)) and started > 0:
+        age = (time.time() if now is None else now) - started
+        if 0 <= age < started_within:
+            return True, f"container started {age:.0f}s ago and is still booting"
+    return False, ""
 
 
 def _probe_ha(url: str, timeout: float) -> bool:
@@ -365,6 +458,116 @@ def _holddown_path(state_path: pathlib.Path) -> pathlib.Path:
     return state_path.with_name("release-holddown")
 
 
+def _docker_inspector(container: str) -> Callable[[], dict[str, Any] | None]:
+    """Ask Docker for the container's state, or `None` if it cannot be asked.
+
+    `None` on *any* failure -- no docker, no such container, malformed output --
+    because the caller treats "cannot answer" as "no extension", which is the
+    flat pre-adaptive behaviour and the safe direction. A promoter that refuses
+    to demote because a CLI is missing would be worse than one that demotes
+    early.
+
+    Deliberately shells out rather than importing a Docker SDK: this file is
+    emitted as text onto a host with nothing installed but `python3` (ADR-005).
+    """
+
+    def inspect() -> dict[str, Any] | None:
+        try:
+            out = subprocess.run(  # noqa: S603
+                [
+                    "docker",
+                    "inspect",
+                    "--format",
+                    "{{.State.Restarting}} {{.State.Running}} "
+                    "{{.State.ExitCode}} {{.State.StartedAt}}",
+                    container,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if out.returncode != 0:
+            return None
+        parts = out.stdout.split()
+        if len(parts) < 4:
+            return None
+        started = 0.0
+        try:
+            started = datetime.fromisoformat(parts[3].replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            pass
+        return {
+            "Restarting": parts[0] == "true",
+            "Running": parts[1] == "true",
+            "ExitCode": int(parts[2]) if parts[2].lstrip("-").isdigit() else None,
+            "StartedAtEpoch": started,
+        }
+
+    return inspect
+
+
+def _grace_extended(
+    *,
+    state_path: pathlib.Path,
+    base_grace: float,
+    probe_grace: float,
+    inspect_container: Callable[[], dict[str, Any] | None] | None,
+    reason_path: pathlib.Path | None,
+) -> bool:
+    """Should the base grace be extended because Home Assistant is returning?
+
+    Called only once the base grace has expired and the probe has already
+    failed, so it can afford a `docker inspect`; on the happy path it never
+    runs at all.
+
+    🚨 **The cap is the point.** Extension stops at `probe_grace` no matter what
+    the container says, so a crash loop -- which signals "restarting" forever --
+    demotes on schedule. Without this the adaptive path would create the one
+    mode TODO explicitly forbids: a failover that silently never happens.
+    """
+    if inspect_container is None:
+        return False
+    # Past the ceiling: no signal may extend further.
+    if not _recently_touched(state_path, probe_grace):
+        _write_reason(reason_path, "")
+        return False
+    try:
+        returning, reason = container_is_returning(inspect_container)
+    except Exception:  # noqa: BLE001 - a broken inspector must not block demotion
+        return False
+    if not returning:
+        _write_reason(reason_path, "")
+        return False
+    print(
+        f"cluster promoter: probe failed and the {base_grace:.0f}s base grace has "
+        f"expired, but NOT demoting yet -- {reason}. Extending to the full "
+        f"{probe_grace:.0f}s, after which this node demotes regardless.",
+        file=sys.stderr,
+    )
+    _write_reason(reason_path, reason)
+    return True
+
+
+def _write_reason(path: pathlib.Path | None, reason: str) -> None:
+    """Publish why a demotion is being deferred, for the operator surface.
+
+    Best effort by design: this is an explanation, and failing to write an
+    explanation must never change what the promoter does.
+    """
+    if path is None:
+        return
+    try:
+        if reason:
+            path.write_text(reason + "\n", encoding="utf-8")
+        else:
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def run(
     client: Any,
     *,
@@ -382,6 +585,10 @@ def run(
     release_holddown: float = DEFAULT_RELEASE_HOLDDOWN_SECONDS,
     hold_path: pathlib.Path | None = None,
     handover_path: pathlib.Path | None = None,
+    base_grace: float = DEFAULT_BASE_GRACE_SECONDS,
+    heartbeat_ttl_ms: int = 60_000,
+    inspect_container: Callable[[], dict[str, Any] | None] | None = None,
+    grace_reason_path: pathlib.Path | None = None,
 ) -> int:
     """One tick: take or renew the lease, and act only on a change of it.
 
@@ -418,6 +625,12 @@ def run(
         previous = read_state(state_path)
 
         key = _leader_key(namespace)
+        # Before anything can decide to return early, say that this promoter is
+        # alive. Placed first deliberately: every branch below can exit, and a
+        # heartbeat that only fires on the happy path would go quiet for the
+        # very states an operator most needs to see -- a held-down node, a node
+        # in maintenance hold, a node whose probe is failing.
+        _beat(client, _promoter_key(namespace, node_id), heartbeat_ttl_ms)
         holddown = holddown_path if holddown_path is not None else _holddown_path(state_path)
 
         held = hold_path is not None and hold_path.is_file()
@@ -517,8 +730,15 @@ def run(
                 pass
         elif (
             previous == "MASTER"
-            and not _recently_touched(state_path, probe_grace)
+            and not _recently_touched(state_path, base_grace)
             and not (probe if probe is not None else _probe_ha)(ha_url, PROBE_TIMEOUT_SECONDS)
+            and not _grace_extended(
+                state_path=state_path,
+                base_grace=base_grace,
+                probe_grace=probe_grace,
+                inspect_container=inspect_container,
+                reason_path=grace_reason_path,
+            )
         ):
             # D3. The probe gates RENEWAL only, never taking -- this whole
             # branch is reachable only when we already believe we hold the
@@ -598,16 +818,26 @@ def run(
             # no holddown marker and is never blocked by this branch.
             #
             # Announced for the same reason as the release above: a node
-            # sitting at BACKUP with a free lease looks identical to a node
-            # that simply has not noticed, and the difference is the whole
+            # sitting at BACKUP and not taking looks identical to a node that
+            # simply has not noticed, and the difference is the whole
             # explanation.
+            #
+            # It does NOT say the lease is free, because this branch has not
+            # looked. It fires on the hold-down marker and `previous` alone --
+            # the peer may well have taken the lease already, and on
+            # 2026-09-07 it had: this line printed "NOT taking the free lease"
+            # on node-b while node-a demonstrably held it, which sent an
+            # operator hunting a split-brain that did not exist. A log line
+            # asserting a fact it never checked is the exact failure this
+            # project keeps finding elsewhere; it does not get a pass here.
             age = time.time() - holddown.stat().st_mtime if holddown.exists() else 0.0
             print(
-                f"cluster promoter: NOT taking the free lease -- this node "
-                f"released it {age:.0f}s ago and is holding down for "
+                f"cluster promoter: NOT attempting to take the lease -- this "
+                f"node released it {age:.0f}s ago and is holding down for "
                 f"{release_holddown:.0f}s to avoid a promote/fail/release "
-                f"cycle. Run --adopt to clear this once Home Assistant is "
-                f"healthy here.",
+                f"cycle. Whether the peer now holds it is not checked here; "
+                f"`--adopt` reports the holder and clears this once Home "
+                f"Assistant is healthy on this node.",
                 file=sys.stderr,
             )
             holds_lease = False
@@ -821,9 +1051,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--probe-grace",
         type=float,
         default=DEFAULT_PROBE_GRACE_SECONDS,
-        help="renew without probing for this long after promoting, so a "
-        "still-booting Home Assistant is not mistaken for a dead one "
-        "(default: %(default)s)",
+        help="the CEILING on the grace. Reached only while the container is "
+        "demonstrably restarting; extension stops here regardless, so a crash "
+        "loop still demotes (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--base-grace",
+        type=float,
+        default=DEFAULT_BASE_GRACE_SECONDS,
+        help="renew without probing for this long after promoting. A wedged "
+        "Home Assistant demotes at this point; one that is visibly coming back "
+        "is extended toward --probe-grace (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--ha-container",
+        default="",
+        help="container name to inspect when deciding whether Home Assistant "
+        "is coming back. Empty (the default) disables the adaptive grace and "
+        "falls back to the flat --probe-grace, which is correct anywhere "
+        "docker cannot answer: bare metal, Core, or no CLI",
+    )
+    parser.add_argument(
+        "--grace-reason-file",
+        type=pathlib.Path,
+        default=None,
+        help="where to publish why a demotion is being deferred, for the operator surface",
     )
     parser.add_argument(
         "--no-probe",
@@ -930,6 +1182,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             release_holddown=args.release_holddown,
             hold_path=args.hold_file,
             handover_path=args.handover_file,
+            base_grace=args.base_grace,
+            inspect_container=(_docker_inspector(args.ha_container) if args.ha_container else None),
+            grace_reason_path=args.grace_reason_file,
         )
     finally:
         # This runs from a systemd timer, forever. A socket leaked on every

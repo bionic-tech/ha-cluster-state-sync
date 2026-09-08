@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the cluster fileset pull, so a follower's staged go-bag stays close to current
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

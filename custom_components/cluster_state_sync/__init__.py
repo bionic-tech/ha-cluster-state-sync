@@ -61,6 +61,7 @@ from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.typing import ConfigType
 
+from . import recorder_snapshot, storage
 from .area import async_assign_area
 from .backend import ClusterBackend, RedisBackend, SnapshotEntry, default_node_id
 from .const import (
@@ -81,6 +82,8 @@ from .const import (
     CONF_LEADERSHIP_ENTITY,
     CONF_LEADERSHIP_SOURCE,
     CONF_NODE_ID,
+    CONF_RECORDER_SNAPSHOT_ENABLED,
+    CONF_RECORDER_SNAPSHOT_MINUTES,
     CONF_REDIS_DB,
     CONF_REDIS_HOST,
     CONF_REDIS_PASSWORD,
@@ -93,6 +96,10 @@ from .const import (
     CONF_REDIS_USERNAME,
     CONF_RESTORE_MAX_AGE,
     CONF_SNAPSHOT_INTERVAL,
+    CONF_STATISTICS_ENABLED,
+    CONF_STATISTICS_INTERVAL_MINUTES,
+    CONF_STATISTICS_MAX_BYTES,
+    CONF_STATISTICS_WINDOW_DAYS,
     DATA_BACKEND,
     DATA_CLUSTER_VIEW,
     DATA_CONFIG,
@@ -102,6 +109,7 @@ from .const import (
     DATA_GATE,
     DATA_LEADERSHIP,
     DATA_MIRROR,
+    DATA_STATISTICS,
     DATA_STATS,
     DATA_UNSUB,
     DEFAULT_CLUSTER_NAMESPACE,
@@ -113,29 +121,52 @@ from .const import (
     DEFAULT_FILESET_MAX_BYTES,
     DEFAULT_INCLUDE_DOMAINS,
     DEFAULT_LEADERSHIP_SOURCE,
+    DEFAULT_RECORDER_SNAPSHOT_ENABLED,
     DEFAULT_RESTORE_MAX_AGE,
     DEFAULT_SNAPSHOT_INTERVAL,
+    DEFAULT_STATISTICS_ENABLED,
+    DEFAULT_STATISTICS_INTERVAL_MINUTES,
+    DEFAULT_STATISTICS_MAX_BYTES,
+    DEFAULT_STATISTICS_WINDOW_DAYS,
     DEGRADED_MARKER_NAME,
     DOMAIN,
     FINAL_FLUSH_TIMEOUT,
     MAX_ATTRIBUTE_BYTES,
+    MAX_RECORDER_SNAPSHOT_MINUTES,
     MAX_RESTORE_ENTRIES,
+    MAX_STATISTICS_INTERVAL_MINUTES,
+    MAX_STATISTICS_WINDOW_DAYS,
+    MIN_RECORDER_SNAPSHOT_MINUTES,
+    MIN_STATISTICS_INTERVAL_MINUTES,
+    MIN_STATISTICS_WINDOW_DAYS,
     SENSITIVE_DOMAINS,
     SERVICE_CLEAR_DEGRADED,
     SERVICE_FLUSH_SNAPSHOT,
     STALE_SNAPSHOT_FRACTION,
 )
 from .coordinator import BackendHealthCoordinator, ClusterViewCoordinator, SyncStats
+from .crypto import (
+    STATISTICS_STATUS_AAD,
+    FilesetCryptoError,
+    derive_fileset_key,
+    open_sealed,
+)
 from .fileset import FilesetPublisher
 from .gating import ServiceGate
 from .hold import read_hold
 from .leadership import LeadershipMonitor
 from .panel import async_register_panel
+from .statistics_publisher import StatisticsPublisher
 from .util import parse_sentinel_hosts
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.BINARY_SENSOR, Platform.SENSOR, Platform.SWITCH]
+PLATFORMS: list[Platform] = [
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.SENSOR,
+    Platform.SWITCH,
+]
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -208,6 +239,146 @@ async def _async_register_services(hass: HomeAssistant) -> None:
 
     hass.services.async_register(DOMAIN, SERVICE_FLUSH_SNAPSHOT, _flush_snapshot)
     hass.services.async_register(DOMAIN, SERVICE_CLEAR_DEGRADED, _clear_degraded)
+
+
+async def _surface_follower_status(
+    hass: HomeAssistant,
+    backend: Any,
+    secret: str | None = None,
+    *,
+    node_id: str | None = None,
+    stale_after: float | None = None,
+) -> None:
+    """Raise the standby's findings as repairs on this node.
+
+    The standby has no logbook, no repairs panel and no entities -- in the cold
+    model its Home Assistant is stopped. Everything it discovers would die on a
+    host nobody reads, so it leaves a sealed status line in Valkey and this
+    raises the alarm on its behalf.
+
+    Every issue is created OR deleted on every pass, so a fixed standby clears
+    its own alarm without anyone reloading anything: the issue registry is
+    storage-backed and survives restarts, so creating without deleting would
+    leave a recovered cluster carrying an ERROR forever.
+    """
+    mapping = {
+        "schema_mismatch": ("statistics_schema_mismatch", ir.IssueSeverity.ERROR),
+        "gap": ("statistics_gap", ir.IssueSeverity.WARNING),
+        "not_seeded": ("statistics_not_seeded", ir.IssueSeverity.WARNING),
+    }
+    status = await _read_follower_status(backend, secret)
+    state = str((status or {}).get("state") or "")
+
+    for reported, (issue_id, severity) in mapping.items():
+        if state == reported:
+            ir.async_create_issue(
+                hass,
+                DOMAIN,
+                issue_id,
+                is_fixable=False,
+                severity=severity,
+                translation_key=issue_id,
+                translation_placeholders={
+                    "detail": str((status or {}).get("detail", "no detail given"))
+                },
+            )
+        else:
+            # Includes the no-status case: a standby that has said nothing at
+            # all is not a standby with a schema mismatch, and leaving the
+            # issue up would train the operator to ignore it.
+            ir.async_delete_issue(hass, DOMAIN, issue_id)
+
+    # AR-0046. The above is why a silent follower raises nothing -- and on its
+    # own that made a follower whose replication has DIED indistinguishable
+    # from a healthy one. The status key expires, the issues are deleted, and
+    # the quiet state is the good state.
+    #
+    # 🚨 That is AR-0040's shape, in a mechanism built after AR-0040: a thing
+    # reporting success by saying nothing. So silence is now measured.
+    if stale_after is None:
+        await _clear(hass, "statistics_stalled")
+        return
+    stale = _status_is_stale(status, stale_after)
+    if not stale:
+        await _clear(hass, "statistics_stalled")
+        return
+
+    # A stopped node and a stopped replication need opposite things from an
+    # operator, and only the promoter heartbeat separates them: it is written
+    # by a host-side timer on a node whose Home Assistant may be off, which is
+    # exactly the case in question.
+    beating = await backend.read_promoter_nodes()
+    peers = {n for n in beating if n != node_id}
+    if peers:
+        detail = (
+            f"the standby ({', '.join(sorted(peers))}) is up — its promoter is beating — "
+            "but it has not reported applying statistics recently. Its history has "
+            "stopped advancing. Check cluster-statistics-pull.timer on that host."
+        )
+    else:
+        detail = (
+            "no standby has reported, and no peer promoter heartbeat is present either, "
+            "so the standby is most likely switched off. History replication is not "
+            "running; nothing else is implied about the cluster."
+        )
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        "statistics_stalled",
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="statistics_stalled",
+        translation_placeholders={"detail": detail},
+    )
+
+
+async def _clear(hass: HomeAssistant, issue_id: str) -> None:
+    """Deleting an issue that does not exist is a documented no-op."""
+    ir.async_delete_issue(hass, DOMAIN, issue_id)
+
+
+def _status_is_stale(status: dict[str, Any] | None, stale_after: float) -> bool:
+    """Has the follower gone quiet for longer than it should have?
+
+    A missing status counts as stale: the key carries a TTL, so its absence is
+    itself the signal that nothing has reported for a day.
+    """
+    if not status:
+        return True
+    raw = status.get("ts")
+    if not isinstance(raw, str):
+        return True
+    try:
+        reported = datetime.fromisoformat(raw)
+    except ValueError:
+        return True
+    if reported.tzinfo is None:
+        reported = reported.replace(tzinfo=UTC)
+    return (datetime.now(tz=UTC) - reported).total_seconds() > stale_after
+
+
+async def _read_follower_status(backend: Any, secret: str | None) -> dict[str, Any] | None:
+    """Open the follower's sealed status line (AR-0045).
+
+    Returns None for every failure -- absent, unopenable, or not an object.
+    An unopenable status is NOT reported as a follower problem: it was written
+    by something without the cluster key, which makes it noise rather than
+    news, and turning noise into a repair is how operators learn to ignore the
+    panel.
+    """
+    sealed = await backend.read_statistics_status()
+    if sealed is None or not secret:
+        return None
+    try:
+        plain = open_sealed(derive_fileset_key(secret), sealed, aad=STATISTICS_STATUS_AAD)
+        status = json.loads(plain.decode("utf-8"))
+    except (FilesetCryptoError, ValueError, UnicodeDecodeError):
+        _LOGGER.warning(
+            "The statistics status in Valkey did not authenticate; ignoring it. "
+            "Something without the cluster key wrote to that key."
+        )
+        return None
+    return status if isinstance(status, dict) else None
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -318,7 +489,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # 2. Build the authoritative mirror and seed it from current state.
     #    Seeding is AR-0002: without it, an entity that never fires a
     #    state-changed event after boot would never be mirrored at all.
-    mirror = StateMirror(hass, backend, cfg, node_id)
+    mirror = StateMirror(hass, backend, cfg, node_id, stats=runtime[DATA_STATS])
     mirror.seed_from_current_states()
     runtime[DATA_MIRROR] = mirror
 
@@ -427,6 +598,52 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
     )
 
+    # 3a-bis. Recorder history continuity (ADR-010). Leader-only, for the same
+    #         reason the flush is: only the leader's history is the house's
+    #         history, and a follower snapshotting its own neutered instance
+    #         would ship noise. Off unless the operator opted in.
+    if cfg.get(CONF_RECORDER_SNAPSHOT_ENABLED, DEFAULT_RECORDER_SNAPSHOT_ENABLED):
+        snap_minutes = int(
+            cfg.get(CONF_RECORDER_SNAPSHOT_MINUTES)
+            or storage.inspect_path(hass.config.path()).default_minutes
+        )
+        snap_minutes = max(
+            MIN_RECORDER_SNAPSHOT_MINUTES, min(MAX_RECORDER_SNAPSHOT_MINUTES, snap_minutes)
+        )
+
+        async def _scheduled_recorder_snapshot(_now: datetime) -> None:
+            if not await leadership.async_is_leader():
+                return
+            # `VACUUM INTO` took ~10s on a 2.2 GB database. That must not sit
+            # on the event loop, so it goes to an executor like every other
+            # blocking call in this integration.
+            result = await hass.async_add_executor_job(
+                recorder_snapshot.take_snapshot, hass.config.path()
+            )
+            stats = runtime.get(DATA_STATS)
+            if stats is not None:
+                stats.record_recorder_snapshot(result)
+            if not result.ok and result.error:
+                # A shared-database install has no SQLite file, which is
+                # ordinary rather than broken -- debug, not error, so a valid
+                # configuration does not log a failure every interval.
+                _LOGGER.debug("Recorder snapshot skipped: %s", result.error)
+
+        runtime[DATA_UNSUB].append(
+            async_track_time_interval(
+                hass,
+                _scheduled_recorder_snapshot,
+                timedelta(minutes=snap_minutes),
+                name=f"{DOMAIN}_recorder_snapshot",
+                cancel_on_shutdown=True,
+            )
+        )
+        _LOGGER.info(
+            "Recorder history continuity on: a consistent copy every %d minutes (%s)",
+            snap_minutes,
+            storage.inspect_path(hass.config.path()).describe(),
+        )
+
     # 3b. Fileset replication (design 2026-08-29). Off unless configured: it
     #     reads every credential in the config directory, so the operator opts
     #     in. Leader-only for the same reason the flush is — a follower
@@ -476,6 +693,94 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             )
 
     runtime[DATA_FILESET] = publisher
+
+    # 3b-ii. Long-term statistics replication (ADR-010). Rides on the fileset's
+    #        key and secret, and is separately switchable: an estate on a shared
+    #        Postgres recorder wants the go-bag and not this.
+    #
+    #        Only `statistics` crosses. Measured on this estate: long-term
+    #        statistics grow ~5,500 rows a day, raw `states` churns ~324,000,
+    #        and block-replicating the latter cost 4 GB a day through Valkey.
+    #        So the years of energy and climate history survive a failover and
+    #        the recent logbook does not -- stated plainly rather than implied.
+    statistics: StatisticsPublisher | None = None
+    if cfg.get(CONF_STATISTICS_ENABLED, DEFAULT_STATISTICS_ENABLED):
+        secret = cfg.get(CONF_CLUSTER_SECRET)
+        if not secret:
+            _LOGGER.error(
+                "Statistics replication is enabled but no cluster secret is set; "
+                "not publishing. Reconfigure the integration to mint one."
+            )
+        else:
+            window_days = max(
+                MIN_STATISTICS_WINDOW_DAYS,
+                min(
+                    MAX_STATISTICS_WINDOW_DAYS,
+                    int(cfg.get(CONF_STATISTICS_WINDOW_DAYS) or DEFAULT_STATISTICS_WINDOW_DAYS),
+                ),
+            )
+            statistics = StatisticsPublisher(
+                backend,
+                config_dir=hass.config.path(),
+                secret=secret,
+                window_days=window_days,
+                max_bytes=cfg.get(CONF_STATISTICS_MAX_BYTES, DEFAULT_STATISTICS_MAX_BYTES),
+            )
+
+            async def _scheduled_statistics(_now: datetime) -> None:
+                if not await leadership.async_is_leader():
+                    return
+                try:
+                    await statistics.async_publish()
+                except Exception:  # noqa: BLE001 — a publish must never kill the loop
+                    _LOGGER.exception("Statistics publish failed; will retry next interval")
+                # Then read what the standby made of the LAST window. This is
+                # the only place in this integration where data flows standby
+                # to leader, and it has to exist: in the cold model the standby
+                # has no Home Assistant, so a schema mismatch or a gap it
+                # discovers has no logbook, no repairs panel and no entity to
+                # land on. It leaves a status line in Valkey; this raises the
+                # alarm on its behalf. Without it the standby's history stops
+                # advancing and nobody learns until a promotion -- the AR-0040
+                # shape exactly.
+                await _surface_follower_status(
+                    hass,
+                    backend,
+                    secret,
+                    node_id=node_id,
+                    # Two publish intervals plus a margin: one missed pass
+                    # is a timer that drifted, three is a mechanism that
+                    # has stopped.
+                    stale_after=interval * 60 * 3,
+                )
+
+            interval = max(
+                MIN_STATISTICS_INTERVAL_MINUTES,
+                min(
+                    MAX_STATISTICS_INTERVAL_MINUTES,
+                    int(
+                        cfg.get(CONF_STATISTICS_INTERVAL_MINUTES)
+                        or DEFAULT_STATISTICS_INTERVAL_MINUTES
+                    ),
+                ),
+            )
+            runtime[DATA_UNSUB].append(
+                async_track_time_interval(
+                    hass,
+                    _scheduled_statistics,
+                    timedelta(minutes=interval),
+                    name=f"{DOMAIN}_statistics_publish",
+                    cancel_on_shutdown=True,
+                )
+            )
+            _LOGGER.info(
+                "Long-term statistics replication on: a %d-day window every %d minutes. "
+                "Raw states history does NOT cross — see ADR-010.",
+                window_days,
+                interval,
+            )
+
+    runtime[DATA_STATISTICS] = statistics
 
     # 3c. The degraded-fileset alarm. Decision D4 has the standby promote on a
     #     stale or missing go-bag rather than refuse to start, which makes
@@ -711,11 +1016,16 @@ class StateMirror:
         backend: ClusterBackend,
         cfg: dict[str, Any],
         node_id: str,
+        stats: SyncStats | None = None,
     ) -> None:
         self._hass = hass
         self._backend = backend
         self._cfg = cfg
         self._node_id = node_id
+        # Optional so every existing construction site and test keeps working;
+        # a mirror with no stats simply records nothing, which is the old
+        # behaviour rather than a crash.
+        self._stats = stats
         self._tracked: dict[str, SnapshotEntry] = {}
         # Monotonic revision rather than a dirty *flag*: changes that arrive
         # while a flush is awaiting the backend bump the revision past the one
@@ -797,6 +1107,30 @@ class StateMirror:
 
         revision = self._revision
         payload = dict(self._tracked)
+
+        # Drop entries the restore would refuse anyway. The budget used to be
+        # applied on READ only, which meant an oversized entity was written on
+        # every single flush and then declined on every single restore -- pure
+        # write cost for something guaranteed unusable. Measured on a real
+        # estate: one entity carried 100,911 bytes against a 16,384 byte cap.
+        #
+        # Recorded, not merely dropped: an entity that never replicates and
+        # says so nowhere is the exact shape this project keeps finding
+        # (ADR-008). `oversized` reaches the operator as a diagnostic.
+        oversized = [
+            entity_id
+            for entity_id, entry in payload.items()
+            if not _attributes_within_budget(entity_id, entry.attributes)
+        ]
+        for entity_id in oversized:
+            del payload[entity_id]
+            if self._stats is not None:
+                self._stats.record_oversized(entity_id)
+        if oversized and not payload:
+            # Everything we had was oversized. Writing an empty map would
+            # publish "this node tracks nothing", which is a different and
+            # much worse claim than "some entries did not fit".
+            return False
 
         if await self._backend.write_snapshot(payload, self._node_id):
             # Only the revision we actually wrote is marked clean; anything

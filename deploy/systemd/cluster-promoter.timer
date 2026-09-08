@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the cluster promoter — this is the leader election; Keepalived is not installed
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=10s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,7 @@
+[Unit]
+Description=Cluster State Sync — apply the leader's long-term statistics
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/etc/cluster-sync/cluster-statistics-pull.sh

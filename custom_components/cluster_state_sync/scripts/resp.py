@@ -362,6 +362,25 @@ class ValkeyClient:
             raise RespError(f"MGET returned {len(reply)} values for {len(keys)} keys")
         return reply
 
+    def set(self, key: str, value: str, *, ex: int | None = None) -> None:
+        """SET, with an optional expiry in seconds.
+
+        The only write this client performs. It exists for one purpose: a
+        follower whose Home Assistant is stopped has no other way to report
+        that it could not apply the statistics window -- no logbook, no
+        repairs panel, no entity. It leaves a status line in Valkey and the
+        leader raises the alarm on its behalf.
+
+        Callers pass `ex` so a decommissioned follower's last word expires
+        instead of standing forever. Without it the leader cannot tell "the
+        standby reported success" from "the standby reported success in March
+        and has not been heard from since".
+        """
+        args = ["SET", key, value]
+        if ex is not None:
+            args += ["EX", str(int(ex))]
+        self._command(*args)
+
     def eval(self, script: str, keys: Sequence[str], args: Sequence[str]) -> Any:
         """Run a Lua script server-side.
 
