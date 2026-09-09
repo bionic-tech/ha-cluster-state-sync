@@ -1106,3 +1106,41 @@ async def test_not_caring_about_history_leaves_both_models_available(
     raw = sel.get("options", field.get("options", []))
     offered = {o["value"] if isinstance(o, dict) else o for o in raw}
     assert offered == {"cold", "warm"}, offered
+
+
+def test_the_transfer_screen_says_how_to_get_itself_back() -> None:
+    """AR-0059's last gap, and it was circular.
+
+    INSTALL.md now explains how to recover an interrupted install — but it
+    lives inside the container the bundle has not reached yet. An operator who
+    loses this screen *before* running it cannot read the file that would tell
+    them what to do. Telling someone to read a file they cannot get to is not
+    instructions, so the screen carries the recovery itself.
+    """
+    from custom_components.cluster_state_sync.config_flow import _transfer_commands
+
+    for peer in ({}, {"host": "peer.lan", "user": "ops"}):
+        block = _transfer_commands(
+            {"ha_container": "homeassistant"}, "/config/cluster_state_sync_bundle", peer
+        )
+        assert "Lost this before you ran it?" in block
+        # It must name the command that reads the instructions without needing
+        # the bundle to have been transferred first.
+        assert "cat /config/cluster_state_sync_bundle/INSTALL.md" in block
+        # And say the screen itself is reproducible.
+        assert "reconfigur" in block.lower()
+
+
+def test_the_transfer_screen_quotes_a_hostile_container_name() -> None:
+    """The recovery line interpolates the container name into a shell command.
+
+    It is validated at bundle time (AR-0043/0056), but this text is rendered
+    from the config entry directly, before any bundle is built.
+    """
+    from custom_components.cluster_state_sync.config_flow import _transfer_commands
+
+    block = _transfer_commands(
+        {"ha_container": 'ha"; rm -rf /; #'}, "/config/cluster_state_sync_bundle", {}
+    )
+    assert 'rm -rf /; #"' not in block.replace("'", ""), "an unquoted container name"
+    assert "'ha\"; rm -rf /; #'" in block or '"ha' in block

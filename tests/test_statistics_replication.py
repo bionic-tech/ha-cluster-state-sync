@@ -9,6 +9,7 @@ interesting failures live in the seam between them.
 from __future__ import annotations
 
 import base64
+from datetime import UTC, datetime, timedelta
 import json
 import pathlib
 import sqlite3
@@ -651,7 +652,17 @@ async def test_replication_that_has_stopped_no_longer_looks_healthy(hass) -> Non
     # replication, not a switched-off machine.
     backend.promoter_nodes = {"node-a", "node-b"}
 
-    await _surface_follower_status(hass, backend, SECRET, node_id="node-a", stale_after=90 * 60)
+    await _surface_follower_status(
+        hass,
+        backend,
+        SECRET,
+        node_id="node-a",
+        stale_after=90 * 60,
+        # AR-0057: silence only means something once we have been publishing
+        # for longer than the window. These tests are about an ESTABLISHED
+        # replication going quiet, so they say so.
+        publishing_since=datetime.now(tz=UTC) - timedelta(hours=6),
+    )
     issue = ir.async_get(hass).async_get_issue("cluster_state_sync", "statistics_stalled")
     assert issue is not None, "replication stopped and nothing said so"
     assert "node-b" in issue.translation_placeholders["detail"]
@@ -668,7 +679,17 @@ async def test_a_switched_off_standby_reads_differently_from_a_broken_one(hass) 
     backend.statistics_status = None
     backend.promoter_nodes = {"node-a"}  # only us
 
-    await _surface_follower_status(hass, backend, SECRET, node_id="node-a", stale_after=90 * 60)
+    await _surface_follower_status(
+        hass,
+        backend,
+        SECRET,
+        node_id="node-a",
+        stale_after=90 * 60,
+        # AR-0057: silence only means something once we have been publishing
+        # for longer than the window. These tests are about an ESTABLISHED
+        # replication going quiet, so they say so.
+        publishing_since=datetime.now(tz=UTC) - timedelta(hours=6),
+    )
     issue = ir.async_get(hass).async_get_issue("cluster_state_sync", "statistics_stalled")
     assert issue is not None
     assert "switched off" in issue.translation_placeholders["detail"]
@@ -684,7 +705,17 @@ async def test_a_follower_reporting_on_time_raises_nothing(hass) -> None:
     backend.statistics_status = _sealed_status({"state": "ok", "applied": 12})
     backend.promoter_nodes = {"node-a", "node-b"}
 
-    await _surface_follower_status(hass, backend, SECRET, node_id="node-a", stale_after=90 * 60)
+    await _surface_follower_status(
+        hass,
+        backend,
+        SECRET,
+        node_id="node-a",
+        stale_after=90 * 60,
+        # AR-0057: silence only means something once we have been publishing
+        # for longer than the window. These tests are about an ESTABLISHED
+        # replication going quiet, so they say so.
+        publishing_since=datetime.now(tz=UTC) - timedelta(hours=6),
+    )
     assert ir.async_get(hass).async_get_issue("cluster_state_sync", "statistics_stalled") is None
 
 
@@ -698,9 +729,89 @@ async def test_the_stall_alarm_clears_itself_when_the_follower_returns(hass) -> 
     backend = FakeBackend()
     backend.statistics_status = None
     backend.promoter_nodes = {"node-a", "node-b"}
-    await _surface_follower_status(hass, backend, SECRET, node_id="node-a", stale_after=90 * 60)
+    await _surface_follower_status(
+        hass,
+        backend,
+        SECRET,
+        node_id="node-a",
+        stale_after=90 * 60,
+        # AR-0057: silence only means something once we have been publishing
+        # for longer than the window. These tests are about an ESTABLISHED
+        # replication going quiet, so they say so.
+        publishing_since=datetime.now(tz=UTC) - timedelta(hours=6),
+    )
     assert ir.async_get(hass).async_get_issue("cluster_state_sync", "statistics_stalled")
 
     backend.statistics_status = _sealed_status({"state": "ok", "applied": 3})
-    await _surface_follower_status(hass, backend, SECRET, node_id="node-a", stale_after=90 * 60)
+    await _surface_follower_status(
+        hass,
+        backend,
+        SECRET,
+        node_id="node-a",
+        stale_after=90 * 60,
+        # AR-0057: silence only means something once we have been publishing
+        # for longer than the window. These tests are about an ESTABLISHED
+        # replication going quiet, so they say so.
+        publishing_since=datetime.now(tz=UTC) - timedelta(hours=6),
+    )
     assert ir.async_get(hass).async_get_issue("cluster_state_sync", "statistics_stalled") is None
+
+
+async def test_switching_replication_on_does_not_accuse_a_correct_setup(hass) -> None:
+    """🚨 AR-0057. Silence only means something once there is something to be
+    silent about.
+
+    On the pass that first enables this, no follower has had a window to fetch
+    yet — the status key does not exist, and a missing status counts as stale.
+    Without a guard the leader raises "replication has stalled" against a
+    perfectly correct installation, for up to three publish intervals (90
+    minutes at the default), on the one day its owner is least able to tell a
+    real fault from a new one.
+    """
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.cluster_state_sync import _surface_follower_status
+
+    backend = FakeBackend()
+    backend.statistics_status = None  # nothing has reported yet
+    backend.promoter_nodes = {"node-a", "node-b"}
+
+    await _surface_follower_status(
+        hass,
+        backend,
+        SECRET,
+        node_id="node-a",
+        stale_after=90 * 60,
+        publishing_since=datetime.now(tz=UTC),  # we started publishing just now
+    )
+    assert ir.async_get(hass).async_get_issue("cluster_state_sync", "statistics_stalled") is None, (
+        "a brand-new, correct setup was accused of a stalled replication"
+    )
+
+
+async def test_a_follower_silent_long_after_publishing_began_still_alarms(hass) -> None:
+    """The guard must not become a way to never alarm at all.
+
+    Once we have been publishing longer than the staleness window, a follower
+    that has still said nothing is a real fault — which is the whole point of
+    AR-0046.
+    """
+    from homeassistant.helpers import issue_registry as ir
+
+    from custom_components.cluster_state_sync import _surface_follower_status
+
+    backend = FakeBackend()
+    backend.statistics_status = None
+    backend.promoter_nodes = {"node-a", "node-b"}
+
+    await _surface_follower_status(
+        hass,
+        backend,
+        SECRET,
+        node_id="node-a",
+        stale_after=90 * 60,
+        publishing_since=datetime.now(tz=UTC) - timedelta(hours=6),
+    )
+    assert (
+        ir.async_get(hass).async_get_issue("cluster_state_sync", "statistics_stalled") is not None
+    ), "a follower silent for six hours of publishing did not alarm"

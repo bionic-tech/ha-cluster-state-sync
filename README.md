@@ -74,17 +74,18 @@ is reference — you do not need to read the README front to back.
 |---|---|
 | **Understand a word I don't know** | [GLOSSARY.md](docs/GLOSSARY.md) — every term, no assumed knowledge |
 | **Install it** | [RUNBOOK-installation.md](docs/RUNBOOK-installation.md) — requirements, which HA install types can run the failover half at all, and the order things must be done in |
+| **Reach it after it moves (DNS, proxy, tunnel, VPN)** | [GUIDE-ingress.md](docs/GUIDE-ingress.md) — the cluster does **not** move your way in |
 | **Work out whether my radios can fail over** | 🚨 [GUIDE-radios.md](docs/GUIDE-radios.md) — **read before buying hardware.** How a Zigbee or 433 MHz stick is attached decides whether it can move at all |
 | **Use the dashboard** | [GUIDE-dashboard.md](docs/GUIDE-dashboard.md) — every row and button, what the colours mean, and **when not to press each one** |
 | **Fix something that is broken** | [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — symptom-first, from real failures on a live cluster |
 | **Change the restore, the swap, or the bundle** | 🚨 [GOTCHAS.md](docs/GOTCHAS.md) **first** — 27 traps this project actually fell into, nearly all of which reported success while doing nothing |
 | **Understand what it does at runtime** | [REFERENCE-behaviour.md](docs/REFERENCE-behaviour.md) — restore semantics, leadership, sizing, actions |
-| **Keep the mobile app working through a failover** | GUIDE-ingress.md — the cluster can promote in 15 seconds and still leave the app dead |
+| **Keep the mobile app working through a failover** | [GUIDE-ingress.md](docs/GUIDE-ingress.md) — the cluster can promote in 15 seconds and still leave the app dead |
 | **Bring a standby up from cold** | [RUNBOOK-standby-bringup.md](docs/RUNBOOK-standby-bringup.md) |
 | **Know why it is built this way** | [the ADRs](docs/adr/README.md), with a suggested reading order |
 | **Work on the code** | CONTRIBUTING.md |
 | **Re-litigate a closed decision** | [DECISIONS-SETTLED.md](docs/DECISIONS-SETTLED.md) — check here first; several of these keep being rediscovered as blockers |
-| **See what changed** | v0.4.0 · v0.3.5 · v0.3.1 · v0.3.0 |
+| **See what changed** | v0.4.1 · v0.4.0 · v0.3.5 · v0.3.1 · v0.3.0 |
 
 ## What this is
 
@@ -242,6 +243,41 @@ the host scripts write the same files and the two views must never disagree.
 
 There is **no force-promote button**, on purpose — see
 [Actions](docs/REFERENCE-behaviour.md#actions).
+
+## History that survives a failover
+
+Off by default; switch it on in the wizard when it asks whether history
+matters.
+
+**What crosses:** long-term statistics — the years of energy and climate data
+behind the Energy dashboard and long-range graphs. On a 3,595-entity estate
+that is about **half a megabyte a day**.
+
+**What does not:** raw recent history — the logbook and the last ten days of
+detail. It churns roughly sixty times faster, and replicating it was measured
+at **4 GB a day**. After a failover your long graphs are intact and the logbook
+starts fresh.
+
+That split is not a compromise; it is what the measurements argue for:
+
+| table | rows | growth |
+|---|---:|---:|
+| `statistics` — multi-year | 6,409,578 | **+5,535/day** |
+| `states` — 10-day raw | 3,977,092 | +324,517/day |
+
+**One manual step, once.** Six and a half million existing rows cannot arrive
+half a megabyte at a time, so the standby needs a one-off seed. Press **Write
+statistics seed**, copy the file it names to the standby, and it is adopted
+automatically after an integrity check — so running the copy and the pull at
+the same time is safe. About 500 MB on an estate this size.
+
+Everything after that is automatic, including after a failover: a demoted node
+rebuilds its own store from its recorder, with no second copy needed.
+
+If replication ever stops, the leader raises a repair naming which host to
+check. See **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** for all five
+states and **[REFERENCE-ha-compatibility.md](docs/REFERENCE-ha-compatibility.md)**
+for the one upgrade that needs a re-seed.
 
 ## Diagnostics
 
@@ -427,11 +463,18 @@ leaked credential does not become the run of your Valkey.
 
 ### What is *not* protected
 
-* **The password and cluster secret are stored in plaintext.** Home Assistant
-  writes config entries to `.storage/` as unencrypted JSON. The setup form masks
-  those fields, which stops shoulder-surfing and nothing more. Anyone who can
-  read your `config/` directory has both. Restrict its permissions, and treat a
-  host compromise as a compromise of the cluster secret.
+* **The password and cluster secret are stored in plaintext, in a
+  world-readable file.** Home Assistant writes config entries to `.storage/` as
+  unencrypted JSON, and it writes them **mode 0644** — verified on this fleet.
+  So the honest statement is not "anyone who can read `config/`"; it is
+  **anyone with a login on the host at all**. The setup form masks those fields,
+  which stops shoulder-surfing and nothing more.
+
+  Restricting the permissions on `config/` helps only if the directory itself
+  denies traversal, and Home Assistant will keep rewriting the file 0644. Treat
+  a host account as a compromise of the cluster secret, and treat a host
+  compromise as a compromise of **both** nodes — the secret is the same on each,
+  by definition.
 
   **And read that in the light of what a cluster does to `config/`.** If you
   replicate it to the standby — which the tier-1 model in ADR-001 does, and
@@ -541,6 +584,21 @@ variants are generated; the notify scripts then call a dispatcher with a single
   peer promoted, 21 seconds; fail-back, 14 seconds.** What the grace really
   protects is a node whose Home Assistant is still booting *just after that node
   promoted*, which is what it was written for.
+* 🚨 **Your way IN does not fail over.** The cluster moves Home Assistant; it
+  does not move your DNS, your reverse proxy, your tunnel or your VPN. A
+  failover can succeed completely — lease moved, radios followed, house
+  responding — while the address on your phone still points at the machine that
+  died. **None of the cluster's probes look at whether anyone can still reach
+  it.** [GUIDE-ingress.md](docs/GUIDE-ingress.md) covers the options; the
+  choice depends on your network and is yours to build.
+* 🚨 **One radio may never fail over, and it may be the one you need most.** A
+  transceiver physically plugged into a machine cannot follow a promotion. On
+  the fleet this was built for, one such radio is the transmitter a *firewall
+  recovery watchdog* uses — so failing over silently removes the last-resort
+  recovery path for the network you would need to fix anything. Work out which
+  of your devices cannot follow, and whether any is something you would need
+  *during* the outage this cluster exists to survive.
+  [GUIDE-radios.md](docs/GUIDE-radios.md).
 * 🚨 **If Valkey goes away, the cluster silently stops being able to fail
   over.** Both instances keep running and the house is unaffected — but no node
   can take or renew the lease, so a real failure afterwards has nothing to

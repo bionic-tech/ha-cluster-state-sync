@@ -283,7 +283,7 @@ def _transfer_commands(cfg: dict[str, Any], bundle_dir: str, peer: dict[str, Any
             "```\n\n"
             "The `tar` pipe rather than `docker cp`: the bundle contains two "
             "files with `0600` permissions, and `docker cp` does not preserve "
-            "them."
+            "them." + LOST_THIS_SCREEN.format(container=container, bundle=BUNDLE_DIR_NAME)
         )
 
     target = f"{user}@{remote}" if user else remote
@@ -314,7 +314,25 @@ def _transfer_commands(cfg: dict[str, Any], bundle_dir: str, peer: dict[str, Any
         f"{hint}\n\n"
         "🚨 This moves **this node's** bundle to **this node's** host. It is "
         "not a way to set up the other node -- that one runs its own wizard."
+        + LOST_THIS_SCREEN.format(container=container, bundle=BUNDLE_DIR_NAME)
     )
+
+
+#: What to do when this screen is gone. Deliberately part of the screen
+#: itself: everything else that explains the install lives in INSTALL.md,
+#: which is inside the container the bundle has not reached yet. Telling
+#: someone to read a file they cannot get to is not instructions.
+LOST_THIS_SCREEN = (
+    "\n\n---\n\n"
+    "**Lost this before you ran it?** Nothing is broken and nothing is "
+    "half-applied. The bundle is regenerated in Home Assistant every time "
+    "this wizard runs, so you can get back here by reconfiguring the "
+    "integration — or read the full instructions straight out of the "
+    "container, from a shell on the host:\n\n"
+    "```bash\n"
+    "docker exec {container} cat /config/{bundle}/INSTALL.md\n"
+    "```"
+)
 
 
 #: Never worth offering as an extra replicated path. Not a security boundary --

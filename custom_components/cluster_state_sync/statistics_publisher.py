@@ -78,6 +78,13 @@ class StatisticsPublisher:
         #: `FilesetPublisher.last_success_at` for the same reason -- a gauge
         #: that keeps climbing if the loop silently stops.
         self.last_success_at: datetime | None = None
+        #: When publishing first succeeded, which is a different question from
+        #: when it last did. AR-0057: the follower's silence only means
+        #: something once we have been publishing long enough for it to have
+        #: had something to fetch. Without this, switching the feature on
+        #: raises "replication has stalled" on a correct setup that has simply
+        #: not had its first pull yet.
+        self.first_success_at: datetime | None = None
         #: The standing refusal, so the error logs on the transition into the
         #: state rather than once every interval for as long as it lasts.
         self._skipped_reason: str | None = None
@@ -162,6 +169,8 @@ class StatisticsPublisher:
         )
         self.last_result = result
         self.last_success_at = datetime.now(tz=UTC)
+        if self.first_success_at is None:
+            self.first_success_at = self.last_success_at
         _LOGGER.debug(
             "Statistics window published: %d rows, %d metadata, %.2f MB, %.1fs",
             result.rows,

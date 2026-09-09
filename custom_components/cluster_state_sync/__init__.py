@@ -248,6 +248,7 @@ async def _surface_follower_status(
     *,
     node_id: str | None = None,
     stale_after: float | None = None,
+    publishing_since: datetime | None = None,
 ) -> None:
     """Raise the standby's findings as repairs on this node.
 
@@ -298,6 +299,20 @@ async def _surface_follower_status(
     if stale_after is None:
         await _clear(hass, "statistics_stalled")
         return
+
+    # AR-0057. Silence only means something once there has been something to
+    # be silent about. On the pass that first switches this on, no follower has
+    # had a window to fetch yet -- raising "replication has stalled" there
+    # accuses a correct setup of a fault, on the one day its owner is least
+    # able to tell the difference. An alarm that cries wolf at installation is
+    # an alarm nobody believes at 3am.
+    if (
+        publishing_since is None
+        or (datetime.now(tz=UTC) - publishing_since).total_seconds() < stale_after
+    ):
+        await _clear(hass, "statistics_stalled")
+        return
+
     stale = _status_is_stale(status, stale_after)
     if not stale:
         await _clear(hass, "statistics_stalled")
@@ -379,6 +394,310 @@ async def _read_follower_status(backend: Any, secret: str | None) -> dict[str, A
         )
         return None
     return status if isinstance(status, dict) else None
+
+
+async def _setup_recorder_snapshots(
+    hass: HomeAssistant,
+    cfg: dict[str, Any],
+    runtime: dict[str, Any],
+    leadership: Any,
+) -> None:
+    """Schedule the leader's consistent recorder copies, if opted in.
+
+    Extracted from `async_setup_entry` (AR-0050) without changing what it
+    does: the same opt-in guard, the same clamp, the same interval, the
+    same executor, in the same place in the sequence.
+    """
+    # 3a-bis. Recorder history continuity (ADR-010). Leader-only, for the same
+    #         reason the flush is: only the leader's history is the house's
+    #         history, and a follower snapshotting its own neutered instance
+    #         would ship noise. Off unless the operator opted in.
+    if cfg.get(CONF_RECORDER_SNAPSHOT_ENABLED, DEFAULT_RECORDER_SNAPSHOT_ENABLED):
+        snap_minutes = int(
+            cfg.get(CONF_RECORDER_SNAPSHOT_MINUTES)
+            or storage.inspect_path(hass.config.path()).default_minutes
+        )
+        snap_minutes = max(
+            MIN_RECORDER_SNAPSHOT_MINUTES, min(MAX_RECORDER_SNAPSHOT_MINUTES, snap_minutes)
+        )
+
+        async def _scheduled_recorder_snapshot(_now: datetime) -> None:
+            if not await leadership.async_is_leader():
+                return
+            # `VACUUM INTO` took ~10s on a 2.2 GB database. That must not sit
+            # on the event loop, so it goes to an executor like every other
+            # blocking call in this integration.
+            result = await hass.async_add_executor_job(
+                recorder_snapshot.take_snapshot, hass.config.path()
+            )
+            stats = runtime.get(DATA_STATS)
+            if stats is not None:
+                stats.record_recorder_snapshot(result)
+            if not result.ok and result.error:
+                # A shared-database install has no SQLite file, which is
+                # ordinary rather than broken -- debug, not error, so a valid
+                # configuration does not log a failure every interval.
+                _LOGGER.debug("Recorder snapshot skipped: %s", result.error)
+
+        runtime[DATA_UNSUB].append(
+            async_track_time_interval(
+                hass,
+                _scheduled_recorder_snapshot,
+                timedelta(minutes=snap_minutes),
+                name=f"{DOMAIN}_recorder_snapshot",
+                cancel_on_shutdown=True,
+            )
+        )
+        _LOGGER.info(
+            "Recorder history continuity on: a consistent copy every %d minutes (%s)",
+            snap_minutes,
+            storage.inspect_path(hass.config.path()).describe(),
+        )
+
+
+async def _setup_fileset_replication(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    cfg: dict[str, Any],
+    runtime: dict[str, Any],
+    backend: Any,
+    leadership: Any,
+    node_id: str,
+) -> None:
+    """Publish the config go-bag, if opted in. Leader-only.
+
+    Extracted from `async_setup_entry` (AR-0050). Sets `runtime[DATA_FILESET]`
+    itself, exactly as the inline block did, including to None when the
+    feature is off — a caller that forgot that assignment would leave the
+    diagnostics reading a key that never existed.
+    """
+    # 3b. Fileset replication (design 2026-08-29). Off unless configured: it
+    #     reads every credential in the config directory, so the operator opts
+    #     in. Leader-only for the same reason the flush is — a follower
+    #     publishing would overwrite the leader's identity with its own.
+    publisher: FilesetPublisher | None = None
+    if cfg.get(CONF_FILESET_ENABLED, DEFAULT_FILESET_ENABLED):
+        secret = cfg.get(CONF_CLUSTER_SECRET)
+        if not secret:
+            # Without a secret there is no key, and an unsealed `.storage` in
+            # shared Valkey is not a degraded mode worth offering.
+            _LOGGER.error(
+                "Fileset replication is enabled but no cluster secret is set; "
+                "not publishing. Reconfigure the integration to mint one."
+            )
+        else:
+            publisher = FilesetPublisher(
+                backend,
+                config_dir=hass.config.path(),
+                node_id=node_id,
+                secret=secret,
+                exclusions=cfg.get(CONF_FILESET_EXCLUSIONS, DEFAULT_FILESET_EXCLUSIONS),
+                extra_paths=(
+                    *cfg.get(CONF_FILESET_EXTRA_PATHS, DEFAULT_FILESET_EXTRA_PATHS),
+                    *cfg.get(CONF_FILESET_EXTRA_CUSTOM, DEFAULT_FILESET_EXTRA_CUSTOM),
+                ),
+                max_bytes=cfg.get(CONF_FILESET_MAX_BYTES, DEFAULT_FILESET_MAX_BYTES),
+            )
+
+            async def _scheduled_fileset(_now: datetime) -> None:
+                if not await leadership.async_is_leader():
+                    return
+                try:
+                    await publisher.async_publish()
+                except Exception:  # noqa: BLE001 — a publish must never kill the loop
+                    _LOGGER.exception("Fileset publish failed; will retry next interval")
+
+            runtime[DATA_UNSUB].append(
+                async_track_time_interval(
+                    hass,
+                    _scheduled_fileset,
+                    timedelta(
+                        seconds=cfg.get(CONF_FILESET_HOT_INTERVAL, DEFAULT_FILESET_HOT_INTERVAL)
+                    ),
+                    name=f"{DOMAIN}_fileset_publish",
+                    cancel_on_shutdown=True,
+                )
+            )
+
+    runtime[DATA_FILESET] = publisher
+
+
+async def _setup_statistics_replication(
+    hass: HomeAssistant,
+    cfg: dict[str, Any],
+    runtime: dict[str, Any],
+    backend: Any,
+    leadership: Any,
+    node_id: str,
+) -> None:
+    """Publish the long-term statistics window, if opted in. Leader-only.
+
+    Extracted from `async_setup_entry` (AR-0050). Sets
+    `runtime[DATA_STATISTICS]` itself, on both paths.
+    """
+    # 3b-ii. Long-term statistics replication (ADR-010). Rides on the fileset's
+    #        key and secret, and is separately switchable: an estate on a shared
+    #        Postgres recorder wants the go-bag and not this.
+    #
+    #        Only `statistics` crosses. Measured on this estate: long-term
+    #        statistics grow ~5,500 rows a day, raw `states` churns ~324,000,
+    #        and block-replicating the latter cost 4 GB a day through Valkey.
+    #        So the years of energy and climate history survive a failover and
+    #        the recent logbook does not -- stated plainly rather than implied.
+    statistics: StatisticsPublisher | None = None
+    if cfg.get(CONF_STATISTICS_ENABLED, DEFAULT_STATISTICS_ENABLED):
+        secret = cfg.get(CONF_CLUSTER_SECRET)
+        if not secret:
+            _LOGGER.error(
+                "Statistics replication is enabled but no cluster secret is set; "
+                "not publishing. Reconfigure the integration to mint one."
+            )
+        else:
+            window_days = max(
+                MIN_STATISTICS_WINDOW_DAYS,
+                min(
+                    MAX_STATISTICS_WINDOW_DAYS,
+                    int(cfg.get(CONF_STATISTICS_WINDOW_DAYS) or DEFAULT_STATISTICS_WINDOW_DAYS),
+                ),
+            )
+            statistics = StatisticsPublisher(
+                backend,
+                config_dir=hass.config.path(),
+                secret=secret,
+                window_days=window_days,
+                max_bytes=cfg.get(CONF_STATISTICS_MAX_BYTES, DEFAULT_STATISTICS_MAX_BYTES),
+            )
+
+            async def _scheduled_statistics(_now: datetime) -> None:
+                if not await leadership.async_is_leader():
+                    return
+                try:
+                    await statistics.async_publish()
+                except Exception:  # noqa: BLE001 — a publish must never kill the loop
+                    _LOGGER.exception("Statistics publish failed; will retry next interval")
+                # Then read what the standby made of the LAST window. This is
+                # the only place in this integration where data flows standby
+                # to leader, and it has to exist: in the cold model the standby
+                # has no Home Assistant, so a schema mismatch or a gap it
+                # discovers has no logbook, no repairs panel and no entity to
+                # land on. It leaves a status line in Valkey; this raises the
+                # alarm on its behalf. Without it the standby's history stops
+                # advancing and nobody learns until a promotion -- the AR-0040
+                # shape exactly.
+                await _surface_follower_status(
+                    hass,
+                    backend,
+                    secret,
+                    node_id=node_id,
+                    # Two publish intervals plus a margin: one missed pass
+                    # is a timer that drifted, three is a mechanism that
+                    # has stopped.
+                    stale_after=interval * 60 * 3,
+                    publishing_since=statistics.first_success_at,
+                )
+
+            interval = max(
+                MIN_STATISTICS_INTERVAL_MINUTES,
+                min(
+                    MAX_STATISTICS_INTERVAL_MINUTES,
+                    int(
+                        cfg.get(CONF_STATISTICS_INTERVAL_MINUTES)
+                        or DEFAULT_STATISTICS_INTERVAL_MINUTES
+                    ),
+                ),
+            )
+            runtime[DATA_UNSUB].append(
+                async_track_time_interval(
+                    hass,
+                    _scheduled_statistics,
+                    timedelta(minutes=interval),
+                    name=f"{DOMAIN}_statistics_publish",
+                    cancel_on_shutdown=True,
+                )
+            )
+            _LOGGER.info(
+                "Long-term statistics replication on: a %d-day window every %d minutes. "
+                "Raw states history does NOT cross — see ADR-010.",
+                window_days,
+                interval,
+            )
+
+    runtime[DATA_STATISTICS] = statistics
+
+
+async def _setup_degraded_alarm(
+    hass: HomeAssistant,
+    runtime: dict[str, Any],
+) -> None:
+    """Raise, or clear, the degraded-go-bag repair for this boot.
+
+    Extracted from `async_setup_entry` (AR-0050). Sets
+    `runtime[DATA_DEGRADED_MARKER]` itself.
+
+    🚨 It both creates AND deletes the issue. The registry is storage-backed,
+    so creating without deleting would leave a fully recovered node carrying
+    an ERROR for ever.
+    """
+    # 3c. The degraded-fileset alarm. Decision D4 has the standby promote on a
+    #     stale or missing go-bag rather than refuse to start, which makes
+    #     this the only safety net: every HTTP health check on a node in that
+    #     state is green anyway. `cluster-fileset-swap.sh` writes this marker
+    #     on the host, before the container starts, on every degraded path,
+    #     and removes it on a clean swap — so its mere presence is the signal,
+    #     and it does not go away on its own.
+    #
+    #     AR-0040 is why this cannot be a log line: a defect of exactly this
+    #     shape — a promotion that quietly did not do its job — lived in this
+    #     project for its entire life, and its only symptom was an INFO line
+    #     nobody read. This goes to the repairs panel instead.
+    marker_path = hass.config.path(DEGRADED_MARKER_NAME)
+
+    def _read_degraded_marker() -> dict[str, Any] | None:
+        try:
+            with open(marker_path, encoding="utf-8") as handle:
+                return json.load(handle)
+        except FileNotFoundError:
+            # The normal case on a healthy node, and the only one that is not
+            # worth a word.
+            return None
+        except (OSError, ValueError):
+            # A marker that exists but cannot be read is NOT the same as no
+            # marker, and returning None silently makes them identical. This is
+            # the only safety net on decision D4's "promote anyway": the swap
+            # wrote this file because something went wrong, and a truncated
+            # write or a permission problem would otherwise turn the alarm off
+            # and leave the node looking clean. Say so, because the alternative
+            # is a degraded promotion nobody ever hears about.
+            _LOGGER.warning(
+                "Could not read the degraded-fileset marker at %s; treating this boot as "
+                "clean. If the host-side swap wrote one, its alarm has been lost -- check "
+                "the swap log on the host.",
+                marker_path,
+                exc_info=True,
+            )
+            return None
+
+    degraded_marker = await hass.async_add_executor_job(_read_degraded_marker)
+    runtime[DATA_DEGRADED_MARKER] = degraded_marker
+    if degraded_marker:
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            "fileset_degraded",
+            is_fixable=False,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="fileset_degraded",
+            translation_placeholders={"reason": str(degraded_marker.get("reason", "unknown"))},
+        )
+    else:
+        # The issue registry is storage-backed and survives restarts, so
+        # creating the issue is only half the job. `strings.json` tells the
+        # operator that reloading the integration once a fresh fileset is
+        # staged clears it — without this, that is a false promise, and a
+        # fully-recovered node would carry a stale ERROR forever. Deleting an
+        # issue that does not exist is a documented no-op, so this is safe to
+        # run on every setup, degraded or not.
+        ir.async_delete_issue(hass, DOMAIN, "fileset_degraded")
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -598,250 +917,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
     )
 
-    # 3a-bis. Recorder history continuity (ADR-010). Leader-only, for the same
-    #         reason the flush is: only the leader's history is the house's
-    #         history, and a follower snapshotting its own neutered instance
-    #         would ship noise. Off unless the operator opted in.
-    if cfg.get(CONF_RECORDER_SNAPSHOT_ENABLED, DEFAULT_RECORDER_SNAPSHOT_ENABLED):
-        snap_minutes = int(
-            cfg.get(CONF_RECORDER_SNAPSHOT_MINUTES)
-            or storage.inspect_path(hass.config.path()).default_minutes
-        )
-        snap_minutes = max(
-            MIN_RECORDER_SNAPSHOT_MINUTES, min(MAX_RECORDER_SNAPSHOT_MINUTES, snap_minutes)
-        )
+    await _setup_recorder_snapshots(hass, cfg, runtime, leadership)
 
-        async def _scheduled_recorder_snapshot(_now: datetime) -> None:
-            if not await leadership.async_is_leader():
-                return
-            # `VACUUM INTO` took ~10s on a 2.2 GB database. That must not sit
-            # on the event loop, so it goes to an executor like every other
-            # blocking call in this integration.
-            result = await hass.async_add_executor_job(
-                recorder_snapshot.take_snapshot, hass.config.path()
-            )
-            stats = runtime.get(DATA_STATS)
-            if stats is not None:
-                stats.record_recorder_snapshot(result)
-            if not result.ok and result.error:
-                # A shared-database install has no SQLite file, which is
-                # ordinary rather than broken -- debug, not error, so a valid
-                # configuration does not log a failure every interval.
-                _LOGGER.debug("Recorder snapshot skipped: %s", result.error)
+    await _setup_fileset_replication(hass, entry, cfg, runtime, backend, leadership, node_id)
 
-        runtime[DATA_UNSUB].append(
-            async_track_time_interval(
-                hass,
-                _scheduled_recorder_snapshot,
-                timedelta(minutes=snap_minutes),
-                name=f"{DOMAIN}_recorder_snapshot",
-                cancel_on_shutdown=True,
-            )
-        )
-        _LOGGER.info(
-            "Recorder history continuity on: a consistent copy every %d minutes (%s)",
-            snap_minutes,
-            storage.inspect_path(hass.config.path()).describe(),
-        )
+    await _setup_statistics_replication(hass, cfg, runtime, backend, leadership, node_id)
 
-    # 3b. Fileset replication (design 2026-08-29). Off unless configured: it
-    #     reads every credential in the config directory, so the operator opts
-    #     in. Leader-only for the same reason the flush is — a follower
-    #     publishing would overwrite the leader's identity with its own.
-    publisher: FilesetPublisher | None = None
-    if cfg.get(CONF_FILESET_ENABLED, DEFAULT_FILESET_ENABLED):
-        secret = cfg.get(CONF_CLUSTER_SECRET)
-        if not secret:
-            # Without a secret there is no key, and an unsealed `.storage` in
-            # shared Valkey is not a degraded mode worth offering.
-            _LOGGER.error(
-                "Fileset replication is enabled but no cluster secret is set; "
-                "not publishing. Reconfigure the integration to mint one."
-            )
-        else:
-            publisher = FilesetPublisher(
-                backend,
-                config_dir=hass.config.path(),
-                node_id=node_id,
-                secret=secret,
-                exclusions=cfg.get(CONF_FILESET_EXCLUSIONS, DEFAULT_FILESET_EXCLUSIONS),
-                extra_paths=(
-                    *cfg.get(CONF_FILESET_EXTRA_PATHS, DEFAULT_FILESET_EXTRA_PATHS),
-                    *cfg.get(CONF_FILESET_EXTRA_CUSTOM, DEFAULT_FILESET_EXTRA_CUSTOM),
-                ),
-                max_bytes=cfg.get(CONF_FILESET_MAX_BYTES, DEFAULT_FILESET_MAX_BYTES),
-            )
-
-            async def _scheduled_fileset(_now: datetime) -> None:
-                if not await leadership.async_is_leader():
-                    return
-                try:
-                    await publisher.async_publish()
-                except Exception:  # noqa: BLE001 — a publish must never kill the loop
-                    _LOGGER.exception("Fileset publish failed; will retry next interval")
-
-            runtime[DATA_UNSUB].append(
-                async_track_time_interval(
-                    hass,
-                    _scheduled_fileset,
-                    timedelta(
-                        seconds=cfg.get(CONF_FILESET_HOT_INTERVAL, DEFAULT_FILESET_HOT_INTERVAL)
-                    ),
-                    name=f"{DOMAIN}_fileset_publish",
-                    cancel_on_shutdown=True,
-                )
-            )
-
-    runtime[DATA_FILESET] = publisher
-
-    # 3b-ii. Long-term statistics replication (ADR-010). Rides on the fileset's
-    #        key and secret, and is separately switchable: an estate on a shared
-    #        Postgres recorder wants the go-bag and not this.
-    #
-    #        Only `statistics` crosses. Measured on this estate: long-term
-    #        statistics grow ~5,500 rows a day, raw `states` churns ~324,000,
-    #        and block-replicating the latter cost 4 GB a day through Valkey.
-    #        So the years of energy and climate history survive a failover and
-    #        the recent logbook does not -- stated plainly rather than implied.
-    statistics: StatisticsPublisher | None = None
-    if cfg.get(CONF_STATISTICS_ENABLED, DEFAULT_STATISTICS_ENABLED):
-        secret = cfg.get(CONF_CLUSTER_SECRET)
-        if not secret:
-            _LOGGER.error(
-                "Statistics replication is enabled but no cluster secret is set; "
-                "not publishing. Reconfigure the integration to mint one."
-            )
-        else:
-            window_days = max(
-                MIN_STATISTICS_WINDOW_DAYS,
-                min(
-                    MAX_STATISTICS_WINDOW_DAYS,
-                    int(cfg.get(CONF_STATISTICS_WINDOW_DAYS) or DEFAULT_STATISTICS_WINDOW_DAYS),
-                ),
-            )
-            statistics = StatisticsPublisher(
-                backend,
-                config_dir=hass.config.path(),
-                secret=secret,
-                window_days=window_days,
-                max_bytes=cfg.get(CONF_STATISTICS_MAX_BYTES, DEFAULT_STATISTICS_MAX_BYTES),
-            )
-
-            async def _scheduled_statistics(_now: datetime) -> None:
-                if not await leadership.async_is_leader():
-                    return
-                try:
-                    await statistics.async_publish()
-                except Exception:  # noqa: BLE001 — a publish must never kill the loop
-                    _LOGGER.exception("Statistics publish failed; will retry next interval")
-                # Then read what the standby made of the LAST window. This is
-                # the only place in this integration where data flows standby
-                # to leader, and it has to exist: in the cold model the standby
-                # has no Home Assistant, so a schema mismatch or a gap it
-                # discovers has no logbook, no repairs panel and no entity to
-                # land on. It leaves a status line in Valkey; this raises the
-                # alarm on its behalf. Without it the standby's history stops
-                # advancing and nobody learns until a promotion -- the AR-0040
-                # shape exactly.
-                await _surface_follower_status(
-                    hass,
-                    backend,
-                    secret,
-                    node_id=node_id,
-                    # Two publish intervals plus a margin: one missed pass
-                    # is a timer that drifted, three is a mechanism that
-                    # has stopped.
-                    stale_after=interval * 60 * 3,
-                )
-
-            interval = max(
-                MIN_STATISTICS_INTERVAL_MINUTES,
-                min(
-                    MAX_STATISTICS_INTERVAL_MINUTES,
-                    int(
-                        cfg.get(CONF_STATISTICS_INTERVAL_MINUTES)
-                        or DEFAULT_STATISTICS_INTERVAL_MINUTES
-                    ),
-                ),
-            )
-            runtime[DATA_UNSUB].append(
-                async_track_time_interval(
-                    hass,
-                    _scheduled_statistics,
-                    timedelta(minutes=interval),
-                    name=f"{DOMAIN}_statistics_publish",
-                    cancel_on_shutdown=True,
-                )
-            )
-            _LOGGER.info(
-                "Long-term statistics replication on: a %d-day window every %d minutes. "
-                "Raw states history does NOT cross — see ADR-010.",
-                window_days,
-                interval,
-            )
-
-    runtime[DATA_STATISTICS] = statistics
-
-    # 3c. The degraded-fileset alarm. Decision D4 has the standby promote on a
-    #     stale or missing go-bag rather than refuse to start, which makes
-    #     this the only safety net: every HTTP health check on a node in that
-    #     state is green anyway. `cluster-fileset-swap.sh` writes this marker
-    #     on the host, before the container starts, on every degraded path,
-    #     and removes it on a clean swap — so its mere presence is the signal,
-    #     and it does not go away on its own.
-    #
-    #     AR-0040 is why this cannot be a log line: a defect of exactly this
-    #     shape — a promotion that quietly did not do its job — lived in this
-    #     project for its entire life, and its only symptom was an INFO line
-    #     nobody read. This goes to the repairs panel instead.
-    marker_path = hass.config.path(DEGRADED_MARKER_NAME)
-
-    def _read_degraded_marker() -> dict[str, Any] | None:
-        try:
-            with open(marker_path, encoding="utf-8") as handle:
-                return json.load(handle)
-        except FileNotFoundError:
-            # The normal case on a healthy node, and the only one that is not
-            # worth a word.
-            return None
-        except (OSError, ValueError):
-            # A marker that exists but cannot be read is NOT the same as no
-            # marker, and returning None silently makes them identical. This is
-            # the only safety net on decision D4's "promote anyway": the swap
-            # wrote this file because something went wrong, and a truncated
-            # write or a permission problem would otherwise turn the alarm off
-            # and leave the node looking clean. Say so, because the alternative
-            # is a degraded promotion nobody ever hears about.
-            _LOGGER.warning(
-                "Could not read the degraded-fileset marker at %s; treating this boot as "
-                "clean. If the host-side swap wrote one, its alarm has been lost -- check "
-                "the swap log on the host.",
-                marker_path,
-                exc_info=True,
-            )
-            return None
-
-    degraded_marker = await hass.async_add_executor_job(_read_degraded_marker)
-    runtime[DATA_DEGRADED_MARKER] = degraded_marker
-    if degraded_marker:
-        ir.async_create_issue(
-            hass,
-            DOMAIN,
-            "fileset_degraded",
-            is_fixable=False,
-            severity=ir.IssueSeverity.ERROR,
-            translation_key="fileset_degraded",
-            translation_placeholders={"reason": str(degraded_marker.get("reason", "unknown"))},
-        )
-    else:
-        # The issue registry is storage-backed and survives restarts, so
-        # creating the issue is only half the job. `strings.json` tells the
-        # operator that reloading the integration once a fresh fileset is
-        # staged clears it — without this, that is a false promise, and a
-        # fully-recovered node would carry a stale ERROR forever. Deleting an
-        # issue that does not exist is a documented no-op, so this is safe to
-        # run on every setup, degraded or not.
-        ir.async_delete_issue(hass, DOMAIN, "fileset_degraded")
+    await _setup_degraded_alarm(hass, runtime)
 
     # 4. On stop, write a final snapshot — the gift the dying node leaves the
     #    standby. AR-0016: this is the *only* shutdown flush path. v0.1 had two

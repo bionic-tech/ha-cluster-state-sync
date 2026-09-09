@@ -123,3 +123,83 @@ def test_the_generated_python_is_syntactically_valid(cfg: dict, artefact: str) -
     import ast
 
     ast.parse(build_bundle(cfg)[artefact])  # SyntaxError if the shipped copy is broken
+
+
+def test_install_refuses_to_run_on_the_peer(tmp_path) -> None:
+    """🚨 AR-0058. A bundle belongs to ONE node, and the obvious mistake is
+    installing the other one's.
+
+    The container-name and config-path checks catch it only when the two hosts
+    happen to differ. Anyone who followed a standard guide has `homeassistant`
+    on both and the same config path — and then nothing noticed. The reliable
+    question is the inverse one: we may not know our own hostname, but we know
+    the peer's, because the operator typed it.
+    """
+    import subprocess
+
+    from custom_components.cluster_state_sync import bundle
+
+    script = bundle.build_bundle(
+        {
+            "ha_container": "homeassistant",
+            "ha_config_path": str(tmp_path),
+            "redis_host": "v",
+            "redis_port": 6380,
+            "redis_db": 2,
+            "cluster_namespace": "prod",
+            "cluster_secret": "s" * 44,
+            "node_id": "nodeA",
+            # The peer is whatever THIS machine calls itself, so the guard must
+            # fire — which is exactly the wrong-bundle situation.
+            "peer_host": subprocess.run(
+                ["hostname", "-s"], capture_output=True, text=True, check=False
+            ).stdout.strip()
+            or "localhost",
+            "topology_model": "cold",
+            "leadership_source": "lease",
+            "fileset_enabled": True,
+        }
+    )["install.sh"]
+    path = tmp_path / "install.sh"
+    path.write_text(script, encoding="utf-8")
+
+    result = subprocess.run(
+        ["bash", str(path), "--dry-run"], capture_output=True, text=True, check=False
+    )
+    assert result.returncode != 0, "installing the peer's bundle was not refused"
+    assert "wrong node's bundle" in result.stderr, result.stderr[-400:]
+
+
+def test_install_readme_tells_you_how_to_recover_a_lost_session(tmp_path) -> None:
+    """The paste-buffer question, which had no answer at all.
+
+    An operator part-way through, whose SSH dropped and whose clipboard is
+    gone, needs to know the bundle still exists inside Home Assistant and that
+    re-running the installer is safe. Neither was written down anywhere.
+    """
+    from custom_components.cluster_state_sync import bundle
+
+    md = bundle.build_bundle(
+        {
+            "ha_container": "homeassistant",
+            "ha_config_path": "/c",
+            "redis_host": "v",
+            "redis_port": 6380,
+            "redis_db": 2,
+            "cluster_namespace": "prod",
+            "cluster_secret": "s" * 44,
+            "node_id": "nodeA",
+            "peer_host": "otherhost",
+            "topology_model": "cold",
+            "leadership_source": "lease",
+            "fileset_enabled": True,
+        }
+    )["INSTALL.md"]
+
+    assert "If you lose your session" in md
+    # It must name the command that gets the bundle back...
+    assert "cluster_state_sync_bundle" in md
+    # ...say that re-running is safe...
+    assert "safe to re-run" in md
+    # ...and say that an interrupted install has changed nothing.
+    assert "Nothing is armed until the timers are enabled" in md

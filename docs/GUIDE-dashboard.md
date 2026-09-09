@@ -119,7 +119,7 @@ change, anything that takes the machine away — and to test that failover genui
   [known gaps](#known-gaps-before-you-rely-on-this).
 * **Network devices keep working** — Tuya, Meross, Sonos, anything over MQTT.
 * **Remote access** is separate again: see
-  GUIDE-ingress.md.
+  [GUIDE-ingress.md](GUIDE-ingress.md).
 
 **It shows "REQUESTED" until the promoter acts.** Click again to withdraw while it is pending. If
 it stays requested for more than a tick or two, the promoter is not running.

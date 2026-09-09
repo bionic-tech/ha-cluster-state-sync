@@ -1,4 +1,5 @@
 {
   "name": "Cluster State Sync",
-  "homeassistant": "2026.6.4"
+  "homeassistant": "2026.6.4",
+  "render_readme": false
 }

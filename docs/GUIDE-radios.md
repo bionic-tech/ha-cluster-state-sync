@@ -254,3 +254,40 @@ spoken.
 - **[GOTCHAS.md](GOTCHAS.md)** §15, §17, §18, §18a–d — the incidents behind every warning here
 - **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** — "After promotion, radios do not work"
 - `examples/hardware-custody/` — the worked VirtualHere hooks, installed by nobody
+
+
+---
+
+## The radio that never moves, and why it is the one that matters
+
+🚨 **Found on a real failover, 2026-09-09.** Worth stating on its own, because
+it is the case where the general rule bites hardest.
+
+A radio that is **physically plugged into one machine** does not follow a
+promotion. That is not a limitation of this software — it is a plug. The rule
+appears throughout this guide, but here is what it costs in practice.
+
+On the fleet this integration was built for, one 433 MHz transceiver is
+hardwired to the primary node and by design never transfers. It is the
+transmitter that a **firewall RF-recovery watchdog** depends on. So a failover
+— working perfectly, doing exactly what it was asked — **silently removes the
+fleet's last-resort path for recovering the firewall.**
+
+Nothing reported a fault. Nothing could: every device that *can* move had
+moved, and the cluster has no way to know that the one that stayed behind was
+the important one.
+
+### What to do about it
+
+1. **List every radio and ask, for each: can this follow?** Directly attached
+   USB cannot. Reachable over IP (VirtualHere, ser2net, a network-attached
+   coordinator) can, given the hooks.
+2. **For each that cannot, ask a harder question:** would I need this *during*
+   the failure this cluster exists to survive? A doorbell is an inconvenience.
+   A transmitter that recovers your network is a circular dependency.
+3. **Write down the answer where the person on call will find it** — not here,
+   in your own runbook. The cluster cannot warn you about this, because it does
+   not know which of your radios matters.
+
+If the answer to (2) is yes for any device, that device wants either its own
+redundancy or a recovery path that does not depend on it.

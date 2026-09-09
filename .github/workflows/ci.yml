@@ -10,9 +10,15 @@ on:
   pull_request:
   workflow_dispatch:
   schedule:
-    # Weekly canary against the newest Home Assistant harness. Home Assistant
-    # ships monthly with breaking changes; without this the first sign of an API
-    # move is an upgrade that fails in production.
+    # Weekly canary against the newest Home Assistant harness — see the
+    # `canary` job. Home Assistant ships monthly with breaking changes;
+    # without this the first sign of an API move is an upgrade that fails in
+    # somebody's house.
+    #
+    # 🚨 This comment used to promise a canary that did not exist: every job
+    # installed requirements-dev.txt, so the weekly run re-tested the same
+    # pinned Home Assistant and could never find anything new. Found on
+    # 2026-09-09 while answering "how do we get ahead of HA releases".
     - cron: "0 6 * * 1"
 
 concurrency:
@@ -175,6 +181,61 @@ jobs:
       # that the largest privileged surface here is covered.
       - name: Fail on high severity
         run: bandit -r custom_components/ scripts/ --severity-level high --confidence-level high
+
+  canary:
+    name: Canary (newest Home Assistant)
+    runs-on: ubuntu-latest
+    # Scheduled and manual only. It is allowed to fail: its job is to go red
+    # BEFORE an upgrade does, not to block work on a release nobody has
+    # adopted yet. A red canary is a fortnight's warning, not an outage.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    services:
+      valkey:
+        image: valkey/valkey:8.1
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      CLUSTER_SYNC_TEST_VALKEY: "127.0.0.1:6379"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install nftables and shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables shellcheck
+      # Everything EXCEPT the Home Assistant harness comes from the pin; the
+      # harness itself is deliberately unpinned, because it is the variable
+      # under test.
+      - name: Install with the newest Home Assistant harness
+        run: |
+          pip install --upgrade pip
+          grep -v '^pytest-homeassistant-custom-component==' requirements-dev.txt > /tmp/dev.txt
+          pip install -r /tmp/dev.txt
+          pip install --upgrade pytest-homeassistant-custom-component
+      - name: What did we get?
+        run: |
+          {
+            echo "### Canary"
+            echo
+            echo "| package | version |"
+            echo "|---|---|"
+            echo "| homeassistant | $(python -c 'import homeassistant.const as c; print(c.__version__)') |"
+            echo "| harness | $(pip show pytest-homeassistant-custom-component | awk '/^Version:/{print $2}') |"
+            echo "| pinned in repo | $(grep -oP '(?<=^pytest-homeassistant-custom-component==).*' requirements-dev.txt) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+      # The compatibility surface: the API symbols we import, and the recorder
+      # schema we read directly. The second is the one no test suite notices,
+      # because it lives in Home Assistant rather than here.
+      - name: Compatibility check
+        run: python scripts/ha_compat_check.py | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Run the suite against it
+        run: pytest -q -rs
 
   hassfest:
     name: Validate (hassfest)

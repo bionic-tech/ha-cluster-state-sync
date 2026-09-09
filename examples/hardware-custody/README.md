@@ -60,3 +60,25 @@ case failover exists for — a node that is simply gone — releases nothing, an
 recovery depends entirely on your provider reaping a dead client's claim. For
 USB-over-IP that is the server noticing the TCP connection drop. **Measure it:
 that number is your radio RTO**, and no hook can improve it.
+
+
+## Keeping an adapted copy current
+
+🚨 **Your copy is yours, and an upgrade never touches it.** These hooks live in
+`/etc/cluster-sync/pre-start.d/` and `post-stop.d/`, which the bundle
+deliberately does not manage — regenerating or reinstalling must never delete
+an operator's own emergency hook.
+
+The consequence is that improvements here do not reach you. When a release note
+mentions a hook example, diff yours against it:
+
+```bash
+diff /etc/cluster-sync/post-stop.d/90-virtualhere-release.sh \
+     examples/hardware-custody/virtualhere-release.sh
+```
+
+Known changes worth picking up:
+
+| Release | Change |
+|---|---|
+| v0.4.1 | `virtualhere-release.sh` waits `RELEASE_WAIT` (default 30s, was a fixed 15s) and **exits 0** when devices linger. At 15s a *successful* handover was reported as `DEGRADED` — measured on a real failover, where the devices detached at about 21s |

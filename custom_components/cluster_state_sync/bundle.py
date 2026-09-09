@@ -23,6 +23,7 @@ import shlex
 from typing import Any
 
 from .const import (
+    BUNDLE_DIR_NAME,
     CONF_BLOCK_DISCOVERY,
     CONF_CLUSTER_NAMESPACE,
     CONF_CLUSTER_SECRET,
@@ -32,6 +33,9 @@ from .const import (
     CONF_COMPOSE_SERVICE,
     CONF_DOCKER_NETWORK,
     CONF_FILESET_ENABLED,
+    CONF_FILESET_EXCLUSIONS,
+    CONF_FILESET_EXTRA_CUSTOM,
+    CONF_FILESET_EXTRA_PATHS,
     CONF_FILESET_STALE_AFTER,
     CONF_HA_CONFIG_PATH,
     CONF_HA_CONTAINER,
@@ -39,12 +43,15 @@ from .const import (
     CONF_HA_START_MODE,
     CONF_HA_UID,
     CONF_IOT_SUBNETS,
+    CONF_LEADERSHIP_ENTITY,
     CONF_NODE_ID,
     CONF_PEER_HOST,
+    CONF_RADIO_WATCH,
     CONF_REDIS_DB,
     CONF_REDIS_HOST,
     CONF_REDIS_PASSWORD,
     CONF_REDIS_PORT,
+    CONF_REDIS_SENTINEL_HOSTS,
     CONF_REDIS_TLS_CA_CERTS,
     CONF_REDIS_USE_TLS,
     CONF_REDIS_USERNAME,
@@ -380,24 +387,66 @@ def _config_path(cfg: dict[str, Any]) -> str:
 #: mistake or an attack, and both deserve to stop the build.
 _SHELL_METACHARACTERS = frozenset("\"'`$\\;&|<>()[]{}!*?~ \n\r\t")
 
-#: The operator-typed fields that reach generated shell. Kept explicit rather
-#: than derived, so adding a config key is a decision about whether it is safe
-#: rather than an accident of naming.
-SHELL_EXPOSED_FIELDS = (
-    CONF_HA_CONTAINER,
-    CONF_HA_CONFIG_PATH,
-    CONF_HA_CONTAINER_IP,
-    CONF_REDIS_HOST,
-    CONF_REDIS_USERNAME,
-    CONF_REDIS_TLS_CA_CERTS,
-    CONF_CLUSTER_NAMESPACE,
-    CONF_NODE_ID,
-    CONF_PEER_HOST,
-    CONF_COMPOSE_FILE,
-    CONF_COMPOSE_SERVICE,
-    CONF_COMPOSE_PROFILE,
-    CONF_COMPOSE_ENV_FILE,
-)
+#: 🚨 AR-0056. The first version of this guard validated a hand-written list of
+#: thirteen fields, and its own docstring said the reason a chokepoint beats a
+#: hunt is that "the next person to add a site will forget". Curating the FIELD
+#: list is that same mistake one level up, and it was made immediately: a
+#: review five days later found `redis_port`, `redis_db`, `fileset_stale_after`,
+#: `iot_subnets` and `ha_uid` all reaching root-run shell unchecked, because
+#: they look like numbers and nobody had typed them into the list.
+#:
+#:     --redis v:6379; touch /tmp/PWNED     <- generated, and it executed
+#:
+#: So the rule is inverted. **Everything in the config is validated unless it
+#: is named here, with a reason.** A field added tomorrow is checked by
+#: default; forgetting to think about it now fails closed instead of open.
+SHELL_SAFE_EXCEPTIONS: dict[str, str] = {
+    CONF_REDIS_PASSWORD: (
+        "never interpolated into a script. Its single use is "
+        "`_fileset_valkey_password`, which wraps it in shlex.quote for a file "
+        "the pull sources as root -- verified by executing a payload against "
+        "the generated env file. Passwords legitimately contain $ and quotes, "
+        "so validating this one would reject valid configurations."
+    ),
+    CONF_CLUSTER_SECRET: (
+        "never reaches shell at all. It derives the fileset key, and only the "
+        "hex of that key is written. Asserted by a test that builds with a "
+        "marker secret and greps every emitted artefact for it."
+    ),
+    CONF_FILESET_EXCLUSIONS: "glob patterns (`*.bak-*`); never read by bundle.py",
+    CONF_FILESET_EXTRA_PATHS: "operator path list; never read by bundle.py",
+    CONF_FILESET_EXTRA_CUSTOM: "operator path list; never read by bundle.py",
+    CONF_LEADERSHIP_ENTITY: "an entity_id used inside Home Assistant; never read by bundle.py",
+    CONF_REDIS_SENTINEL_HOSTS: "consumed by the integration's client, never by a script",
+    CONF_RADIO_WATCH: "entity globs; never read by bundle.py",
+}
+
+
+#: Fields whose shape is known, and therefore checkable more strictly than
+#: "contains no metacharacter". Each is an ALLOWLIST of permitted characters,
+#: which is tighter than the generic rule rather than an exemption from it.
+#:
+#: `iot_subnets` needs this because it is a comma-separated list and a space
+#: after the comma is ordinary -- rejecting the space would refuse a valid
+#: firewall configuration, and exempting the field would leave nftables input
+#: unchecked. Neither is acceptable, so its actual shape is validated.
+_SUBNET_CHARS = frozenset("0123456789abcdefABCDEF.:/")
+
+
+def _check_subnets(field: str, value: str) -> None:
+    """Every comma-separated element must look like an address or a CIDR."""
+    for element in (e.strip() for e in value.split(",")):
+        if not element:
+            continue
+        if not set(element) <= _SUBNET_CHARS:
+            raise UnsafeBundleValue(
+                f"{field} element {element!r} is not an address or CIDR range. This "
+                "value is written into nftables rules loaded as root, so only "
+                "address characters are accepted."
+            )
+
+
+SHELL_SAFE_VALIDATORS: dict[str, Any] = {}
 
 
 class UnsafeBundleValue(ValueError):
@@ -405,17 +454,29 @@ class UnsafeBundleValue(ValueError):
 
 
 def validate_shell_safe(cfg: dict[str, Any]) -> None:
-    """Reject any operator-supplied value that shell would not treat as a word.
+    """Reject any config value that shell would not treat as a single word.
+
+    Default-deny (AR-0056): **every** value is checked unless its key appears
+    in `SHELL_SAFE_EXCEPTIONS`. Booleans and real numbers are skipped because
+    they render as literals and cannot carry a metacharacter -- but a *string*
+    in a numeric field is still a string, which is exactly how `redis_port`
+    became an injection vector.
 
     Raises `UnsafeBundleValue`. The config flow calls this too, so the operator
     meets a form error rather than a traceback -- but this runs on every build
     regardless of how the config got here, including a hand-edited
     `core.config_entries` replicated from a peer.
     """
-    for field in SHELL_EXPOSED_FIELDS:
-        value = cfg.get(field)
-        if value is None or value == "":
-            continue
+
+    def check(field: str, value: Any) -> None:
+        if value is None or isinstance(value, bool | int | float):
+            # Rendered as a literal; cannot carry a metacharacter. A string
+            # that merely looks numeric is NOT this case and falls through.
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                check(field, item)
+            return
         text = str(value)
         bad = sorted(set(text) & _SHELL_METACHARACTERS)
         if bad:
@@ -423,6 +484,19 @@ def validate_shell_safe(cfg: dict[str, Any]) -> None:
                 f"{field} contains {''.join(bad)!r}, which cannot appear in a value "
                 "that is written into scripts this host runs as root. Remove it."
             )
+
+    for field, value in cfg.items():
+        if field in SHELL_SAFE_EXCEPTIONS:
+            continue
+        shaped = SHELL_SAFE_VALIDATORS.get(field)
+        if shaped is not None:
+            if value is not None:
+                shaped(field, str(value))
+            continue
+        check(field, value)
+
+
+SHELL_SAFE_VALIDATORS[CONF_IOT_SUBNETS] = _check_subnets
 
 
 def sh(value: Any) -> str:
@@ -1831,22 +1905,28 @@ PROMOTER_BASE_GRACE_SECONDS = 120
 RECORDER_SNAPSHOT_NAME = ".cluster_sync_recorder.db"
 RECORDER_DB_NAME = "home-assistant_v2.db"
 
-#: (removed 2026-09-08) Shipping the recorder snapshot by rsync-over-SSH would
-#: have been the FIRST direct node-to-node dependency this project has.
-#: Everything else reaches Valkey and nothing else -- a node has never needed to
-#: talk to its peer, which is why the failure modes are as simple as they are.
-#: It was also not native to Home Assistant, which this integration is required
-#: to be: rsync-over-SSH works on Docker, might work on a Supervised install,
-#: and cannot work on Home Assistant OS at all.
-#:
-#: What replaced it: only long-term `statistics` cross, as ROWS through the
-#: same Valkey and the same sealed envelope as everything else (ADR-010). That
-#: is half a megabyte a day rather than 1.59 GB, it needs no new transport, no
-#: new port and no new trust, and it works identically on every install shape.
-#: The price is honest and stated: raw `states` -- the recent logbook and
-#: history graphs -- does not cross. Long-term statistics do, and those are the
-#: years of energy and climate data people actually grieve losing.
-RECORDER_SNAPSHOT_LOCK_NAME = ".cluster_sync_recorder.writing"
+# --- Why the recorder snapshot is not shipped between nodes ------------------
+#
+# (removed 2026-09-08) Shipping it by rsync-over-SSH would have been the FIRST
+# direct node-to-node dependency this project has. Everything else reaches
+# Valkey and nothing else -- a node has never needed to talk to its peer, which
+# is why the failure modes are as simple as they are. It was also not native to
+# Home Assistant, which this integration is required to be: rsync-over-SSH
+# works on Docker, might work on a Supervised install, and cannot work on Home
+# Assistant OS at all.
+#
+# What replaced it: only long-term `statistics` cross, as ROWS through the same
+# Valkey and the same sealed envelope as everything else (ADR-010). That is half
+# a megabyte a day rather than 1.59 GB, it needs no new transport, no new port
+# and no new trust, and it works identically on every install shape. The price
+# is honest and stated: raw `states` -- the recent logbook and history graphs --
+# does not cross. Long-term statistics do, and those are the years of energy and
+# climate data people actually grieve losing.
+#
+# `RECORDER_SNAPSHOT_LOCK_NAME` lived here and was deleted 2026-09-09: it was
+# the rsync transport's write-lock marker and nothing has referenced it since
+# the transport went. The reasoning above is kept because it is the live record
+# of a decision this project is asked to revisit roughly once a week.
 
 #: Mirrors `cluster_promoter.DEFAULT_RELEASE_HOLDDOWN_SECONDS`, for the same
 #: reason and with the same caveat as the grace above. Used only by
@@ -2262,6 +2342,9 @@ def _install_readme(cfg: dict[str, Any], warm: bool) -> str:
     namespace = cfg.get(CONF_CLUSTER_NAMESPACE, "default")
     node = cfg.get(CONF_NODE_ID, "node")
     ha_url = _promoter_ha_url(cfg)
+    # Named in the recovery instructions, so someone whose session died
+    # can fetch the bundle again without knowing anything by heart.
+    container = str(cfg.get(CONF_HA_CONTAINER) or "homeassistant")
     lines = [
         f"# Cluster State Sync — host bundle ({model} standby)\n\n",
         f"Generated for node `{node}`, cluster namespace `{namespace}`.\n\n",
@@ -2269,6 +2352,33 @@ def _install_readme(cfg: dict[str, Any], warm: bool) -> str:
         "> The firewall rules in particular were written from your wizard answers\n"
         "> without access to the machine, and the correct filter point depends on\n"
         "> how Home Assistant is networked. Read them before loading them.\n\n",
+        "## If you lose your session part-way through\n\n",
+        "**Nothing here depends on your clipboard, and nothing is left half\n"
+        "applied.** If SSH drops, a laptop sleeps, or the command you copied is\n"
+        "gone, you have lost nothing but the typing.\n\n",
+        "**The bundle lives inside Home Assistant** and is rewritten every time\n"
+        f"the wizard runs, at `{BUNDLE_DIR_NAME}/` in the config directory. It is\n"
+        "not a one-time paste; fetch it again as often as you like:\n\n",
+        "```bash\n"
+        f"docker exec {container} tar -C /config/{BUNDLE_DIR_NAME} -cf - . \\\n"
+        "  | sudo tar -C /etc/cluster-sync -xf -\n"
+        "```\n\n",
+        "**Lost this file?** It is in there too:\n\n",
+        f"```bash\ndocker exec {container} cat /config/{BUNDLE_DIR_NAME}/INSTALL.md\n```\n\n",
+        "**`install.sh` is safe to re-run.** It re-copies the files and leaves\n"
+        "already-enabled timers alone, so finishing an interrupted install is\n"
+        "just running it again -- with `--dry-run` first if you want to see what\n"
+        "it would do:\n\n",
+        "```bash\n"
+        "cd /etc/cluster-sync && sudo ./install.sh --dry-run   # look\n"
+        "cd /etc/cluster-sync && sudo ./install.sh             # then do\n"
+        "```\n\n",
+        "**Nothing is armed until the timers are enabled**, which is the last\n"
+        "thing the script does. An interrupted install leaves files in\n"
+        "`/etc/cluster-sync` and no change in behaviour at all.\n\n",
+        "**On the wrong machine?** The script checks before it touches anything:\n"
+        "it verifies the container and config path exist, and refuses outright if\n"
+        "this host answers to the peer's name.\n\n",
         "## Install\n\n",
         "> 🚨 **This bundle belongs to ONE node. Do not copy it to the other.**\n"
         f"> It was generated for `{node}`, and nine of its files carry that\n"
@@ -2760,6 +2870,8 @@ def _install_script(cfg: dict[str, Any], filenames: list[str]) -> str:
     """
     config_path = shlex.quote(str(cfg.get(CONF_HA_CONFIG_PATH) or DEFAULT_HA_CONFIG_PATH))
     container = shlex.quote(str(cfg.get(CONF_HA_CONTAINER) or "homeassistant"))
+    # AR-0058: used to prove this is not the OTHER node.
+    peer_host = str(cfg.get(CONF_PEER_HOST) or "")
     use_tls = bool(cfg.get(CONF_REDIS_USE_TLS))
     ca_certs = str(cfg.get(CONF_REDIS_TLS_CA_CERTS) or "") if use_tls else ""
     host_ca = shlex.quote(_host_path(cfg, ca_certs)) if ca_certs else ""
@@ -2870,6 +2982,36 @@ for cmd in docker systemctl python3; do
     command -v "$cmd" >/dev/null 2>&1 || fail "$cmd is not on PATH"
 done
 ok "docker, systemctl and python3 present"
+
+# 🚨 Are we on the RIGHT machine? (AR-0058)
+#
+# This bundle is built for ONE node: the container name, the config path, the
+# node id and the peer are all specific to it. Installing the other node's
+# bundle is silently wrong -- the promoter inspects a container that is not
+# there, the pull writes to a path nothing reads.
+#
+# The container and path checks above catch it ONLY when the two hosts happen
+# to differ. Anyone who followed a standard guide has `homeassistant` on both
+# and the same config path, and then nothing above notices.
+#
+# So this asks the reliable question instead. We may not know our own
+# hostname -- the integration sees the CONTAINER's -- but we know the peer's,
+# because the operator typed it. If this machine answers to the peer's name,
+# this is the wrong bundle, and no amount of the rest of the script is going
+# to be right.
+PEER_NAME="{peer_host}"
+if [[ -n "$PEER_NAME" ]]; then
+    THIS_HOST="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+    PEER_SHORT="${{PEER_NAME%%.*}}"
+    if [[ -n "$THIS_HOST" && "${{THIS_HOST,,}}" == "${{PEER_SHORT,,}}" ]]; then
+        fail "this bundle is for the PEER of '$PEER_NAME', and this machine
+    calls itself '$THIS_HOST'. You are installing the wrong node's bundle.
+
+    Each node has its own: regenerate on the other machine's Home Assistant,
+    or copy that node's bundle here. Nothing has been changed."
+    fi
+    ok "not the peer ('$PEER_NAME'), so this is the intended machine"
+fi
 
 if ! docker inspect {container} >/dev/null 2>&1; then
     fail "no container named {container} on this host.

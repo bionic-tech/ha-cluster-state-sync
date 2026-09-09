@@ -413,6 +413,13 @@ def test_this_version_has_a_release_note() -> None:
         ("ha_container_ip", '1.2.3.4"; nft flush ruleset; #'),
         ("node_id", "node-a\nmalicious line"),
         ("redis_tls_ca_certs", "/ca.pem|sh"),
+        # AR-0056: the five the first version of this guard missed, because
+        # they look like numbers and were not on a hand-written field list.
+        ("redis_port", "6379; touch /tmp/PWNED"),
+        ("redis_db", "2 || touch /tmp/PWNED"),
+        ("fileset_stale_after", "1800; touch /tmp/PWNED"),
+        ("iot_subnets", "10.0.0.0/8; touch /tmp/PWNED"),
+        ("ha_uid", "1000; touch /tmp/PWNED"),
     ],
 )
 def test_no_config_value_can_inject_into_root_run_shell(field: str, payload: str) -> None:
@@ -464,3 +471,185 @@ def test_the_guard_runs_before_any_artefact_is_rendered() -> None:
         f"validate_shell_safe must be the first statement in build_bundle; found "
         f"{first_statement!r}"
     )
+
+
+# --- AR-0050: the setup contract a refactor of async_setup_entry could break --
+
+
+#: Every slot `async_setup_entry` must leave in `entry.runtime_data`. The
+#: platforms and diagnostics read these by key; a setup path that skips one
+#: does not fail — it produces an entity reading a key that was never set,
+#: which is `unknown` on a dashboard and nothing in a log.
+REQUIRED_RUNTIME_SLOTS = (
+    "mirror",
+    "unsub",
+    "leadership",
+    "gate",
+    "fileset",
+    "statistics",
+    "degraded_marker",
+    "coordinator",
+    "cluster_view",
+    "stats",
+)
+
+
+async def test_setup_fills_every_runtime_slot_the_platforms_read(hass) -> None:
+    """🚨 Written for AR-0050's refactor, and it is the point of it.
+
+    `async_setup_entry` was 514 lines doing eleven unrelated jobs. Splitting it
+    is safe only if something checks that every slot still gets filled — and
+    the failure mode of missing one is silent: an entity reads `runtime[...]`,
+    gets nothing, and reports `unknown` for ever.
+
+    This asserts the contract rather than the shape, so the function can be
+    reorganised freely and this still catches a dropped assignment.
+    """
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    from tests.fakes import FakeBackend
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            "redis_host": "valkey.invalid",
+            "cluster_namespace": "testns",
+            "node_id": "node-a",
+            "cluster_secret": "s" * 44,
+            "snapshot_interval": 30,
+            "fileset_enabled": False,
+        },
+    )
+    entry.add_to_hass(hass)
+    with patch("custom_components.cluster_state_sync.RedisBackend", return_value=FakeBackend()):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    missing = [k for k in REQUIRED_RUNTIME_SLOTS if k not in entry.runtime_data]
+    assert not missing, (
+        f"async_setup_entry left these runtime slots unset: {missing}. Every one is "
+        "read by a platform or a diagnostic, and the symptom of a missing slot is an "
+        "entity stuck at `unknown` rather than an error."
+    )
+
+
+def test_the_optional_feature_setups_stay_in_their_agreed_order() -> None:
+    """Order is the one thing extraction can silently change.
+
+    The go-bag must be published before the statistics that ride on its key and
+    its secret, and the degraded alarm must be raised after both so it can
+    describe what the swap actually installed. Nothing else in the suite
+    notices if these swap places.
+    """
+    import inspect
+
+    from custom_components import cluster_state_sync
+
+    source = inspect.getsource(cluster_state_sync.async_setup_entry)
+    order = [
+        source.index("await _setup_recorder_snapshots"),
+        source.index("await _setup_fileset_replication"),
+        source.index("await _setup_statistics_replication"),
+        source.index("await _setup_degraded_alarm"),
+    ]
+    assert order == sorted(order), (
+        "the optional feature setups have been reordered; statistics rides on the "
+        "fileset's key and secret, and the degraded alarm describes what the swap did"
+    )
+    # And they must all still run before the platforms, which build entities
+    # from what they left behind.
+    assert order[-1] < source.index("async_forward_entry_setups")
+
+
+def test_the_shell_guard_is_default_deny_not_a_curated_list() -> None:
+    """🚨 AR-0056, and the reason it happened.
+
+    The first version of this guard validated a hand-written list of thirteen
+    fields, while its own docstring explained that a chokepoint beats a hunt
+    because "the next person to add a site will forget". Curating the FIELD
+    list is that same mistake one level up, and five fields were already
+    missing — `--redis v:6379; touch /tmp/PWNED` was generated, and it ran.
+
+    A config key invented tomorrow must be checked by **not** being mentioned.
+    """
+    unknown_key = "some_field_nobody_has_thought_of_yet"
+    with pytest.raises(bundle.UnsafeBundleValue):
+        bundle.build_bundle(_cfg(**{unknown_key: "x; touch /tmp/PWNED"}))
+
+
+def test_every_exception_to_the_shell_guard_carries_a_reason() -> None:
+    """An unexplained exemption is how a curated list rots.
+
+    Each entry must say why that field cannot be validated, so removing it
+    later is a decision rather than a guess.
+    """
+    for field, reason in bundle.SHELL_SAFE_EXCEPTIONS.items():
+        assert isinstance(reason, str) and len(reason) > 30, (
+            f"{field} is exempt from the shell guard with no real reason given"
+        )
+
+
+def test_the_cluster_secret_never_reaches_a_generated_artefact() -> None:
+    """It is exempt from the guard, so this is what makes that exemption safe.
+
+    The secret derives the fileset key; only the hex of that key ships. If it
+    ever started being interpolated somewhere, its exemption would silently
+    become an injection path.
+    """
+    marker = "SECRETMARKER" + "s" * 32
+    for name, body in bundle.build_bundle(_cfg(cluster_secret=marker)).items():
+        assert marker not in body, f"the raw cluster secret reached {name}"
+
+
+def test_a_hostile_looking_password_still_builds() -> None:
+    """Passwords legitimately contain $, quotes and spaces.
+
+    Validating this field would reject valid configurations; it is safe because
+    its single use wraps it in `shlex.quote` for a file the pull sources.
+    """
+    out = bundle.build_bundle(_cfg(redis_password='p@ss$w0rd"with`quotes;and spaces'))
+    assert "cluster-fileset-valkey.env" in out
+
+
+def test_glob_bearing_fields_still_build() -> None:
+    """`*.bak-*` is a legitimate exclusion and contains a metacharacter."""
+    out = bundle.build_bundle(
+        _cfg(
+            fileset_exclusions=("*.bak-*", "core.restore_state"),
+            fileset_extra_paths=("packages/",),
+            radio_watch="sensor.*_rssi_numeric",
+        )
+    )
+    assert "cluster-fileset-pull.sh" in out
+
+
+@pytest.mark.parametrize(
+    ("subnets", "should_build"),
+    [
+        ("192.168.145.0/24, 192.168.1.0/24", True),
+        ("10.0.0.0/8", True),
+        ("fd00::/8, 2001:db8::1", True),
+        ("10.0.0.0/8; touch /tmp/PWNED", False),
+        ("10.0.0.0/8$(id)", False),
+        # An nftables breakout rather than a shell one: this value lands inside
+        # a rule loaded as root, so closing the set early matters as much as a
+        # semicolon does.
+        ("10.0.0.0/8 }; drop; #", False),
+    ],
+)
+def test_subnets_are_validated_by_shape_not_by_metacharacter(
+    subnets: str, should_build: bool
+) -> None:
+    """A comma-separated list legitimately contains spaces.
+
+    Rejecting the space would refuse a valid firewall configuration; exempting
+    the field would leave nftables input unchecked. Neither is acceptable, so
+    the field's actual shape is validated — an allowlist of address
+    characters, which is stricter than the generic rule, not looser.
+    """
+    cfg = _cfg(topology_model="warm", peer_host="peer.lan", iot_subnets=subnets)
+    if should_build:
+        assert bundle.build_bundle(cfg)
+    else:
+        with pytest.raises(bundle.UnsafeBundleValue):
+            bundle.build_bundle(cfg)
