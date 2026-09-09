@@ -1046,3 +1046,39 @@ forward.
 **Rule:** a windowed payload must state **the floor it covers**, not just the rows it carries.
 The receiver compares that floor against its own newest row and says so when there is a hole.
 Without it, "nothing new" and "a year is missing" are the same observation.
+
+## 27. A blank panel that is nobody's bug, because an auth proxy answered instead
+
+The cluster panel went blank — a black page, no error visible. A panel had just
+been changed, so the change was the obvious suspect. It was not.
+
+Everything server-side was correct, and all of it was checked: the file parsed
+as an ES module, `customElements.define` was present with the right name, the
+integration still registered the panel, Home Assistant served it on
+`127.0.0.1:8123` as `200 text/javascript`, and the content hash in the module
+URL matched the deployed file exactly.
+
+**The request never reached Home Assistant.** An authenticating reverse proxy
+sits in front, and a request whose session it does not accept gets a `302` to a
+login page. The browser receives HTML where it asked for a module, so
+`customElements.define` never runs, the element is never defined, and Home
+Assistant renders an empty panel. On a dark theme that is a black page.
+
+It resolved on a hard reload.
+
+**Rule:** a blank panel has three distinct causes that look identical —
+a module that fails to parse, a module that never downloads, and **a module
+that downloads something that is not JavaScript**. Before suspecting the code:
+
+* Fetch the module **from inside the host**, bypassing the proxy. A `200
+  text/javascript` there and a blank page in the browser means the proxy or the
+  session, not the file.
+* Check the **status code and Content-Type the browser got**, not the one the
+  origin serves. A `302` to an HTML login page is the signature.
+* Remember the panel is a **subresource**. The SPA around it can be perfectly
+  authenticated while one module request is not — which is why the rest of Home
+  Assistant looks fine.
+
+Related: §24 is the same shape with a different cause (a cached stale module).
+The content hash fixed that one and cannot fix this one, because the URL is
+new — it is the *answer* that is wrong, not the request.

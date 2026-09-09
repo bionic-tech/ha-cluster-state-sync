@@ -57,7 +57,7 @@ simulation: the moment that client was stopped, the peer claimed every device vi
 | Failure | What releases the claims | Radios follow? |
 |---|---|---|
 | Host loss, power cut, kernel panic | the USB/IP **server reaps a dead client** (~17 s measured) | ✅ within the 45 s claim deadline |
-| Home Assistant dies, host alive | the node's **own demote path**, after the 600 s probe grace | ✅ **but only after ~10 minutes** |
+| Home Assistant dies, host alive | the node's **own demote path** | ✅ **~21 s measured** — see the 2026-09-09 addendum; the ~10-minute figure this row used to carry was wrong |
 | **Promoter dies, host and USB/IP client alive** | **nothing** | ❌ **the real gap** |
 
 **The genuine gap is narrow.** It needs the promoter itself to stop while the machine, and its
@@ -154,3 +154,54 @@ whose radios matter, and both are updated accordingly.
 - [ADR-001](./ADR-001-active-passive-topology.md) — the RTO budget this was measured against
 - [ADR-005](./ADR-005-generate-not-control.md) — why the promoter does not reach into the device server
 - `docs/GUIDE-radios.md` — the reader-facing version of §3
+
+
+---
+
+## Addendum, 2026-09-09 — the ~10-minute figure was wrong, and a drill proved it
+
+This ADR said an HA-only failure moves the radios "~10 minutes late", on the
+reasoning that the leader renews for the full 600 s probe grace before
+releasing. **A failover drill on the live pair measured 21 seconds.**
+
+**Why the original reasoning failed.** The probe grace is measured from the
+state file's mtime, and that file is written on a leadership **transition** —
+not on every tick. So the grace is a *post-promotion boot window*: it lets a
+node that has just promoted renew without probing while its Home Assistant
+starts. A node that promoted hours ago has no grace left, and a failed probe
+demotes it on the next tick.
+
+The code has always said so — `cluster_promoter.py`'s `--adopt` path carries a
+comment citing "a failover that took 12 seconds when the state file was old",
+against two minutes when `install.sh` had just run. The documentation was
+written from the constant's value rather than from where it is measured.
+
+### Measured, node-a → node-b, 2026-09-09
+
+| step | measured |
+|---|---:|
+| Home Assistant stopped on the leader | 06:08:00 |
+| Leader released the lease (probe failed, no grace remaining) | 06:08:01 |
+| Peer swapped in the go-bag | 06:08:05 |
+| Peer claimed the radios | 06:08:22 |
+| Peer serving HTTP 200 | ~06:09 |
+| **Fault → radios on the peer** | **21 s** |
+| Fail-back (peer's HA stopped → original leader MASTER) | **14 s** |
+
+### What this changes
+
+* An HA-only failure **does** meet the 2.5-minute budget, comfortably. The
+  README's "cannot, by design" claim is withdrawn.
+* The ~10-minute figure survives in exactly one case: Home Assistant failing
+  inside the grace window of that node's *own* recent promotion — which is the
+  case the grace exists to protect.
+* v0.4.0's change (600 s → 120 s base, extending only while the container is
+  demonstrably restarting) therefore affects **that window only**, not the
+  steady-state failover time. The v0.4.0 release note said otherwise and has
+  been corrected.
+
+### The lesson worth keeping
+
+The number was derived from a constant's value rather than from **where that
+constant is measured from**. Nobody had run the drill. One measurement replaced
+a figure that had been repeated across three documents for months.

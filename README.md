@@ -77,14 +77,14 @@ is reference — you do not need to read the README front to back.
 | **Work out whether my radios can fail over** | 🚨 [GUIDE-radios.md](docs/GUIDE-radios.md) — **read before buying hardware.** How a Zigbee or 433 MHz stick is attached decides whether it can move at all |
 | **Use the dashboard** | [GUIDE-dashboard.md](docs/GUIDE-dashboard.md) — every row and button, what the colours mean, and **when not to press each one** |
 | **Fix something that is broken** | [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — symptom-first, from real failures on a live cluster |
-| **Change the restore, the swap, or the bundle** | 🚨 [GOTCHAS.md](docs/GOTCHAS.md) **first** — 26 traps this project actually fell into, nearly all of which reported success while doing nothing |
+| **Change the restore, the swap, or the bundle** | 🚨 [GOTCHAS.md](docs/GOTCHAS.md) **first** — 27 traps this project actually fell into, nearly all of which reported success while doing nothing |
 | **Understand what it does at runtime** | [REFERENCE-behaviour.md](docs/REFERENCE-behaviour.md) — restore semantics, leadership, sizing, actions |
 | **Keep the mobile app working through a failover** | GUIDE-ingress.md — the cluster can promote in 15 seconds and still leave the app dead |
 | **Bring a standby up from cold** | [RUNBOOK-standby-bringup.md](docs/RUNBOOK-standby-bringup.md) |
 | **Know why it is built this way** | [the ADRs](docs/adr/README.md), with a suggested reading order |
 | **Work on the code** | CONTRIBUTING.md |
 | **Re-litigate a closed decision** | [DECISIONS-SETTLED.md](docs/DECISIONS-SETTLED.md) — check here first; several of these keep being rediscovered as blockers |
-| **See what changed** | v0.3.5 · v0.3.1 · v0.3.0 |
+| **See what changed** | v0.4.0 · v0.3.5 · v0.3.1 · v0.3.0 |
 
 ## What this is
 
@@ -518,19 +518,29 @@ variants are generated; the notify scripts then call a dispatcher with a single
 * Each flush writes the full tracked map rather than a delta. Fine for
   hundreds of entities; would need rethinking at tens of thousands.
 * HomeKit/Matter cryptographic identity is out of scope.
-* **Radios move late when Home Assistant alone dies.** Host loss releases them
-  in ~17s; an HA-only failure releases them via the node's own demote path,
-  which waits out the full 600s probe grace first — so ~10 minutes. A narrower
-  case (the *promoter* dies while the machine and its USB/IP client stay alive)
+* **Radios move on an HA-only failure too — and faster than this document
+  used to claim.** Host loss releases them in ~17s. An HA-only failure releases
+  them via the node's own demote path, which was described here as waiting out
+  the full 600s probe grace, so ~10 minutes. **Measured on the real pair
+  2026-09-09: 21 seconds.** The grace is anchored on the last *leadership
+  transition*, not on the failure, so an established leader has none left to
+  wait out. The ~10-minute figure applies only if Home Assistant fails within
+  the grace window of that node's own promotion. A narrower case (the
+  *promoter* dies while the machine and its USB/IP client stay alive) still
   releases nothing at all.
   [ADR-009](docs/adr/ADR-009-radio-custody-failure-modes.md).
 * **A directly-attached USB radio can never fail over**, by construction. Nor
   can a radio whose consumer is a separate container that does not itself fail
   over (deCONZ, Zigbee2MQTT). [GUIDE-radios.md](docs/GUIDE-radios.md).
-* **An HA-only failure cannot meet the 2.5-minute budget by design.** The leader
-  keeps renewing for the full 600s probe grace before releasing, so that path is
-  ~10.5 minutes. Deliberate — the grace exists to ride out restarts — but it is
-  a property of the design, not a bug to be fixed.
+* **An HA-only failure is fast, and this document said the opposite for
+  months.** It claimed the leader renews for the full 600s grace before
+  releasing, making that path ~10.5 minutes. That was wrong. The grace is
+  measured from the state file's mtime — written on a leadership *transition* —
+  so a node that promoted hours ago has no grace to wait out and demotes on the
+  first failed probe. **Measured 2026-09-09 on node-a/node-b: fault to
+  peer promoted, 21 seconds; fail-back, 14 seconds.** What the grace really
+  protects is a node whose Home Assistant is still booting *just after that node
+  promoted*, which is what it was written for.
 * 🚨 **If Valkey goes away, the cluster silently stops being able to fail
   over.** Both instances keep running and the house is unaffected — but no node
   can take or renew the lease, so a real failure afterwards has nothing to
