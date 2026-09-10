@@ -124,7 +124,7 @@ memory of its own last run. The shared snapshot is the cross-node channel.
 ## 3. Are we replicating every domain?
 
 **No, and deliberately not.** Here is what is actually on the live estate, from
-`core.restore_state` on node-a — i.e. the entities Home Assistant itself
+`core.restore_state` on the reference node — i.e. the entities Home Assistant itself
 remembers across a restart:
 
 | domain | entities | replicated? | why |
