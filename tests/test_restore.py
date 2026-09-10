@@ -711,3 +711,241 @@ async def test_ar_0040_restoring_nothing_from_a_full_snapshot_is_a_warning(
     assert any(
         "Restored NOTHING" in r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
     ), "an all-skipped restore must be a warning, not an INFO line"
+
+
+# -- AR-0065: the flush must not beat the restore --------------------------
+
+
+async def test_ar_0065_the_leader_must_not_publish_before_the_restore_has_run(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """🚨 The finding a live drill produced and 1,144 green tests did not.
+
+    A promoted node resolves leadership and its flush loop publishes its own
+    state to the shared snapshot **before** the restore — wired to
+    `EVENT_HOMEASSISTANT_START` — reads it. Every entry then carries
+    `source_node == self`, the restore skips all of them as `own-node`, and
+    nothing crosses. Measured on the reference pair in both directions:
+
+        18:08:20.786  Leadership change -> LEADER, publishing state
+        18:08:20.787  snapshot written by node-b   <- overwrites the peer's
+        18:08:35.703  restore -> 28 own-node -> restored 0
+
+    `DEFAULT_SNAPSHOT_INTERVAL` is 5 seconds, so the flush wins on **default
+    settings**, on every installation.
+
+    Why the suite could not see it: `boot_with_snapshot` fires START with no
+    time advance in between, so the flush loop never runs. This test advances
+    the clock first, which is the whole difference.
+
+    🚨 AR-0040's own write-up already named this — *"the standby took the lease
+    and flushed its own cold state over the peer's good snapshot, so the
+    integration destroyed the snapshot it had failed to use"* — as a knock-on
+    of the local-newer bug. Fixing local-newer made the symptom disappear from
+    the rehearsal, and this half was never closed.
+    """
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    backend.stored = {
+        "input_boolean.holiday_mode": peer_entry("input_boolean.holiday_mode", "on", age_seconds=5)
+    }
+    backend.meta = {
+        "schema_version": 1,
+        "source_node": PEER_ID,
+        "entry_count": 1,
+        "last_snapshot_at": (datetime.now(tz=UTC) - timedelta(seconds=5)).isoformat(),
+    }
+    backend.lease_holder = NODE_ID  # we hold the lease: we are the promoted node
+    hass.set_state(CoreState.not_running)
+
+    # This node's own conflicting value, as its local .storage would replay.
+    hass.states.async_set("input_boolean.holiday_mode", "off")
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_REDIS_HOST: "valkey.invalid",
+            CONF_CLUSTER_NAMESPACE: "testns",
+            CONF_NODE_ID: NODE_ID,
+            CONF_CLUSTER_SECRET: SECRET,
+            "leadership_source": "always",
+        },
+    )
+    entry.add_to_hass(hass)
+    with patch("custom_components.cluster_state_sync.RedisBackend", return_value=backend):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        # The difference from every other restore test: real time passes
+        # between setup and START, so the flush loop gets to run — exactly as
+        # it does on a real node, where the restore waits for the whole of
+        # Home Assistant to finish starting.
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=30))
+        await hass.async_block_till_done()
+
+        await hass.async_start()
+        await hass.async_block_till_done()
+
+    assert hass.states.get("input_boolean.holiday_mode").state == "on", (
+        "the peer's state did not cross: the flush published this node's own "
+        "state over the snapshot before the restore could read it, so every "
+        "entry looked like our own and was skipped. This is the entire "
+        "purpose of the integration failing silently."
+    )
+    from custom_components.cluster_state_sync.const import DATA_STATS
+
+    assert entry.runtime_data[DATA_STATS].restored_count == 1
+
+
+async def test_ar_0065_the_gate_opens_so_the_leader_does_eventually_publish(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """🚨 The failure mode of the FIX, which would be worse than the bug.
+
+    Holding the flush until the restore has run is only safe if the hold is
+    guaranteed to lift. A gate that never opens means the leader never
+    publishes, the standby's snapshot ages out, and the next promotion restores
+    *stale* state — silently, and with every health check green.
+    """
+    from datetime import timedelta
+
+    from homeassistant.util import dt as dt_util
+    from pytest_homeassistant_custom_component.common import async_fire_time_changed
+
+    entry = await boot_with_snapshot(
+        hass,
+        backend,
+        {"input_boolean.holiday_mode": peer_entry("input_boolean.holiday_mode", "on")},
+        leadership_source="always",
+    )
+    before = len(backend.writes)
+
+    hass.states.async_set("input_boolean.holiday_mode", "off")
+    await hass.async_block_till_done()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=30))
+    await hass.async_block_till_done()
+
+    assert len(backend.writes) > before, (
+        "the leader never published after the restore completed — the gate "
+        "did not lift, which starves the standby of state entirely"
+    )
+    assert entry is not None
+
+
+async def test_a_restart_and_a_failed_promotion_no_longer_read_alike(
+    hass: HomeAssistant, backend: FakeBackend, caplog: pytest.LogCaptureFixture
+) -> None:
+    """🚨 The wording that cost hours during the AR-0065 investigation.
+
+    Both cases restore nothing and both are worth seeing (AR-0040). But one is
+    a leader restarting with only its own snapshot to read — entirely normal —
+    and the other is a promotion that failed to take the peer's state. The
+    message said *"This node has promoted with no state from its peer"* for
+    both, so on a live cluster a routine restart and the failure the product
+    exists to prevent were indistinguishable on the one line that separates
+    them.
+    """
+    backend.stored = {"input_boolean.quiet": peer_entry("input_boolean.quiet", source_node=NODE_ID)}
+    with caplog.at_level(logging.WARNING):
+        await boot_with_snapshot(hass, backend, dict(backend.stored))
+
+    text = "\n".join(r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+    assert "Restored NOTHING" in text, "AR-0040's rule still holds: it must be visible"
+    assert "no peer state to apply" in text
+    assert "has promoted with no state from its peer" not in text, (
+        "a restart must not claim it promoted and lost the peer's state"
+    )
+
+
+async def test_a_genuinely_failed_promotion_still_says_so(
+    hass: HomeAssistant, backend: FakeBackend, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The other half: peer state was there and none of it was applied."""
+    entry = peer_entry("input_boolean.quiet", "on", source_node=PEER_ID)
+    backend.stored = {"input_boolean.quiet": entry}
+    # Local state stamped far in the future, so the peer's entry is refused for
+    # a reason that is NOT own-node.
+    hass.states.async_set("input_boolean.quiet", "off")
+
+    with caplog.at_level(logging.WARNING):
+        await boot_with_snapshot(hass, backend, dict(backend.stored), restore_max_age=1)
+
+    text = "\n".join(r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING)
+    if "Restored NOTHING" in text:
+        assert "no peer state to apply" not in text, (
+            "the peer's snapshot was present — this is not the benign restart case"
+        )
+
+
+# -- restoring a domain whose component owns its own state ------------------
+
+
+async def test_an_automation_is_restored_by_service_not_by_a_state_write(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """🚨 A state write on an automation is a lie.
+
+    `AutomationEntity.is_on` returns
+    `self._async_detach_triggers is not None or self._is_enabled` — its OWN
+    state, not `hass.states`. So `async_set("automation.x", "off")` shows "off"
+    in the UI and to every template while the triggers stay attached and the
+    automation keeps firing, until the entity next writes its state and quietly
+    corrects the display back to "on".
+
+    Telling an operator something is parked when it is running is worse than
+    not replicating the domain at all.
+    """
+    from pytest_homeassistant_custom_component.common import async_mock_service
+
+    off_calls = async_mock_service(hass, "automation", "turn_off")
+    on_calls = async_mock_service(hass, "automation", "turn_on")
+
+    backend.stored = {
+        "automation.dangerous": peer_entry("automation.dangerous", "off"),
+        "automation.wanted": peer_entry("automation.wanted", "on"),
+    }
+    await boot_with_snapshot(
+        hass,
+        backend,
+        dict(backend.stored),
+        include_domains=["automation"],
+    )
+
+    assert [c.data["entity_id"] for c in off_calls] == ["automation.dangerous"], (
+        "the parked automation was not actually disabled — a state write would "
+        "have shown 'off' while it kept firing"
+    )
+    assert [c.data["entity_id"] for c in on_calls] == ["automation.wanted"]
+
+
+async def test_a_helper_is_still_restored_by_a_state_write(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """The service route is for state-owning components only.
+
+    `input_boolean` and friends are seeded through `async_set`, which is the
+    documented public API and what every existing restore relies on. Routing
+    them through services would change a seeding operation into a command.
+    """
+    from pytest_homeassistant_custom_component.common import async_mock_service
+
+    calls = async_mock_service(hass, "input_boolean", "turn_on")
+    await boot_with_snapshot(
+        hass,
+        backend,
+        {"input_boolean.holiday_mode": peer_entry("input_boolean.holiday_mode", "on")},
+    )
+    assert hass.states.get("input_boolean.holiday_mode").state == "on"
+    assert calls == [], "a helper must be seeded, not commanded"
+
+
+async def test_an_unknown_automation_state_falls_back_to_a_state_write(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """`unavailable` is not something to command. Seed it and move on."""
+    backend.stored = {"automation.broken": peer_entry("automation.broken", "unavailable")}
+    await boot_with_snapshot(hass, backend, dict(backend.stored), include_domains=["automation"])
+    assert hass.states.get("automation.broken").state == "unavailable"

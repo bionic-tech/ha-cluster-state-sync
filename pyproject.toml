@@ -43,6 +43,18 @@ branch = true
 # Raise it when it is comfortably exceeded; never lower it to make a red build
 # green.
 fail_under = 92
+# 🚨 Without this the floor above is a different number than it looks.
+#
+# coverage.py rounds the total to `precision` digits BEFORE comparing it to
+# `fail_under`, and the default precision is 0 — so `fail_under = 92` really
+# enforced 91.5, and pytest-cov printed "FAIL Required test coverage of 92.0%
+# not reached. Total coverage: 91.89%" while exiting 0 and letting `./check`
+# report all gates passed. A gate that prints FAIL and passes is worse than no
+# gate: it is a gate you stop reading.
+#
+# Found 2026-09-09 when two consecutive runs of the same tree straddled the
+# boundary and disagreed about whether the build was green.
+precision = 2
 show_missing = true
 skip_covered = true
 exclude_lines = [

@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import timedelta
 from unittest.mock import patch
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.util import dt as dt_util
 import pytest
 from pytest_homeassistant_custom_component.common import (
@@ -64,6 +64,18 @@ async def setup_integration(
         },
     )
     entry.add_to_hass(hass)
+    # 🚨 Pin the core state, or the AR-0065 restore gate makes these tests
+    # order-dependent.
+    #
+    # The gate holds the flush until the boot restore has run. Setting up while
+    # `hass` is RUNNING is the "added to a live instance" path, where no restore
+    # is coming and the gate opens at once; setting up while it is starting
+    # leaves the flush held until EVENT_HOMEASSISTANT_START. These tests are
+    # about leadership, not about boot, so they want the former — and left to
+    # whatever core state the previous test happened to leave behind, they got
+    # whichever. Observed as `assert writes_while_leader` failing on one
+    # ordering and passing on every other.
+    hass.set_state(CoreState.running)
     with patch("custom_components.cluster_state_sync.RedisBackend", return_value=backend):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()

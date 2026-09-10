@@ -29,6 +29,8 @@ const FRESH = 900; // seconds; above this an age is worth a second look
  */
 const METRICS = [
   "unreplicated_config_references",
+  "replication_exclusions",
+  "replicated_domains",
   "shared_snapshot_age",
   "last_snapshot_age",
   "entities_restored",
@@ -225,6 +227,108 @@ class ClusterStatusPanel extends HTMLElement {
       </button></div>`;
   }
 
+  /* Replication scope — admin only.
+   *
+   * Not a control surface. Editing lives in the options flow, which validates
+   * input, writes the config entry and reloads the integration; a second way
+   * to write the same settings would be a second source of truth and a second
+   * thing to keep correct. This shows the answer and links to the one place
+   * that changes it.
+   *
+   * Admin-gated because it enumerates entity and device ids, which is a map of
+   * the house. Everything above is a health reading; this is configuration. */
+  _replicationCard(nodes) {
+    const user = this._hass.user;
+    if (!user || !user.is_admin) return "";
+
+    const names = Object.keys(nodes).sort();
+    const withScope = names.filter((n) => nodes[n].replicated_domains);
+    if (!withScope.length) return "";
+
+    /* 🚨 Two nodes that disagree about what crosses is a failover gap nothing
+     * else reports. The leader publishes what ITS config says; the standby
+     * restores what ITS config allows. Domains the standby has dropped are
+     * simply not restored on promotion, and every health check on both nodes
+     * stays green. */
+    const sig = (n) =>
+      JSON.stringify((nodes[n].replicated_domains.attributes.replicated_domains || []).slice().sort());
+    const disagree = withScope.length > 1 && new Set(withScope.map(sig)).size > 1;
+
+    const primary = nodes[withScope[0]];
+    const a = primary.replicated_domains.attributes || {};
+    const x = (primary.replication_exclusions && primary.replication_exclusions.attributes) || {};
+
+    const chips = (list, cls) =>
+      (list || []).length
+        ? `<div class="chips">${list
+            .map((d) => `<span class="chip ${cls}">${this._esc(d)}</span>`)
+            .join("")}</div>`
+        : `<div class="none">none</div>`;
+
+    const devices = (x.excluded_devices || []).length
+      ? `<ul class="ids">${x.excluded_devices
+          .map((d) => {
+            const label = d.name || d.id;
+            return `<li>${this._esc(label)}${
+              d.present ? "" : ' <span class="tag hold">device gone</span>'
+            }</li>`;
+          })
+          .join("")}</ul>`
+      : `<div class="none">none</div>`;
+
+    const ids = (list) =>
+      (list || []).length
+        ? `<ul class="ids">${list.map((i) => `<li>${this._esc(i)}</li>`).join("")}</ul>`
+        : `<div class="none">none</div>`;
+
+    return `
+      <div class="card scope">
+        <h2>Replication scope
+          <a class="edit" href="/config/integrations/integration/cluster_state_sync"
+             title="Settings, Devices &amp; services, Cluster State Sync, Configure, Replication">edit &rarr;</a>
+        </h2>
+        ${
+          disagree
+            ? `<p class="warn-banner">The nodes disagree about which domains cross.
+               Whatever the standby has dropped will simply not be restored when it takes
+               over, and nothing else reports this.</p>`
+            : ""
+        }
+        <p class="hint">Applies to live entity <b>values</b>. Entity and device
+          <i>settings</i> — enabled, hidden, area, renames — live in
+          <code>.storage</code> and are replicated in full by the fileset regardless.</p>
+        <div class="grid">
+          <section>
+            <h3>Crossing (${(a.replicated_domains || []).length} domains)</h3>
+            ${chips(a.replicated_domains, "yes")}
+            <h3>Also these entities</h3>
+            ${ids(a.also_replicated_entities)}
+          </section>
+          <section>
+            <h3>Not crossing (${(a.not_replicated_domains || []).length} domains you run)</h3>
+            ${chips(a.not_replicated_domains, "no")}
+          </section>
+          <section>
+            <h3>Never crossing</h3>
+            ${ids(x.excluded_entities)}
+            <h3>Excluded devices${
+              (x.entities_excluded_by_device || []).length
+                ? ` (${this._esc(x.entities_excluded_by_device.length)} entities)`
+                : ""
+            }</h3>
+            ${devices}
+            ${
+              x.leadership_entity_refused
+                ? `<h3>Always refused</h3><ul class="ids"><li>${this._esc(
+                    x.leadership_entity_refused
+                  )} <span class="tag">leadership signal</span></li></ul>`
+                : ""
+            }
+          </section>
+        </div>
+      </div>`;
+  }
+
   _render() {
     if (!this._hass) return;
     const nodes = this._byNode();
@@ -236,10 +340,32 @@ class ClusterStatusPanel extends HTMLElement {
             const e = nodes[node];
             const leader = e.is_leader && e.is_leader.state === "on";
             const held = e.maintenance_hold && e.maintenance_hold.state === "on";
+            /* 🚨 AR-0055. The heading must come from the entity's ATTRIBUTE, not
+             * from its id.
+             *
+             * Entity ids live in `core.entity_registry`, which the go-bag
+             * replicates wholesale -- so a node promoted from the peer inherits
+             * the peer's ids and every one of them reads
+             * `cluster_sync_<the OTHER node>_...`. The heading then names the
+             * machine that is NOT running, next to a LEADER tag that is
+             * correct, at exactly the moment somebody is trying to work out
+             * where their house went.
+             *
+             * `binary_sensor...is_leader` carries `node_id` as an attribute and
+             * it is computed locally, so it is right on both nodes. The id is
+             * kept as the fallback for the follower, whose is_leader sensor
+             * exists but whose attribute may not have been read yet. */
+            const realNode =
+              (e.is_leader && e.is_leader.attributes && e.is_leader.attributes.node_id) || node;
+            const renamed = realNode !== node;
             return `
       <div class="card ${leader ? "leader" : ""}">
-        <h2>${this._esc(node)}${leader ? ' <span class="tag">LEADER</span>' : ""}${
+        <h2>${this._esc(realNode)}${leader ? ' <span class="tag">LEADER</span>' : ""}${
               held ? ' <span class="tag hold">HOLD</span>' : ""
+            }${
+              renamed
+                ? ` <span class="tag stale" title="Entity ids came from the peer's replicated registry (AR-0055)">ids say ${this._esc(node)}</span>`
+                : ""
             }</h2>
         <div class="grid">
           <section>
@@ -283,6 +409,8 @@ class ClusterStatusPanel extends HTMLElement {
          <p>This panel discovers entities named <code>cluster_sync_&lt;node&gt;_…</code>.
          If the integration has only just been added, give it one refresh cycle.</p></div>`;
 
+    const scopeCard = this._replicationCard(nodes);
+
     this.innerHTML = `
       <style>
         :host { display:block; }
@@ -325,9 +453,32 @@ class ClusterStatusPanel extends HTMLElement {
                     border:1px solid var(--divider-color,#ccc); }
         .legend i.c { border-color:var(--warning-color,#e8a); color:var(--warning-color,#e8a); }
         .legend i.d { border-color:var(--error-color,#d33); color:var(--error-color,#d33); }
+        .tag.stale { border-color:var(--secondary-text-color); opacity:.7;
+                     font-weight:normal; }
+        .scope h2 .edit { float:right; font-size:13px; font-weight:normal;
+                          text-decoration:none; color:var(--primary-color,#03a9f4); }
+        .scope .hint { font-size:12px; color:var(--secondary-text-color);
+                       margin:0 0 12px; line-height:1.5; }
+        .scope .warn-banner { font-size:13px; line-height:1.5; margin:0 0 12px;
+                              padding:8px 10px; border-radius:6px;
+                              border:1px solid var(--error-color,#d33);
+                              color:var(--error-color,#d33); }
+        .chips { display:flex; flex-wrap:wrap; gap:4px; margin:0 0 12px; }
+        .chip { font-size:12px; padding:2px 8px; border-radius:10px;
+                font-family:var(--code-font-family, monospace);
+                border:1px solid var(--divider-color,#ccc); }
+        .chip.yes { border-color:var(--success-color,#4caf50);
+                    color:var(--success-color,#4caf50); }
+        .chip.no  { opacity:.55; }
+        .ids { margin:0 0 12px; padding-left:18px; font-size:12px;
+               font-family:var(--code-font-family, monospace); line-height:1.7;
+               max-height:190px; overflow-y:auto; }
+        .none { font-size:12px; color:var(--secondary-text-color);
+                margin:0 0 12px; font-style:italic; }
       </style>
       <div class="wrap">
         ${body}
+        ${scopeCard}
         ${this._actionsCard(nodes)}
         <div class="card note">
           <b>Reading this page.</b>

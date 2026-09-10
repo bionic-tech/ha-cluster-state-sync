@@ -74,6 +74,44 @@ from typing import Any
 #: host, where the package is not importable.
 DOMAIN = "cluster_state_sync"
 
+#: Settings that describe THE CLUSTER, not this machine, and are therefore
+#: inherited from the go-bag rather than preserved locally.
+#:
+#: 🚨 AR-0066. "Preserve the whole entry" was a deliberate decision, argued in
+#: this module's docstring, and its stated cost was "config drift rather than a
+#: correctness failure, and in the safe direction". A live re-drill on
+#: 2026-09-09 showed the second half of that is false.
+#:
+#: The alerting configured on the leader never reached the standby, so the
+#: promotion **to** the standby sent nothing while the failback **to** the
+#: leader pushed normally. Two moves, one notification, and it was the wrong
+#: one: the alert announced the house coming home and stayed silent when it
+#: left. The failover worth being told about is precisely the one where the
+#: unconfigured node is the one now running.
+#:
+#: So this is an ALLOWLIST and nothing else changes. A per-node setting added
+#: in a year is still preserved by default and still cannot reintroduce the
+#: split brain this module exists to prevent — the property the original
+#: decision was protecting is kept, and only these named fields cross.
+#:
+#: Nothing here can affect leadership, identity or any host path. They are the
+#: operator's answers to "what should this cluster do", which must be the same
+#: on both halves or the pair is not one cluster.
+CLUSTER_WIDE_FIELDS: frozenset[str] = frozenset(
+    {
+        # Who gets told, and about what (v0.4.2).
+        "notify_conditions",
+        "notify_services",
+        # What crosses. A standby that replicates a different set restores a
+        # different house -- and v0.4.2's panel card warns about exactly this
+        # disagreement, which until now the design guaranteed.
+        "include_domains",
+        "include_entities",
+        "exclude_entities",
+        "exclude_devices",
+    }
+)
+
 #: The Home Assistant store this operates on.
 ENTRIES_FILENAME = "core.config_entries"
 
@@ -211,10 +249,40 @@ def graft_entries(
         inherited_id = incoming[index].get("entry_id") if index < len(incoming) else None
         if inherited_id:
             entry["entry_id"] = inherited_id
+        if index < len(incoming):
+            entry = _inherit_cluster_wide(entry, incoming[index])
         rehomed.append(entry)
     grafted = dict(payload)
     grafted["data"] = {**payload["data"], "entries": kept + rehomed}
     return grafted
+
+
+def _inherit_cluster_wide(mine: dict[str, Any], theirs: dict[str, Any]) -> dict[str, Any]:
+    """Take the cluster-wide answers from the go-bag; keep everything else local.
+
+    AR-0066. Default-deny: a field absent from `CLUSTER_WIDE_FIELDS` is not
+    considered, so a per-node setting added later is preserved without anyone
+    having to remember this function exists. That is the property the original
+    "preserve the whole entry" rule was protecting, and it is kept.
+
+    Inherited values are written to `options`, because the integration reads
+    `{**entry.data, **entry.options}` and `options` therefore wins however the
+    local entry happened to store the field.
+
+    A field the leader does not carry is left alone rather than cleared: an
+    unconfigured leader must not wipe a standby's settings, which would turn
+    one node's missing configuration into two.
+    """
+    entry = dict(mine)
+    options = dict(entry.get("options") or {})
+    for key in CLUSTER_WIDE_FIELDS:
+        for source in ("options", "data"):
+            block = theirs.get(source) or {}
+            if key in block:
+                options[key] = block[key]
+                break
+    entry["options"] = options
+    return entry
 
 
 def _write_private(path: Path, payload: object) -> None:

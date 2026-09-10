@@ -19,6 +19,10 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import instance_id
 from homeassistant.helpers.selector import (
+    DeviceSelector,
+    DeviceSelectorConfig,
+    EntitySelector,
+    EntitySelectorConfig,
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
@@ -44,6 +48,8 @@ from .const import (
     CONF_COMPOSE_PROFILE,
     CONF_COMPOSE_SERVICE,
     CONF_DOCKER_NETWORK,
+    CONF_EXCLUDE_DEVICES,
+    CONF_EXCLUDE_ENTITIES,
     CONF_FILESET_ENABLED,
     CONF_FILESET_EXCLUSIONS,
     CONF_FILESET_EXTRA_CUSTOM,
@@ -62,10 +68,14 @@ from .const import (
     CONF_HISTORY_MATTERS,
     CONF_INCLUDE_DOMAINS,
     CONF_INCLUDE_ENTITIES,
+    CONF_INGRESS_URL,
+    CONF_INGRESS_VERIFY_TLS,
     CONF_IOT_SUBNETS,
     CONF_LEADERSHIP_ENTITY,
     CONF_LEADERSHIP_SOURCE,
     CONF_NODE_ID,
+    CONF_NOTIFY_CONDITIONS,
+    CONF_NOTIFY_SERVICES,
     CONF_RADIO_WATCH,
     CONF_REDIS_DB,
     CONF_REDIS_HOST,
@@ -96,7 +106,11 @@ from .const import (
     DEFAULT_HA_CONFIG_PATH,
     DEFAULT_HA_START_MODE,
     DEFAULT_INCLUDE_DOMAINS,
+    DEFAULT_INGRESS_URL,
+    DEFAULT_INGRESS_VERIFY_TLS,
     DEFAULT_LEADERSHIP_SOURCE,
+    DEFAULT_NOTIFY_CONDITIONS,
+    DEFAULT_NOTIFY_SERVICES,
     DEFAULT_REDIS_DB,
     DEFAULT_REDIS_PORT,
     DEFAULT_RESTORE_MAX_AGE,
@@ -116,6 +130,7 @@ from .const import (
     MAX_STATISTICS_WINDOW_DAYS,
     MIN_STATISTICS_INTERVAL_MINUTES,
     MIN_STATISTICS_WINDOW_DAYS,
+    NOTIFY_CONDITIONS,
     RECORDER_DOCS_URL,
     TOPOLOGY_COLD,
     TOPOLOGY_MODELS,
@@ -124,6 +139,7 @@ from .const import (
 )
 from .fileset import REPLICATED_DIRS, REPLICATED_FILES, is_excluded
 from .includes import scan as scan_includes
+from .ingress import InvalidIngressURL, validate_ingress_url
 from .util import parse_sentinel_hosts
 
 _LOGGER = logging.getLogger(__name__)
@@ -835,6 +851,122 @@ def _fileset_schema(d: dict[str, Any], candidates: list[str] | None = None) -> v
     )
 
 
+def _alerts_schema(d: dict[str, Any], hass: HomeAssistant) -> vol.Schema:
+    """Who gets told, and about what.
+
+    Both fields may be left exactly as they are. The defaults push the four
+    conditions that change whether the house is protected right now, through
+    the persistent notification every admin already sees -- so a wizard the
+    operator clicks straight past still produces something that reaches a
+    person. That is the point of the step: opting IN to a channel, not opting
+    out of silence.
+
+    Services are offered from what Home Assistant has actually loaded, and are
+    free text as well: the notify service for a phone that has not yet paired
+    does not exist at wizard time, and refusing to accept its name would send
+    the operator back here later for no reason.
+    """
+    loaded = hass.services.async_services().get("notify", {})
+    available = sorted(f"notify.{name}" for name in loaded)
+    chosen = list(d.get(CONF_NOTIFY_SERVICES) or DEFAULT_NOTIFY_SERVICES)
+    return vol.Schema(
+        {
+            vol.Required(
+                CONF_NOTIFY_CONDITIONS,
+                default=list(d.get(CONF_NOTIFY_CONDITIONS) or DEFAULT_NOTIFY_CONDITIONS),
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=list(NOTIFY_CONDITIONS),
+                    multiple=True,
+                    mode=SelectSelectorMode.LIST,
+                    translation_key="notify_conditions",
+                )
+            ),
+            vol.Optional(CONF_NOTIFY_SERVICES, default=chosen): SelectSelector(
+                SelectSelectorConfig(
+                    # Sorted union, so a service configured earlier survives a
+                    # revisit made while its integration happens to be down.
+                    options=sorted(set(available) | set(chosen)),
+                    multiple=True,
+                    custom_value=True,
+                    mode=SelectSelectorMode.DROPDOWN,
+                )
+            ),
+        }
+    )
+
+
+def _ingress_schema(d: dict[str, Any]) -> vol.Schema:
+    """Where your front door is, so the cluster can check somebody can still get in.
+
+    Two fields and both optional. Leaving the address empty is the default and
+    switches the whole check off -- no entity, no request, no alert -- because
+    a probe of an address nobody supplied would be a green tick for a check
+    that never ran.
+
+    The TLS toggle is here rather than assumed because a great many homes
+    terminate TLS on a certificate this container has no reason to trust, and
+    against those a verifying probe is red for ever. An operator whose only
+    escape from a permanently-red entity is to turn the feature off loses the
+    real alarm along with the false one.
+    """
+    return vol.Schema(
+        {
+            vol.Optional(
+                CONF_INGRESS_URL,
+                default=d.get(CONF_INGRESS_URL, DEFAULT_INGRESS_URL),
+                # Plain text, and a URL selector is deliberately not used: some
+                # frontend URL widgets refuse anything without a scheme and
+                # others quietly add one, and both behaviours would obscure the
+                # explicit validation this step performs and explains.
+            ): str,
+            vol.Required(
+                CONF_INGRESS_VERIFY_TLS,
+                default=d.get(CONF_INGRESS_VERIFY_TLS, DEFAULT_INGRESS_VERIFY_TLS),
+            ): bool,
+        }
+    )
+
+
+def _replication_schema(d: dict[str, Any], hass: HomeAssistant) -> vol.Schema:
+    """Everything that decides whether an entity's VALUE crosses.
+
+    Four fields, in the order the filter applies them, because an operator
+    reading this page is reasoning about precedence whether they know it or
+    not: an exclusion always beats an inclusion, and a device exclusion is
+    shorthand for excluding every entity that device exposes.
+
+    Deliberately not on this page: the fileset. `.storage` crosses wholesale,
+    so an entity's *settings* -- enabled, hidden, area, name -- replicate even
+    when its value does not. Putting the two on one form would suggest they are
+    one switch.
+    """
+    return vol.Schema(
+        {
+            vol.Optional(
+                CONF_INCLUDE_DOMAINS,
+                default=list(d.get(CONF_INCLUDE_DOMAINS) or DEFAULT_INCLUDE_DOMAINS),
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=_domain_options(hass),
+                    multiple=True,
+                    mode=SelectSelectorMode.DROPDOWN,
+                    custom_value=True,
+                )
+            ),
+            vol.Optional(
+                CONF_INCLUDE_ENTITIES, default=list(d.get(CONF_INCLUDE_ENTITIES) or [])
+            ): EntitySelector(EntitySelectorConfig(multiple=True)),
+            vol.Optional(
+                CONF_EXCLUDE_ENTITIES, default=list(d.get(CONF_EXCLUDE_ENTITIES) or [])
+            ): EntitySelector(EntitySelectorConfig(multiple=True)),
+            vol.Optional(
+                CONF_EXCLUDE_DEVICES, default=list(d.get(CONF_EXCLUDE_DEVICES) or [])
+            ): DeviceSelector(DeviceSelectorConfig(multiple=True)),
+        }
+    )
+
+
 class ClusterStateSyncConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle the initial UI setup."""
 
@@ -1070,11 +1202,30 @@ class ClusterStateSyncConfigFlow(ConfigFlow, domain=DOMAIN):
         """
         if user_input is not None:
             self._data.update(user_input)
-            return await self.async_step_container()
+            return await self.async_step_alerts()
 
         return self.async_show_form(
             step_id="domains",
             data_schema=_domains_schema(self._data, self.hass),
+        )
+
+    # -- wizard step 4a-bis: who hears about it (v0.4.2) ------------------
+
+    async def async_step_alerts(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Reaching the person who is not looking at Home Assistant.
+
+        Skippable in the sense that matters: submitting it untouched is a
+        complete, sensible configuration. Nothing here is required, and nothing
+        here can fail -- an unreachable notify service costs an alert and is
+        logged, never a setup.
+        """
+        if user_input is not None:
+            self._data.update(user_input)
+            return await self.async_step_container()
+
+        return self.async_show_form(
+            step_id="alerts",
+            data_schema=_alerts_schema(self._data, self.hass),
         )
 
     # -- wizard step 4b: how Home Assistant is started -------------------
@@ -1232,12 +1383,86 @@ class ClusterStateSyncOptionsFlow(OptionsFlow):
         self.entry = entry
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Which set of tunables to edit.
+
+        A menu rather than one long form, because the two have nothing to do
+        with each other: one is where Valkey lives, the other is who gets woken
+        up. Reading past six connection fields to change a phone number is how
+        an operator ends up editing the wrong one.
+        """
+        return self.async_show_menu(
+            step_id="init", menu_options=["replication", "alerts", "ingress", "connection"]
+        )
+
+    async def async_step_connection(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            return self._save(user_input)
         merged = {**self.entry.data, **self.entry.options}
         use_sentinel = merged.get(CONF_REDIS_USE_SENTINEL, False)
         schema = _sentinel_schema(merged) if use_sentinel else _direct_schema(merged)
-        return self.async_show_form(step_id="init", data_schema=schema)
+        return self.async_show_form(step_id="connection", data_schema=schema)
+
+    async def async_step_replication(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Change what crosses, without re-walking the whole wizard.
+
+        Reachable before only through Reconfigure, which re-walks eleven steps
+        to change one list -- and `exclude_entities` was reachable through
+        nothing at all: honoured by the filter, offered by no screen, settable
+        only by hand-editing the config entry.
+        """
+        if user_input is not None:
+            return self._save(user_input)
+        merged = {**self.entry.data, **self.entry.options}
+        return self.async_show_form(
+            step_id="replication", data_schema=_replication_schema(merged, self.hass)
+        )
+
+    async def async_step_alerts(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Retune who hears about what, without re-running the wizard.
+
+        This is the option most likely to be changed long after installation --
+        a new phone, a Discord channel that moved, a statistics alert that
+        turned out to matter after all -- and the one an operator would
+        otherwise have to delete the entry to reach.
+        """
+        if user_input is not None:
+            return self._save(user_input)
+        merged = {**self.entry.data, **self.entry.options}
+        return self.async_show_form(step_id="alerts", data_schema=_alerts_schema(merged, self.hass))
+
+    async def async_step_ingress(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """AR-0060. The check that asks whether anyone can still get in.
+
+        Validated here, on the page where it was typed, rather than accepted
+        and refused later at setup. A URL this integration cannot fetch is not
+        a small mistake -- it silently produces no entity and no alert, so the
+        operator is left believing they configured a front-door check and the
+        cluster is left with the same blind spot AR-0060 was raised for.
+        """
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                validate_ingress_url(user_input.get(CONF_INGRESS_URL))
+            except InvalidIngressURL as err:
+                _LOGGER.debug("Rejected ingress URL: %s", err)
+                errors[CONF_INGRESS_URL] = "invalid_ingress_url"
+            else:
+                return self._save(user_input)
+        merged = {**self.entry.data, **self.entry.options, **(user_input or {})}
+        return self.async_show_form(
+            step_id="ingress", data_schema=_ingress_schema(merged), errors=errors
+        )
+
+    def _save(self, user_input: dict[str, Any]) -> FlowResult:
+        """Merge into the existing options rather than replacing them.
+
+        🚨 `async_create_entry` replaces the options wholesale. With one section
+        that was harmless; with two, saving the alerting page would silently
+        discard every connection override the operator had made -- and the
+        entry would keep working, on the values in `entry.data`, until a
+        restart moved Valkey back to an address that no longer serves it.
+        """
+        return self.async_create_entry(title="", data={**self.entry.options, **user_input})
 
 
 async def _test_backend(data: dict[str, Any]) -> None:

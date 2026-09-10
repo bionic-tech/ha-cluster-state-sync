@@ -48,6 +48,7 @@ REQUIRED_API: dict[str, tuple[str, ...]] = {
     "homeassistant.helpers.entity": ("EntityCategory",),
     "homeassistant.helpers.event": ("async_track_time_interval",),
     "homeassistant.helpers.issue_registry": ("async_create_issue", "async_delete_issue"),
+    "homeassistant.components.persistent_notification": ("async_create", "async_dismiss"),
     "homeassistant.components.button": ("ButtonEntity",),
     "homeassistant.components.switch": ("SwitchEntity",),
     "homeassistant.components.http": ("StaticPathConfig",),

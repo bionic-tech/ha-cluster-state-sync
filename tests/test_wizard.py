@@ -136,6 +136,10 @@ async def reach_topology_step(hass: HomeAssistant, **backend_overrides: object) 
 
 DOMAINS_INPUT: dict[str, object] = {"include_domains": [], "include_entities": []}
 CONTAINER_INPUT: dict[str, object] = {"ha_start_mode": "docker"}
+ALERTS_INPUT: dict[str, object] = {"notify_conditions": [], "notify_services": []}
+"""v0.4.2. Deliberately empty: the step is optional and this walks the path of
+an operator who clicks straight past it, which must still produce a working
+entry -- the persistent notification needs no configuration at all."""
 """`docker start`, the default: most installs never touch compose mode."""
 """Empty on purpose: `async_setup_entry` falls back to DEFAULT_INCLUDE_DOMAINS,
 so this walks the path an operator takes when they accept the defaults."""
@@ -156,6 +160,8 @@ async def reach_fileset_step(hass: HomeAssistant, model: str, **backend_override
         result = await hass.config_entries.flow.async_configure(flow_id, WARM_INPUT)
     assert result["step_id"] == "domains", "both routes pass through the domains step"
     result = await hass.config_entries.flow.async_configure(flow_id, DOMAINS_INPUT)
+    assert result["step_id"] == "alerts", "the alerting step sits between domains and container"
+    result = await hass.config_entries.flow.async_configure(flow_id, ALERTS_INPUT)
     assert result["step_id"] == "container"
     result = await hass.config_entries.flow.async_configure(flow_id, CONTAINER_INPUT)
     assert result["step_id"] == "fileset", result
@@ -306,6 +312,8 @@ async def test_cold_flow_writes_a_bundle_and_creates_the_entry(
     result = await hass.config_entries.flow.async_configure(flow_id, topology_input(TOPOLOGY_COLD))
     assert result["step_id"] == "domains"
     result = await hass.config_entries.flow.async_configure(flow_id, DOMAINS_INPUT)
+    assert result["step_id"] == "alerts"
+    result = await hass.config_entries.flow.async_configure(flow_id, ALERTS_INPUT)
     assert result["step_id"] == "container"
     result = await hass.config_entries.flow.async_configure(flow_id, CONTAINER_INPUT)
     assert result["step_id"] == "fileset"
@@ -333,6 +341,8 @@ async def test_warm_flow_writes_the_firewall_variants(hass: HomeAssistant) -> No
     result = await hass.config_entries.flow.async_configure(flow_id, WARM_INPUT)
     assert result["step_id"] == "domains"
     result = await hass.config_entries.flow.async_configure(flow_id, DOMAINS_INPUT)
+    assert result["step_id"] == "alerts"
+    result = await hass.config_entries.flow.async_configure(flow_id, ALERTS_INPUT)
     assert result["step_id"] == "container"
     result = await hass.config_entries.flow.async_configure(flow_id, CONTAINER_INPUT)
     assert result["step_id"] == "fileset"
@@ -362,6 +372,7 @@ async def test_generated_scripts_are_executable(hass: HomeAssistant) -> None:
     flow_id = await reach_topology_step(hass)
     await hass.config_entries.flow.async_configure(flow_id, topology_input(TOPOLOGY_COLD))
     await hass.config_entries.flow.async_configure(flow_id, DOMAINS_INPUT)
+    await hass.config_entries.flow.async_configure(flow_id, ALERTS_INPUT)
     await hass.config_entries.flow.async_configure(flow_id, CONTAINER_INPUT)
     await hass.config_entries.flow.async_configure(flow_id, fileset_input())
     with patch("custom_components.cluster_state_sync.RedisBackend") as backend_cls:
@@ -380,6 +391,7 @@ async def test_bundle_step_tells_the_operator_where_the_files_are(
     flow_id = await reach_topology_step(hass)
     await hass.config_entries.flow.async_configure(flow_id, topology_input(TOPOLOGY_COLD))
     await hass.config_entries.flow.async_configure(flow_id, DOMAINS_INPUT)
+    await hass.config_entries.flow.async_configure(flow_id, ALERTS_INPUT)
     await hass.config_entries.flow.async_configure(flow_id, CONTAINER_INPUT)
     result = await hass.config_entries.flow.async_configure(flow_id, fileset_input())
 
@@ -393,6 +405,7 @@ async def test_topology_choice_is_persisted_on_the_entry(hass: HomeAssistant) ->
     flow_id = await reach_topology_step(hass)
     await hass.config_entries.flow.async_configure(flow_id, topology_input(TOPOLOGY_COLD))
     await hass.config_entries.flow.async_configure(flow_id, DOMAINS_INPUT)
+    await hass.config_entries.flow.async_configure(flow_id, ALERTS_INPUT)
     await hass.config_entries.flow.async_configure(flow_id, CONTAINER_INPUT)
     await hass.config_entries.flow.async_configure(flow_id, fileset_input())
     with patch("custom_components.cluster_state_sync.RedisBackend") as backend_cls:
@@ -428,6 +441,13 @@ async def test_options_flow_edits_tunables_without_removing_the_entry(
     entry.add_to_hass(hass)
 
     result = await hass.config_entries.options.async_init(entry.entry_id)
+    # v0.4.2 split this into a menu: connection settings and alerting have
+    # nothing to do with each other, and reading past six connection fields to
+    # change a phone number is how an operator edits the wrong one.
+    assert result["type"] is FlowResultType.MENU
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "connection"}
+    )
     assert result["type"] is FlowResultType.FORM
 
     with patch(
@@ -570,6 +590,7 @@ async def test_every_wizard_step_survives_the_frontend(hass: HomeAssistant, mode
 
     assert result["step_id"] == "domains", result
     result = await hass.config_entries.flow.async_configure(flow_id, DOMAINS_INPUT)
+    result = await hass.config_entries.flow.async_configure(flow_id, ALERTS_INPUT)
     render(result)
     result = await hass.config_entries.flow.async_configure(flow_id, CONTAINER_INPUT)
     render(result)
@@ -789,6 +810,8 @@ async def test_reconfigure_can_fix_a_host_path_without_deleting_the_entry(
     result = await hass.config_entries.flow.async_configure(flow_id, fixed)
     assert result["step_id"] == "domains"
     result = await hass.config_entries.flow.async_configure(flow_id, DOMAINS_INPUT)
+    assert result["step_id"] == "alerts"
+    result = await hass.config_entries.flow.async_configure(flow_id, ALERTS_INPUT)
     assert result["step_id"] == "container"
     result = await hass.config_entries.flow.async_configure(flow_id, CONTAINER_INPUT)
     assert result["step_id"] == "fileset"
@@ -852,6 +875,7 @@ async def test_reconfigure_regenerates_the_bundle(hass: HomeAssistant) -> None:
     fixed = {**topology_input(TOPOLOGY_COLD), CONF_HA_CONFIG_PATH: "/mnt/data/homeassistant"}
     await hass.config_entries.flow.async_configure(flow_id, fixed)
     await hass.config_entries.flow.async_configure(flow_id, DOMAINS_INPUT)
+    await hass.config_entries.flow.async_configure(flow_id, ALERTS_INPUT)
     await hass.config_entries.flow.async_configure(flow_id, CONTAINER_INPUT)
     await hass.config_entries.flow.async_configure(flow_id, fileset_input())
 
@@ -963,6 +987,7 @@ async def test_the_ssh_answers_never_reach_the_config_entry(
     flow_id = await reach_topology_step(hass)
     await hass.config_entries.flow.async_configure(flow_id, topology_input(TOPOLOGY_COLD))
     await hass.config_entries.flow.async_configure(flow_id, DOMAINS_INPUT)
+    await hass.config_entries.flow.async_configure(flow_id, ALERTS_INPUT)
     await hass.config_entries.flow.async_configure(flow_id, CONTAINER_INPUT)
     result = await hass.config_entries.flow.async_configure(flow_id, fileset_input())
     assert result["step_id"] == "bundle"

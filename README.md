@@ -76,6 +76,7 @@ is reference — you do not need to read the README front to back.
 | **Install it** | [RUNBOOK-installation.md](docs/RUNBOOK-installation.md) — requirements, which HA install types can run the failover half at all, and the order things must be done in |
 | **Reach it after it moves (DNS, proxy, tunnel, VPN)** | [GUIDE-ingress.md](docs/GUIDE-ingress.md) — the cluster does **not** move your way in |
 | **Work out whether my radios can fail over** | 🚨 [GUIDE-radios.md](docs/GUIDE-radios.md) — **read before buying hardware.** How a Zigbee or 433 MHz stick is attached decides whether it can move at all |
+| **Patch, reboot and monitor the two machines** | [GUIDE-infrastructure.md](docs/GUIDE-infrastructure.md) — the maintenance hold you do not yet know exists, why a restart on the leader causes a failover, and what your alerting cannot tell you |
 | **Use the dashboard** | [GUIDE-dashboard.md](docs/GUIDE-dashboard.md) — every row and button, what the colours mean, and **when not to press each one** |
 | **Fix something that is broken** | [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — symptom-first, from real failures on a live cluster |
 | **Change the restore, the swap, or the bundle** | 🚨 [GOTCHAS.md](docs/GOTCHAS.md) **first** — 27 traps this project actually fell into, nearly all of which reported success while doing nothing |
@@ -244,6 +245,44 @@ the host scripts write the same files and the two views must never disagree.
 There is **no force-promote button**, on purpose — see
 [Actions](docs/REFERENCE-behaviour.md#actions).
 
+### What crosses, and what does not
+
+An **allowlist**. Eleven domains by default — `input_boolean`, `input_number`,
+`input_select`, `input_text`, `input_datetime`, `counter`, `timer`, `vacuum`,
+`climate`, `humidifier`, `water_heater` — chosen as stateful things a promoted
+node cannot recompute, and nothing whose restore could actuate hardware.
+
+`sensor` and `binary_sensor` are absent deliberately. Their values are re-read
+from the device on the new node within seconds, so a restored reading is stale
+before anyone sees it; restoring one writes a state change, and automations
+trigger on state changes; and they are the bulk of all state churn (~324,000
+rows a day here, against ~5,500 for long-term statistics). For a value that
+genuinely cannot be re-derived — a meter total — add that one entity rather
+than the domain.
+
+Four settings, applied in this order, under **Configure → Replication**:
+
+| | |
+|---|---|
+| Domains that cross | the allowlist |
+| Also cross these entities | one-off additions |
+| Never cross these entities | beats both above |
+| Never cross these devices | shorthand for all of a device's entities, now and later |
+
+Excluding a **device** is the right tool for hardware wired to one node — a
+radio that does not fail over. It stores device IDs, so renaming the device
+does not silently re-enable it.
+
+> [!IMPORTANT]
+> **This governs entity *values*, not your configuration.** Entity and device
+> *settings* — enabled, hidden, area, renames — live in `.storage` and are
+> replicated in full by the fileset regardless of anything above. The two are
+> separate channels and are filtered separately.
+
+Administrators get a **Replication scope** card on the Cluster panel showing
+what crosses, what does not, and every exclusion — and warning if the two nodes
+disagree, which would otherwise be silent.
+
 ## History that survives a failover
 
 Off by default; switch it on in the wizard when it asks whether history
@@ -369,14 +408,49 @@ produces no RF for a long while. What is diagnostic is a number that *used* to
 move and has stopped. Full treatment in
 [GOTCHAS §18](docs/GOTCHAS.md#18-a-docker-healthcheck-says-healthy-while-the-process-is-livelocked).
 
-### Alerting — install the blueprint
+### Alerting — built in since v0.4.2
 
 Exposing the sensors is only half the job. Every way this integration fails is
 quiet by design: the backend goes away and the flush loop just stops, the peer
 stops writing and the snapshot ages, a promotion restores nothing at all and
-logs one line about it. Nothing in the house changes, so nobody looks.
+logs one line about it. Nothing in the house changes, so nobody looks — and
+every surface listed above needs you to be *at home, looking at a screen*,
+which is the one situation this product is not built for.
 
-A blueprint ships with the repository to close that:
+So the integration now tells you itself. **The wizard's "Who hears about it"
+step is optional and submitting it untouched is a complete setup:** four
+conditions, delivered as a persistent notification that every administrator
+sees. Change it later under **Settings → Devices & services → Cluster State
+Sync → Configure → Alerts**.
+
+| Condition | Default | |
+|---|---|---|
+| **Failover** — the house moved to the other node | push | a 21-second failover is otherwise invisible |
+| **Recovery** — a condition below cleared | push | an alarm that stops without a word is one you cannot trust |
+| **Valkey unreachable** | push | the house keeps running; it can no longer **fail over** |
+| **Promoted with an incomplete configuration** | push | the cluster promotes anyway (decision D4) — this is the only thing that says so |
+| Statistics: schema mismatch, gap, not seeded, stalled | card only | real, but they can wait until Saturday |
+
+Add any `notify.` service — the companion app, Discord, Slack, Telegram, email
+— and those pushes reach you when you are out. Home Assistant already holds
+those credentials; this integration stores only the service name.
+
+Unticking a condition silences the **push** only. The repair card and the
+diagnostic entities are raised regardless, so nothing is hidden — you are
+simply not interrupted.
+
+> [!NOTE]
+> **Alerting cannot be more available than the thing it runs on.** These
+> notifications come from Home Assistant, on a node that is up. They will not
+> reach you if the whole house is down, and *"Valkey unreachable"* is reported
+> by the very component that needs Valkey. Something outside the cluster should
+> watch the cluster — see [GUIDE-ingress.md](docs/GUIDE-ingress.md).
+
+### The blueprint — for thresholds and actions of your own
+
+The built-in alerting covers the conditions the integration knows it is in. A
+blueprint also ships, for the ones only you can define — a snapshot-age limit
+you pick, or an action that is a light rather than a notification:
 
 [![Open your Home Assistant instance and show the blueprint import dialog with a specific blueprint pre-filled.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fboywiz%2Fha-cluster-state-sync%2Fblob%2Fmain%2Fblueprints%2Fautomation%2Fcluster_state_sync%2Ffailover_readiness.yaml)
 
@@ -388,21 +462,20 @@ https://github.com/boywiz/ha-cluster-state-sync/blob/main/blueprints/automation/
 
 It watches three things, because they fail differently:
 
-| Trigger | What it means |
-|---|---|
-| **Backend unreachable** (past a grace period) | Nothing is being written. A promotion now restores whatever was last saved, or nothing. |
-| **Snapshot age above a limit** | The backend is *up* and the flush loop stopped anyway — the harder failure to spot, and the one the Backend sensor cannot see. |
-| **Restored zero entities** | This node promoted cold. Nothing came across from the peer. |
+| Trigger | What it means | Also built in? |
+|---|---|---|
+| **Backend unreachable** (past a grace period) | Nothing is being written. A promotion now restores whatever was last saved, or nothing. | **Yes** — you will get two alerts if you enable both |
+| **Snapshot age above a limit** | The backend is *up* and the flush loop stopped anyway — the harder failure to spot, and the one the Backend sensor cannot see. | No — the threshold is yours |
+| **Restored zero entities** | This node promoted cold. Nothing came across from the peer. | No |
 
 That third one is the reason the blueprint exists rather than a line in the
 docs saying "alert on snapshot age". Restoring nothing was a real defect for the
 entire life of this project, it was found by running the thing rather than by
-testing it, and its only symptom was an INFO line nobody read. Install the
-alerting with the thing it alerts on.
+testing it, and its only symptom was an INFO line nobody read.
 
-You supply the notification action, so it can be a phone push, a persistent
-notification, or a light — whatever you will actually notice. Only the three
-entities and that action are required; the thresholds have defaults.
+If you run both, untick **Valkey unreachable** in the integration or drop the
+backend trigger from the automation. Two alerts for one fault is how people
+learn to ignore both.
 
 ## Security
 
@@ -588,9 +661,17 @@ variants are generated; the notify scripts then call a dispatcher with a single
   does not move your DNS, your reverse proxy, your tunnel or your VPN. A
   failover can succeed completely — lease moved, radios followed, house
   responding — while the address on your phone still points at the machine that
-  died. **None of the cluster's probes look at whether anyone can still reach
-  it.** [GUIDE-ingress.md](docs/GUIDE-ingress.md) covers the options; the
+  died. [GUIDE-ingress.md](docs/GUIDE-ingress.md) covers the options; the
   choice depends on your network and is yours to build.
+
+  The cluster will at least **tell you** now, if you ask it to: give it your
+  address under *Configure → Front door* and the leader requests it once a
+  minute, publishing `binary_sensor.<node>_ingress_reachable` and pushing an
+  alert when it stops answering. **Read what that check cannot prove before you
+  rely on it** — the request is made from inside your own network, so with
+  split-horizon DNS it can be green while the tunnel your phone uses is down.
+  Red is trustworthy; green is not proof. An external uptime monitor is still
+  the only thing that watches the path an outside user actually takes.
 * 🚨 **One radio may never fail over, and it may be the one you need most.** A
   transceiver physically plugged into a machine cannot follow a promotion. On
   the fleet this was built for, one such radio is the transmitter a *firewall

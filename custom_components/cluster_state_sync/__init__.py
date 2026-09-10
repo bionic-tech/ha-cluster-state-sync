@@ -45,6 +45,8 @@ from homeassistant.const import (
     EVENT_HOMEASSISTANT_START,
     EVENT_HOMEASSISTANT_STOP,
     EVENT_STATE_CHANGED,
+    STATE_OFF,
+    STATE_ON,
     Platform,
 )
 from homeassistant.core import (
@@ -57,17 +59,21 @@ from homeassistant.core import (
     callback,
 )
 from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.helpers.typing import ConfigType
 
 from . import recorder_snapshot, storage
+from .alerts import AlertRouter
 from .area import async_assign_area
 from .backend import ClusterBackend, RedisBackend, SnapshotEntry, default_node_id
 from .const import (
     CLOCK_SKEW_TOLERANCE,
     CONF_CLUSTER_NAMESPACE,
     CONF_CLUSTER_SECRET,
+    CONF_EXCLUDE_DEVICES,
     CONF_EXCLUDE_ENTITIES,
     CONF_FILESET_ENABLED,
     CONF_FILESET_EXCLUSIONS,
@@ -79,9 +85,13 @@ from .const import (
     CONF_GATE_RECORDER,
     CONF_INCLUDE_DOMAINS,
     CONF_INCLUDE_ENTITIES,
+    CONF_INGRESS_URL,
+    CONF_INGRESS_VERIFY_TLS,
     CONF_LEADERSHIP_ENTITY,
     CONF_LEADERSHIP_SOURCE,
     CONF_NODE_ID,
+    CONF_NOTIFY_CONDITIONS,
+    CONF_NOTIFY_SERVICES,
     CONF_RECORDER_SNAPSHOT_ENABLED,
     CONF_RECORDER_SNAPSHOT_MINUTES,
     CONF_REDIS_DB,
@@ -100,15 +110,19 @@ from .const import (
     CONF_STATISTICS_INTERVAL_MINUTES,
     CONF_STATISTICS_MAX_BYTES,
     CONF_STATISTICS_WINDOW_DAYS,
+    DATA_ALERTS,
     DATA_BACKEND,
     DATA_CLUSTER_VIEW,
     DATA_CONFIG,
     DATA_COORDINATOR,
     DATA_DEGRADED_MARKER,
+    DATA_EXCLUDED_IDS,
     DATA_FILESET,
     DATA_GATE,
+    DATA_INGRESS,
     DATA_LEADERSHIP,
     DATA_MIRROR,
+    DATA_RESTORE_DONE,
     DATA_STATISTICS,
     DATA_STATS,
     DATA_UNSUB,
@@ -120,7 +134,11 @@ from .const import (
     DEFAULT_FILESET_HOT_INTERVAL,
     DEFAULT_FILESET_MAX_BYTES,
     DEFAULT_INCLUDE_DOMAINS,
+    DEFAULT_INGRESS_URL,
+    DEFAULT_INGRESS_VERIFY_TLS,
     DEFAULT_LEADERSHIP_SOURCE,
+    DEFAULT_NOTIFY_CONDITIONS,
+    DEFAULT_NOTIFY_SERVICES,
     DEFAULT_RECORDER_SNAPSHOT_ENABLED,
     DEFAULT_RESTORE_MAX_AGE,
     DEFAULT_SNAPSHOT_INTERVAL,
@@ -139,6 +157,18 @@ from .const import (
     MIN_RECORDER_SNAPSHOT_MINUTES,
     MIN_STATISTICS_INTERVAL_MINUTES,
     MIN_STATISTICS_WINDOW_DAYS,
+    NOTIFY_BACKEND_LOST,
+    NOTIFY_DEVICES_DISABLED,
+    NOTIFY_FILESET_DEGRADED,
+    NOTIFY_INGRESS_UNREACHABLE,
+    NOTIFY_RESTORED_NOTHING,
+    NOTIFY_STATISTICS_GAP,
+    NOTIFY_STATISTICS_NOT_SEEDED,
+    NOTIFY_STATISTICS_SCHEMA,
+    NOTIFY_STATISTICS_STALLED,
+    PREFLIGHT_MARKER_NAME,
+    RESTORE_BY_SERVICE,
+    RESTORE_GATE_TIMEOUT,
     SENSITIVE_DOMAINS,
     SERVICE_CLEAR_DEGRADED,
     SERVICE_FLUSH_SNAPSHOT,
@@ -154,8 +184,16 @@ from .crypto import (
 from .fileset import FilesetPublisher
 from .gating import ServiceGate
 from .hold import read_hold
+from .ingress import (
+    INGRESS_FAILURES_BEFORE_ALARM,
+    INGRESS_PROBE_INTERVAL,
+    IngressProbe,
+    InvalidIngressURL,
+    validate_ingress_url,
+)
 from .leadership import LeadershipMonitor
 from .panel import async_register_panel
+from .scope import resolve_device_entities
 from .statistics_publisher import StatisticsPublisher
 from .util import parse_sentinel_hosts
 
@@ -235,6 +273,12 @@ async def _async_register_services(hass: HomeAssistant) -> None:
         for loaded in hass.config_entries.async_loaded_entries(DOMAIN):
             runtime = getattr(loaded, "runtime_data", None) or {}
             runtime[DATA_DEGRADED_MARKER] = None
+            router: AlertRouter | None = runtime.get(DATA_ALERTS)
+            if router is not None:
+                # An acknowledgement, not a repair -- so no all-clear is pushed.
+                # Telling somebody their alarm has cleared when all that happened
+                # is that they dismissed it is how a channel stops being trusted.
+                router.forget(NOTIFY_FILESET_DEGRADED)
         ir.async_delete_issue(hass, DOMAIN, "fileset_degraded")
 
     hass.services.async_register(DOMAIN, SERVICE_FLUSH_SNAPSHOT, _flush_snapshot)
@@ -249,6 +293,7 @@ async def _surface_follower_status(
     node_id: str | None = None,
     stale_after: float | None = None,
     publishing_since: datetime | None = None,
+    alerts: AlertRouter | None = None,
 ) -> None:
     """Raise the standby's findings as repairs on this node.
 
@@ -263,15 +308,33 @@ async def _surface_follower_status(
     leave a recovered cluster carrying an ERROR forever.
     """
     mapping = {
-        "schema_mismatch": ("statistics_schema_mismatch", ir.IssueSeverity.ERROR),
-        "gap": ("statistics_gap", ir.IssueSeverity.WARNING),
-        "not_seeded": ("statistics_not_seeded", ir.IssueSeverity.WARNING),
+        "schema_mismatch": (
+            "statistics_schema_mismatch",
+            ir.IssueSeverity.ERROR,
+            NOTIFY_STATISTICS_SCHEMA,
+            "Statistics replication has stopped",
+        ),
+        "gap": (
+            "statistics_gap",
+            ir.IssueSeverity.WARNING,
+            NOTIFY_STATISTICS_GAP,
+            "Statistics history has a gap",
+        ),
+        "not_seeded": (
+            "statistics_not_seeded",
+            ir.IssueSeverity.WARNING,
+            NOTIFY_STATISTICS_NOT_SEEDED,
+            "Statistics have never been seeded",
+        ),
     }
     status = await _read_follower_status(backend, secret)
     state = str((status or {}).get("state") or "")
 
-    for reported, (issue_id, severity) in mapping.items():
+    for reported, (issue_id, severity, condition, title) in mapping.items():
+        detail = str((status or {}).get("detail", "no detail given"))
         if state == reported:
+            if alerts is not None:
+                await alerts.async_raise(condition, title, detail)
             ir.async_create_issue(
                 hass,
                 DOMAIN,
@@ -287,6 +350,10 @@ async def _surface_follower_status(
             # Includes the no-status case: a standby that has said nothing at
             # all is not a standby with a schema mismatch, and leaving the
             # issue up would train the operator to ignore it.
+            if alerts is not None:
+                await alerts.async_clear(
+                    condition, f"Resolved: {title.lower()}", "The standby is reporting healthy."
+                )
             ir.async_delete_issue(hass, DOMAIN, issue_id)
 
     # AR-0046. The above is why a silent follower raises nothing -- and on its
@@ -297,7 +364,7 @@ async def _surface_follower_status(
     # 🚨 That is AR-0040's shape, in a mechanism built after AR-0040: a thing
     # reporting success by saying nothing. So silence is now measured.
     if stale_after is None:
-        await _clear(hass, "statistics_stalled")
+        await _clear(hass, "statistics_stalled", alerts)
         return
 
     # AR-0057. Silence only means something once there has been something to
@@ -310,12 +377,12 @@ async def _surface_follower_status(
         publishing_since is None
         or (datetime.now(tz=UTC) - publishing_since).total_seconds() < stale_after
     ):
-        await _clear(hass, "statistics_stalled")
+        await _clear(hass, "statistics_stalled", alerts)
         return
 
     stale = _status_is_stale(status, stale_after)
     if not stale:
-        await _clear(hass, "statistics_stalled")
+        await _clear(hass, "statistics_stalled", alerts)
         return
 
     # A stopped node and a stopped replication need opposite things from an
@@ -336,6 +403,10 @@ async def _surface_follower_status(
             "so the standby is most likely switched off. History replication is not "
             "running; nothing else is implied about the cluster."
         )
+    if alerts is not None:
+        await alerts.async_raise(
+            NOTIFY_STATISTICS_STALLED, "Statistics replication has stalled", detail
+        )
     ir.async_create_issue(
         hass,
         DOMAIN,
@@ -347,8 +418,14 @@ async def _surface_follower_status(
     )
 
 
-async def _clear(hass: HomeAssistant, issue_id: str) -> None:
+async def _clear(hass: HomeAssistant, issue_id: str, alerts: AlertRouter | None = None) -> None:
     """Deleting an issue that does not exist is a documented no-op."""
+    if alerts is not None:
+        await alerts.async_clear(
+            NOTIFY_STATISTICS_STALLED,
+            "Resolved: statistics replication",
+            "The standby is applying statistics again.",
+        )
     ir.async_delete_issue(hass, DOMAIN, issue_id)
 
 
@@ -504,7 +581,18 @@ async def _setup_fileset_replication(
                     return
                 try:
                     await publisher.async_publish()
-                except Exception:  # noqa: BLE001 — a publish must never kill the loop
+                # 🚨 This does NOT keep the timer alive, though the comment here
+                # said so until 2026-09-10. `_TrackTimeInterval` calls
+                # `_schedule_timer()` BEFORE running the job, and runs it as a
+                # background task — so an escaping exception never reaches the
+                # timer and the interval survives regardless.
+                #
+                # What it actually buys is a NAMED failure. Without it the error
+                # surfaces as an anonymous unretrieved-task traceback whenever the
+                # garbage collector gets to it, detached from the thing that
+                # caused it. That is the difference between a diagnosable fault
+                # and a mystery in the log an hour later.
+                except Exception:  # noqa: BLE001 — name the failure, do not swallow it
                     _LOGGER.exception("Fileset publish failed; will retry next interval")
 
             runtime[DATA_UNSUB].append(
@@ -573,7 +661,18 @@ async def _setup_statistics_replication(
                     return
                 try:
                     await statistics.async_publish()
-                except Exception:  # noqa: BLE001 — a publish must never kill the loop
+                # 🚨 This does NOT keep the timer alive, though the comment here
+                # said so until 2026-09-10. `_TrackTimeInterval` calls
+                # `_schedule_timer()` BEFORE running the job, and runs it as a
+                # background task — so an escaping exception never reaches the
+                # timer and the interval survives regardless.
+                #
+                # What it actually buys is a NAMED failure. Without it the error
+                # surfaces as an anonymous unretrieved-task traceback whenever the
+                # garbage collector gets to it, detached from the thing that
+                # caused it. That is the difference between a diagnosable fault
+                # and a mystery in the log an hour later.
+                except Exception:  # noqa: BLE001 — name the failure, do not swallow it
                     _LOGGER.exception("Statistics publish failed; will retry next interval")
                 # Then read what the standby made of the LAST window. This is
                 # the only place in this integration where data flows standby
@@ -594,6 +693,7 @@ async def _setup_statistics_replication(
                     # has stopped.
                     stale_after=interval * 60 * 3,
                     publishing_since=statistics.first_success_at,
+                    alerts=runtime.get(DATA_ALERTS),
                 )
 
             interval = max(
@@ -679,7 +779,19 @@ async def _setup_degraded_alarm(
 
     degraded_marker = await hass.async_add_executor_job(_read_degraded_marker)
     runtime[DATA_DEGRADED_MARKER] = degraded_marker
+    alerts: AlertRouter | None = runtime.get(DATA_ALERTS)
     if degraded_marker:
+        if alerts is not None:
+            await alerts.async_raise(
+                NOTIFY_FILESET_DEGRADED,
+                "Promoted with a degraded fileset",
+                (
+                    "This node took over using an incomplete copy of the configuration "
+                    f"({degraded_marker.get('reason', 'unknown')}). Decision D4 promotes "
+                    "anyway -- a degraded house beats no house -- but something is missing "
+                    "and only this message says so."
+                ),
+            )
         ir.async_create_issue(
             hass,
             DOMAIN,
@@ -697,7 +809,219 @@ async def _setup_degraded_alarm(
         # fully-recovered node would carry a stale ERROR forever. Deleting an
         # issue that does not exist is a documented no-op, so this is safe to
         # run on every setup, degraded or not.
+        if alerts is not None:
+            await alerts.async_clear(
+                NOTIFY_FILESET_DEGRADED,
+                "Resolved: fileset is complete",
+                "This node's copy of the configuration is whole again.",
+            )
         ir.async_delete_issue(hass, DOMAIN, "fileset_degraded")
+
+
+async def _setup_ingress_probe(
+    hass: HomeAssistant,
+    cfg: dict[str, Any],
+    runtime: dict[str, Any],
+    leadership: Any,
+) -> None:
+    """Watch the operator's own front door, if they told us where it is (AR-0060).
+
+    Sets `runtime[DATA_INGRESS]` itself, on every path -- to the probe, or to
+    None when the feature is off or the URL is unusable. `binary_sensor.py`
+    decides whether the entity exists from that slot, and an entity that
+    watches nothing reads as a check that passed.
+
+    Leader-only, for the reason the flush and the statistics publish are:
+    a follower probing the shared address proves nothing about the node that
+    is supposed to be answering, and doubles the traffic against a tunnel that
+    may well be metered. The follower's reading becomes an explicit "not
+    checked" rather than the leader's last answer left to go stale.
+
+    🚨 Read `ingress.py`'s module docstring before believing a green reading.
+    A probe leaving this container runs inside the LAN, so split-horizon DNS
+    can resolve the same hostname to a local address and make the probe green
+    while the tunnel every external user depends on is down. This closes
+    AR-0060's *reporting* gap -- the cluster now looks -- and cannot close the
+    infrastructure one, which is the operator's and stays theirs.
+    """
+    runtime[DATA_INGRESS] = None
+    try:
+        url = validate_ingress_url(cfg.get(CONF_INGRESS_URL, DEFAULT_INGRESS_URL))
+    except InvalidIngressURL as err:
+        # Refuse this one feature, never the setup. A typo in a diagnostic's
+        # address must not be able to stop the cluster that diagnostic
+        # watches -- and the options page rejects it at the point of typing,
+        # so reaching here means the value was written some other way.
+        _LOGGER.error(
+            "The configured front-door address cannot be checked and no ingress probe "
+            "will run: %s. Fix it under the integration's options, or clear it to turn "
+            "the check off.",
+            err,
+        )
+        return
+    if url is None:
+        return
+
+    probe = IngressProbe(
+        hass,
+        url,
+        verify_tls=bool(cfg.get(CONF_INGRESS_VERIFY_TLS, DEFAULT_INGRESS_VERIFY_TLS)),
+    )
+
+    async def _scheduled_ingress_probe(_now: datetime) -> None:
+        if not await leadership.async_is_leader():
+            probe.async_note_not_leader()
+            return
+        result = await probe.async_probe()
+        alerts: AlertRouter | None = runtime.get(DATA_ALERTS)
+        if alerts is None:
+            return
+        if result.reachable:
+            await alerts.async_clear(
+                NOTIFY_INGRESS_UNREACHABLE,
+                "Home Assistant is reachable again",
+                f"{probe.display_url} is answering. The front door is back.",
+            )
+        elif probe.consecutive_failures >= INGRESS_FAILURES_BEFORE_ALARM:
+            # Waits for a pattern deliberately. The entity moved on the first
+            # failure and the repairs card follows this raise; only the
+            # interruption waits, because a proxy reloading its configuration
+            # is not a reason to wake somebody.
+            await alerts.async_raise(
+                NOTIFY_INGRESS_UNREACHABLE,
+                "Home Assistant cannot be reached at its own address",
+                (
+                    f"The house is running here, but {probe.display_url} has not "
+                    f"answered for {probe.consecutive_failures} checks "
+                    f"({result.error or 'no reason given'}). Nothing is wrong with the "
+                    "cluster -- the way IN to it is broken, which looks identical from "
+                    "a phone. Check DNS, the reverse proxy or the tunnel."
+                ),
+            )
+
+    async def _guarded_ingress_probe(now: datetime) -> None:
+        """Make an unforeseen failure name itself, in our own log.
+
+        `async_probe` is written not to raise and the alert router swallows its
+        own failures, so arriving here at all means something nobody predicted.
+
+        🚨 Not what it sounds like, and said plainly because the first draft of
+        this comment claimed the opposite. The *timer survives without this*: measured
+        against the Home Assistant version this suite pins, `_TrackTimeInterval`
+        re-arms itself before it runs the job, and runs it as a background
+        task. So an escaping exception does not end the checking.
+
+        What it does instead is worse to diagnose. The exception becomes an
+        unretrieved task error, reported by asyncio whenever that task is
+        finally collected, with a traceback attributed to a `HassJob` and no
+        mention of which integration or which check produced it -- detached in
+        both time and name from the thing that failed. A fault reported that
+        way is most of the way to not being reported at all, which is the
+        AR-0040 shape. This costs four lines and turns it into a sentence.
+        """
+        try:
+            await _scheduled_ingress_probe(now)
+        except Exception:  # noqa: BLE001 -- see this function's docstring
+            _LOGGER.exception("Ingress probe failed unexpectedly; will retry next interval")
+
+    runtime[DATA_UNSUB].append(
+        async_track_time_interval(
+            hass,
+            _guarded_ingress_probe,
+            timedelta(seconds=INGRESS_PROBE_INTERVAL),
+            name=f"{DOMAIN}_ingress_probe",
+            cancel_on_shutdown=True,
+        )
+    )
+    # Not probed here, on purpose. Setup runs before Home Assistant has
+    # finished starting, so its own HTTP is not yet serving and a proxy in
+    # front of it would legitimately answer 502 -- an alarm raised by the
+    # act of restarting, which is how an operator learns to ignore one.
+    _LOGGER.info(
+        "Ingress check on: %s every %d seconds, from whichever node holds the lease. "
+        "A green reading does NOT prove an external user can reach you -- see "
+        "GUIDE-ingress.md.",
+        probe.display_url,
+        INGRESS_PROBE_INTERVAL,
+    )
+    runtime[DATA_INGRESS] = probe
+
+
+async def _surface_preflight_disables(hass: HomeAssistant, runtime: dict[str, Any]) -> None:
+    """Say out loud which radios this node came up without.
+
+    🚨 `ha_device_preflight.py` disables config entries whose hardware is
+    absent, and that is the right call -- a standby missing three radios is
+    useful, one whose `rfxtrx` setups fail and stay failed is not. But it did
+    it SILENTLY, and a promoted node missing three radios looks exactly like a
+    healthy one from every surface this integration offers.
+
+    The failure that shape produces: somebody buys a second transceiver for the
+    standby, gets the device mapping wrong -- easily done, since the path
+    embeds the unit's serial -- promotes, and is told nothing at all. They find
+    out when they need the radio.
+
+    Read-and-clear on every setup, like the degraded-fileset marker: the
+    pre-flight rewrites it on each promotion and removes it when it disabled
+    nothing, so a stale one cannot outlive the problem and start crying wolf.
+    """
+    marker_path = pathlib.Path(hass.config.path(".storage", PREFLIGHT_MARKER_NAME))
+    alerts: AlertRouter | None = runtime.get(DATA_ALERTS)
+
+    def _read() -> dict[str, Any] | None:
+        try:
+            return json.loads(marker_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            # Same posture as the degraded marker: a marker that exists and
+            # cannot be read is NOT the same as no marker, and returning None
+            # makes them identical.
+            _LOGGER.warning(
+                "Could not read the device pre-flight marker at %s. If this promotion "
+                "disabled any hardware, its record has been lost -- check the entries "
+                "on this node by hand.",
+                marker_path,
+                exc_info=True,
+            )
+            return None
+
+    marker = await hass.async_add_executor_job(_read)
+    disabled = list((marker or {}).get("disabled") or [])
+    if not disabled:
+        ir.async_delete_issue(hass, DOMAIN, "devices_disabled")
+        if alerts is not None:
+            await alerts.async_clear(
+                NOTIFY_DEVICES_DISABLED,
+                "Resolved: all hardware is present",
+                "Every config entry's device was found on this node.",
+            )
+        return
+
+    detail = ", ".join(
+        f"{item.get('domain', '?')} ({pathlib.Path(str(item.get('device', '?'))).name})"
+        for item in disabled
+    )
+    if alerts is not None:
+        await alerts.async_raise(
+            NOTIFY_DEVICES_DISABLED,
+            f"Promoted without {len(disabled)} device(s)",
+            (
+                f"This node started with {len(disabled)} config entry(s) switched off "
+                f"because their hardware is not attached here: {detail}. That is "
+                f"deliberate -- a node missing a radio is more use than one that fails "
+                f"to start -- but whatever those devices do is not happening."
+            ),
+        )
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        "devices_disabled",
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="devices_disabled",
+        translation_placeholders={"count": str(len(disabled)), "detail": detail},
+    )
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -757,12 +1081,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Redis is briefly down on boot, the integration will come up later.
         raise ConfigEntryNotReady(f"Cannot reach state-sync backend: {err}") from err
 
+    # Alerting (v0.4.2). Built before anything can raise a condition, because
+    # the conditions raised during setup -- a degraded fileset above all -- are
+    # the ones most worth hearing about: they describe the promotion that has
+    # just happened.
+    alerts = AlertRouter(
+        hass,
+        conditions=cfg.get(CONF_NOTIFY_CONDITIONS, DEFAULT_NOTIFY_CONDITIONS),
+        services=cfg.get(CONF_NOTIFY_SERVICES, DEFAULT_NOTIFY_SERVICES),
+        node_id=node_id,
+    )
+
     runtime: dict[str, Any] = {
         DATA_BACKEND: backend,
         DATA_CONFIG: cfg,
         DATA_UNSUB: [],
         DATA_MIRROR: None,
         DATA_STATS: SyncStats(),
+        DATA_ALERTS: alerts,
     }
     # Quality-scale `runtime-data`. Kept in hass.data as well, for now, only
     # because the unload path and several tests still reach for it; the
@@ -773,6 +1109,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # 1. Seed local state from the snapshot BEFORE automations start.
     #    HA fires EVENT_HOMEASSISTANT_START after integrations have loaded
     #    but before the automation engine, which is exactly the window we want.
+    # AR-0065. Closed until the restore has run, so the flush cannot publish
+    # this node's own state over the snapshot it is about to read.
+    runtime[DATA_RESTORE_DONE] = False
     if hass.state is CoreState.running:
         # AR-0012: added to a live HA, not at boot. Restoring here would seed
         # dozens of entities into a running system and every automation
@@ -783,15 +1122,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "Added while Home Assistant is already running — skipping restore. "
             "The shared snapshot will be applied on the next restart."
         )
+        # No restore is coming, so the gate must not hold the flush shut.
+        runtime[DATA_RESTORE_DONE] = True
     else:
         restored_already = False
 
         async def _on_start(_event: Event) -> None:
             nonlocal restored_already
             restored_already = True
-            await _restore_from_snapshot(
-                hass, backend, cfg, node_id, runtime[DATA_STATS], at_boot=True
-            )
+            try:
+                await _restore_from_snapshot(
+                    hass,
+                    backend,
+                    cfg,
+                    node_id,
+                    runtime[DATA_STATS],
+                    at_boot=True,
+                    alerts=runtime.get(DATA_ALERTS),
+                )
+            finally:
+                # In a `finally` deliberately: a restore that RAISED must still
+                # release the flush. Leaving the gate shut on an error would
+                # turn a failed restore into a node that never publishes at
+                # all, and starve the standby of state for as long as it runs.
+                runtime[DATA_RESTORE_DONE] = True
 
         unsub_start = hass.bus.async_listen_once(EVENT_HOMEASSISTANT_START, _on_start)
 
@@ -805,10 +1159,54 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         runtime[DATA_UNSUB].append(_remove_start_listener)
 
+        @callback
+        def _open_gate_anyway(_now: datetime) -> None:
+            if runtime.get(DATA_RESTORE_DONE):
+                return
+            _LOGGER.warning(
+                "Home Assistant has not finished starting after %.0fs and the restore has "
+                "not run, so state publishing is being released anyway. The standby needs a "
+                "fresh snapshot more than this node needs to finish booting first — but a "
+                "boot this slow is worth investigating.",
+                RESTORE_GATE_TIMEOUT,
+            )
+            runtime[DATA_RESTORE_DONE] = True
+
+        runtime[DATA_UNSUB].append(async_call_later(hass, RESTORE_GATE_TIMEOUT, _open_gate_anyway))
+
     # 2. Build the authoritative mirror and seed it from current state.
     #    Seeding is AR-0002: without it, an entity that never fires a
     #    state-changed event after boot would never be mirrored at all.
+    # Device exclusions, resolved to entity ids once and refreshed when either
+    # registry changes. Recomputing per entity per flush would mean 3,595
+    # registry lookups every thirty seconds to answer a question that only
+    # moves when a device gains or loses an entity.
+    @callback
+    def _refresh_excluded_ids(_event: Event | None = None) -> None:
+        resolved = resolve_device_entities(hass, cfg.get(CONF_EXCLUDE_DEVICES) or [])
+        if resolved == runtime.get(DATA_EXCLUDED_IDS):
+            return
+        runtime[DATA_EXCLUDED_IDS] = resolved
+        current = runtime.get(DATA_MIRROR)
+        if current is not None:
+            current.excluded_ids = resolved
+        _LOGGER.debug("Device exclusions resolve to %d entities", len(resolved))
+
+    _refresh_excluded_ids()
+    runtime[DATA_UNSUB].append(
+        hass.bus.async_listen(er.EVENT_ENTITY_REGISTRY_UPDATED, _refresh_excluded_ids)
+    )
+    # 🚨 Both registries, not just the entity one. An integration that adds a
+    # device and its entities in one go can fire only the device event, and a
+    # missed refresh means an entity of an EXCLUDED device silently replicating
+    # -- a failure whose only symptom is data crossing that the operator
+    # explicitly asked to keep local.
+    runtime[DATA_UNSUB].append(
+        hass.bus.async_listen(dr.EVENT_DEVICE_REGISTRY_UPDATED, _refresh_excluded_ids)
+    )
+
     mirror = StateMirror(hass, backend, cfg, node_id, stats=runtime[DATA_STATS])
+    mirror.excluded_ids = runtime.get(DATA_EXCLUDED_IDS) or frozenset()
     mirror.seed_from_current_states()
     runtime[DATA_MIRROR] = mirror
 
@@ -818,7 +1216,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if new_state is None:
             # Entity removed; skip. Could optionally tombstone in v0.2.
             return
-        if not _should_track(new_state.entity_id, cfg):
+        if not _should_track(new_state.entity_id, cfg, runtime.get(DATA_EXCLUDED_IDS)):
             return
         # No lock needed — the asyncio event loop is single-threaded, so this
         # callback runs to completion atomically.
@@ -905,6 +1303,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await gate.async_apply(is_leader)
         if not is_leader:
             return
+        if not runtime.get(DATA_RESTORE_DONE):
+            # 🚨 AR-0065. Publishing now would write THIS node's state over the
+            # peer's snapshot moments before the restore reads it -- every
+            # entry would then carry our own `source_node`, be skipped as
+            # `own-node`, and a promotion would restore nothing at all.
+            #
+            # Measured on the reference pair before this gate existed:
+            #   leadership 18:08:20.786 -> publish .787 -> restore 18:08:35.703
+            #   28 own-node, restored 0
+            #
+            # Gating on leadership alone was not enough, because a promoted
+            # node IS the leader from its first tick and the restore is
+            # deliberately deferred until the whole of Home Assistant has
+            # started. The gate is what separates the two.
+            _LOGGER.debug("Holding the flush until the boot restore has run")
+            return
         await mirror.async_flush()
 
     runtime[DATA_UNSUB].append(
@@ -924,6 +1338,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await _setup_statistics_replication(hass, cfg, runtime, backend, leadership, node_id)
 
     await _setup_degraded_alarm(hass, runtime)
+    await _surface_preflight_disables(hass, runtime)
+
+    await _setup_ingress_probe(hass, cfg, runtime, leadership)
 
     # 4. On stop, write a final snapshot — the gift the dying node leaves the
     #    standby. AR-0016: this is the *only* shutdown flush path. v0.1 had two
@@ -955,6 +1372,57 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     cluster_view = ClusterViewCoordinator(hass, backend, node_id)
     await cluster_view.async_refresh()
     runtime[DATA_CLUSTER_VIEW] = cluster_view
+
+    # Promotion is announced from the cluster view rather than from our own
+    # leadership resolution, because only the view carries `snapshot_source` --
+    # the field that separates "the house moved here" from "this node was
+    # restarted", which are otherwise identical from inside a starting HA.
+    @callback
+    def _watch_for_promotion() -> None:
+        view = cluster_view.data
+        if view is None:
+            return
+        hass.async_create_task(
+            alerts.async_check_promotion(leader=view.leader, snapshot_source=view.snapshot_source)
+        )
+
+    _watch_for_promotion()
+    runtime[DATA_UNSUB].append(cluster_view.async_add_listener(_watch_for_promotion))
+
+    # Losing Valkey does not stop the house; it stops the house being able to
+    # FAIL OVER, silently, which is the failure this integration exists to
+    # prevent and the one nothing else would report.
+    @callback
+    def _watch_backend_health() -> None:
+        healthy = coordinator.data
+        if healthy:
+            hass.async_create_task(
+                alerts.async_clear(
+                    NOTIFY_BACKEND_LOST,
+                    "Cluster backend recovered",
+                    "Valkey is reachable again. Failover protection is restored.",
+                )
+            )
+        elif healthy is False:
+            hass.async_create_task(
+                alerts.async_raise(
+                    NOTIFY_BACKEND_LOST,
+                    "Cluster backend unreachable",
+                    (
+                        "Home Assistant cannot reach Valkey, so state is no longer being "
+                        "replicated and this cluster CANNOT fail over. The house keeps "
+                        "running; its safety net does not."
+                    ),
+                )
+            )
+
+    _watch_backend_health()
+    runtime[DATA_UNSUB].append(coordinator.async_add_listener(_watch_backend_health))
+
+    # Everything above may have queued a push. Release them once the rest of
+    # Home Assistant has loaded, because the `notify.` service the operator
+    # chose belongs to an integration that may well set up after we do.
+    runtime[DATA_UNSUB].append(alerts.async_arm())
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     # The sidebar panel. After the platforms, so the entities it discovers
@@ -969,6 +1437,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # lamps. After the platforms, because the device does not exist until they
     # have run. Never overrides an area the operator has chosen.
     await async_assign_area(hass, entry)
+
+    # 🚨 Without this, every options page in this integration is a lie.
+    #
+    # `async_setup_entry` reads `cfg` ONCE and hands it to the mirror, the
+    # filter and the alert router. Nothing re-reads it, so an operator who
+    # changes a setting is told it saved and sees no change until the next
+    # restart -- and for alerting that means configuring a phone, believing the
+    # house can reach you, and getting nothing.
+    #
+    # Found on the live pair during the v0.4.2 deploy: the options flow stored
+    # `notify_services` correctly and the running router never saw it. The gap
+    # predates the alerting -- the connection settings had it too -- but adding
+    # two more sections to a flow that does not take effect made it worse.
+    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
 
     _LOGGER.info(
         "Cluster State Sync ready — node=%s namespace=%s interval=%ds tracking=%d entities",
@@ -1028,6 +1510,21 @@ async def _final_flush(mirror: StateMirror) -> None:
         await asyncio.wait_for(mirror.async_flush(), timeout=FINAL_FLUSH_TIMEOUT)
     except Exception:  # noqa: BLE001 — teardown must not be blocked by Redis
         _LOGGER.debug("Final flush failed", exc_info=True)
+
+
+async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload so a changed setting actually applies.
+
+    A full reload rather than mutating the live objects: the config reaches a
+    dozen places -- the mirror's filter, the leadership monitor, the fileset
+    and statistics publishers, the alert router -- and a partial update that
+    refreshed some of them would be harder to reason about than a restart of
+    the entry, and would fail in exactly the way this listener exists to stop.
+
+    The cost is a few seconds without replication on a node whose operator is
+    deliberately changing its configuration, which is the right moment to pay.
+    """
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -1104,6 +1601,10 @@ class StateMirror:
         self._backend = backend
         self._cfg = cfg
         self._node_id = node_id
+        #: Entities excluded because their DEVICE is excluded. Public and
+        #: mutable: it is refreshed from a registry listener, and a mirror
+        #: constructed in a test simply never has any.
+        self.excluded_ids: frozenset[str] = frozenset()
         # Optional so every existing construction site and test keeps working;
         # a mirror with no stats simply records nothing, which is the old
         # behaviour rather than a crash.
@@ -1162,7 +1663,7 @@ class StateMirror:
     def seed_from_current_states(self) -> None:
         """Capture every already-present tracked entity (AR-0002)."""
         for state in self._hass.states.async_all():
-            if _should_track(state.entity_id, self._cfg):
+            if _should_track(state.entity_id, self._cfg, self.excluded_ids):
                 self._tracked[state.entity_id] = _entry_from_state(state, self._node_id)
         if self._tracked:
             self._revision += 1
@@ -1254,6 +1755,7 @@ async def _restore_from_snapshot(
     stats: SyncStats,
     *,
     at_boot: bool,
+    alerts: AlertRouter | None = None,
 ) -> None:
     """Seed the local state machine from the shared snapshot.
 
@@ -1306,6 +1808,10 @@ async def _restore_from_snapshot(
     `async_set`. These guards bound the damage; they do not establish
     authenticity. That is the signature's job, not the timestamp's.
     """
+    # Resolved once here rather than per entity: the restore is a single pass
+    # at boot, and the registries are loaded by the time it runs.
+    excluded_ids = resolve_device_entities(hass, cfg.get(CONF_EXCLUDE_DEVICES) or [])
+
     if not cfg.get(CONF_CLUSTER_SECRET):
         # AR-0005. Refusing here rather than restoring unverified entries is
         # the whole point: a snapshot we cannot authenticate is not a weaker
@@ -1418,7 +1924,7 @@ async def _restore_from_snapshot(
             clamped_future += 1
             entry_updated = now
 
-        if not _should_track(entity_id, cfg):
+        if not _should_track(entity_id, cfg, excluded_ids):
             continue
 
         if not _attributes_within_budget(entity_id, entry.attributes):
@@ -1443,14 +1949,28 @@ async def _restore_from_snapshot(
         # abandon every entry after the offending one and skip the summary that
         # would have said so: a promotion that comes up silently cold, which is
         # the exact failure AR-0013 was raised to prevent.
+        service = RESTORE_BY_SERVICE.get(entity_id.split(".", 1)[0])
         try:
-            hass.states.async_set(
-                entity_id=entity_id,
-                new_state=entry.state,
-                attributes=entry.attributes,
-                force_update=False,
-                context=context,
-            )
+            if service is not None and entry.state in (STATE_ON, STATE_OFF):
+                # This domain's component owns its own state, so writing the
+                # state machine would show the value without applying it. Call
+                # the service and let the component do the real work.
+                domain, on_service, off_service = service
+                await hass.services.async_call(
+                    domain,
+                    on_service if entry.state == STATE_ON else off_service,
+                    {"entity_id": entity_id},
+                    blocking=False,
+                    context=context,
+                )
+            else:
+                hass.states.async_set(
+                    entity_id=entity_id,
+                    new_state=entry.state,
+                    attributes=entry.attributes,
+                    force_update=False,
+                    context=context,
+                )
         except Exception:  # noqa: BLE001 — one refused entry, not a failed failover
             skipped_refused += 1
             _LOGGER.debug("State machine refused entry %s", entity_id, exc_info=True)
@@ -1464,13 +1984,58 @@ async def _restore_from_snapshot(
     # INFO — indistinguishable at a glance from a healthy restore. It is the
     # one outcome that means this integration did nothing during the only event
     # it exists for, so it is a warning with the reason breakdown attached.
+    # Whose snapshot was it? Every entry skipped as `own-node` means this node
+    # read back its OWN state, which is the ordinary case on a restart and not
+    # a failure at all. Only a snapshot written by the PEER can represent state
+    # that should have crossed and did not.
+    #
+    # Getting this wrong in the noisy direction would fire "Failover restored
+    # NOTHING" on every single restart of the leader -- the cry-wolf that makes
+    # an operator stop reading the one alert that matters.
+    peer_snapshot = bool(entries) and skipped_own_node < len(entries)
+
     if entries and restored == 0:
+        # AR-0040's rule holds: a snapshot was there and none of it was
+        # applied, so this is visible without anyone knowing to look. What
+        # changed is that the two cases no longer read identically.
+        if peer_snapshot:
+            if alerts is not None:
+                # 🚨 AR-0065. This was a WARNING and nothing else, and it went
+                # unread for hours on a live cluster that had just failed over
+                # into an empty state machine. A log line has now twice proved
+                # to be no surface at all.
+                await alerts.async_event(
+                    NOTIFY_RESTORED_NOTHING,
+                    "Failover restored NOTHING",
+                    (
+                        f"This node took over and restored 0 of {len(entries)} entities "
+                        f"from the shared snapshot, so it is running on its own local "
+                        f"state rather than the state of the node it replaced. Skipped: "
+                        f"{skipped_local_newer} local-newer, {skipped_own_node} own-node, "
+                        f"{skipped_oversized} oversized, {skipped_unparseable} "
+                        f"unparseable, {skipped_future} implausibly-future, "
+                        f"{skipped_refused} refused."
+                    ),
+                )
+            reason = "This node has promoted with no state from its peer."
+        else:
+            # 🚨 The wording that cost hours during the AR-0065 investigation.
+            #
+            # Every entry was written by this node, which is the ordinary case
+            # on a restart that is not a promotion -- there was simply no peer
+            # state to apply. The old text said "promoted with no state from
+            # its peer" here too, so a routine restart and a real failure read
+            # exactly alike, on the one message that distinguishes them.
+            reason = (
+                "All of them were written by this node, so there was no peer state to "
+                "apply — normal on a restart that is not a promotion."
+            )
         _LOGGER.warning(
-            "Restored NOTHING from a snapshot that held %d entries. This node "
-            "has promoted with no state from its peer. Skipped: %d local-newer, "
-            "%d own-node, %d oversized, %d unparseable, %d "
+            "Restored NOTHING from a snapshot that held %d entries. %s Skipped: "
+            "%d local-newer, %d own-node, %d oversized, %d unparseable, %d "
             "implausibly-future, %d refused.",
             len(entries),
+            reason,
             skipped_local_newer,
             skipped_own_node,
             skipped_oversized,
@@ -1593,7 +2158,9 @@ def _attributes_within_budget(entity_id: str, attributes: dict[str, Any]) -> boo
 # ---------------------------------------------------------------------------
 
 
-def _should_track(entity_id: str, cfg: dict[str, Any]) -> bool:
+def _should_track(
+    entity_id: str, cfg: dict[str, Any], excluded_ids: frozenset[str] | None = None
+) -> bool:
     """Decide whether an entity is in scope for snapshot/restore.
 
     AR-0038: the leadership entity is refused first, ahead of every list.
@@ -1619,6 +2186,18 @@ def _should_track(entity_id: str, cfg: dict[str, Any]) -> bool:
 
     excludes: list[str] = cfg.get(CONF_EXCLUDE_ENTITIES) or []
     if entity_id in excludes:
+        return False
+
+    # Excluding a device is shorthand for excluding its entities, so it sits at
+    # the same precedence -- above `include_entities`, because an operator who
+    # has said "not this device" has said something more specific and more
+    # recent than a domain allowlist they set at install.
+    #
+    # Pre-resolved rather than looked up here: this runs per entity per flush
+    # (3,595 of them on the reference estate) and on every state change. The
+    # set is recomputed when either registry changes, which is the only time
+    # the answer can move.
+    if excluded_ids and entity_id in excluded_ids:
         return False
 
     explicit_includes: list[str] = cfg.get(CONF_INCLUDE_ENTITIES) or []

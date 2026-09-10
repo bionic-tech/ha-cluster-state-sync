@@ -371,7 +371,12 @@ def test_every_menu_option_has_a_label() -> None:
 
     root = pathlib.Path(__file__).parent.parent / "custom_components/cluster_state_sync"
     source = (root / "config_flow.py").read_text()
-    strings = json.loads((root / "strings.json").read_text())["config"]["step"]
+    # Both flows, because an OPTIONS menu renders exactly as blankly as a
+    # config one. The options menu was added in v0.4.2 and this test found it
+    # unlabelled on the first run, which is the whole point of deriving the
+    # step list from the source rather than maintaining it by hand.
+    raw = json.loads((root / "strings.json").read_text())
+    strings = {**raw["config"]["step"], **raw.get("options", {}).get("step", {})}
 
     menus = re.findall(
         r"async_show_menu\(\s*step_id=\"(\w+)\",\s*menu_options=\[([^\]]+)\]", source
@@ -516,3 +521,250 @@ async def test_the_statistics_numbers_are_stored_as_integers(hass: HomeAssistant
     assert handler._data["statistics_window_days"] == 45
     assert handler._data["statistics_interval_minutes"] == 15
     assert isinstance(handler._data["statistics_interval_minutes"], int)
+
+
+# -- wizard step 4a-bis: who hears about it (v0.4.2) -----------------------
+
+
+async def test_the_alerts_step_is_reachable_from_domains(hass: HomeAssistant) -> None:
+    """The step has to be ON the path, not merely defined.
+
+    A step nobody routes to is a step that ships dead, and the wizard is long
+    enough that nobody would notice it missing.
+    """
+    from custom_components.cluster_state_sync.config_flow import ClusterStateSyncConfigFlow
+
+    flow = ClusterStateSyncConfigFlow()
+    flow.hass = hass
+    result = await flow.async_step_domains({"include_domains": ["sensor"]})
+    assert result["step_id"] == "alerts"
+
+
+async def test_submitting_the_alerts_step_untouched_is_a_complete_setup(
+    hass: HomeAssistant,
+) -> None:
+    """'Optional and skippable' has to mean the defaults land, not that nothing does.
+
+    Someone clicking Next without reading must still end up with a cluster that
+    can reach them -- which is the entire reason the persistent notification is
+    unconditional and the four urgent conditions are on by default.
+    """
+    from custom_components.cluster_state_sync.config_flow import ClusterStateSyncConfigFlow
+    from custom_components.cluster_state_sync.const import (
+        CONF_NOTIFY_CONDITIONS,
+        CONF_NOTIFY_SERVICES,
+        DEFAULT_NOTIFY_CONDITIONS,
+    )
+
+    flow = ClusterStateSyncConfigFlow()
+    flow.hass = hass
+    form = await flow.async_step_alerts()
+    defaults = {
+        str(key): key.default() for key in form["data_schema"].schema if hasattr(key, "default")
+    }
+    assert defaults[CONF_NOTIFY_CONDITIONS] == list(DEFAULT_NOTIFY_CONDITIONS)
+    assert defaults[CONF_NOTIFY_SERVICES] == []
+
+    result = await flow.async_step_alerts(defaults)
+    assert result["step_id"] == "container"
+    assert flow._data[CONF_NOTIFY_CONDITIONS] == list(DEFAULT_NOTIFY_CONDITIONS)
+
+
+async def test_the_alerts_step_offers_loaded_notify_services(hass: HomeAssistant) -> None:
+    """Offered from what is actually loaded, so the operator picks rather than types."""
+    from pytest_homeassistant_custom_component.common import async_mock_service
+
+    from custom_components.cluster_state_sync.config_flow import ClusterStateSyncConfigFlow
+
+    async_mock_service(hass, "notify", "mobile_app_pixel")
+    flow = ClusterStateSyncConfigFlow()
+    flow.hass = hass
+    form = await flow.async_step_alerts()
+    schema = form["data_schema"].schema
+    services = next(v for k, v in schema.items() if str(k) == "notify_services")
+    assert "notify.mobile_app_pixel" in services.config["options"]
+    assert services.config["custom_value"] is True, (
+        "a phone that has not paired yet has no notify service — refusing to "
+        "accept its name sends the operator back here for nothing"
+    )
+
+
+def test_every_alert_condition_has_a_label() -> None:
+    """🚨 An unlabelled option in a LIST selector renders as a raw slug.
+
+    The conditions are the one place in this wizard where the operator is
+    choosing what will wake them at 3am. `statistics_not_seeded` as a bare
+    string is not a choice anyone can make well.
+    """
+    import json
+    import pathlib
+
+    from custom_components.cluster_state_sync.const import NOTIFY_CONDITIONS
+
+    root = pathlib.Path(__file__).parent.parent / "custom_components/cluster_state_sync"
+    for name in ("strings.json", "translations/en.json"):
+        labels = json.loads((root / name).read_text())["selector"]["notify_conditions"]["options"]
+        for condition in NOTIFY_CONDITIONS:
+            assert condition in labels, f"{name}: {condition} has no label"
+            assert labels[condition].strip(), f"{name}: {condition} label is empty"
+
+
+# -- the options flow, which nothing covered until v0.4.2 ------------------
+
+
+def _entry_with_options(options: dict) -> object:
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    return MockConfigEntry(
+        domain=DOMAIN,
+        data={"redis_host": "valkey.lan", "redis_port": 6379, "cluster_namespace": "ns"},
+        options=options,
+    )
+
+
+async def test_options_offers_every_section(hass: HomeAssistant) -> None:
+    from custom_components.cluster_state_sync.config_flow import ClusterStateSyncOptionsFlow
+
+    flow = ClusterStateSyncOptionsFlow(_entry_with_options({}))
+    flow.hass = hass
+    result = await flow.async_step_init()
+    assert result["type"] == "menu"
+    assert set(result["menu_options"]) == {"replication", "alerts", "ingress", "connection"}
+
+
+async def test_saving_alerts_does_not_discard_connection_options(hass: HomeAssistant) -> None:
+    """🚨 The bug this guard exists for.
+
+    `async_create_entry` replaces the options wholesale. With one section that
+    was harmless. With two, saving the alerting page would silently drop every
+    connection override -- and the entry would keep working on the values in
+    `entry.data` until a restart pointed Valkey at an address that no longer
+    serves it. A data-loss bug that waits for a reboot to become visible is
+    the worst-shaped one this project has.
+    """
+    from custom_components.cluster_state_sync.config_flow import ClusterStateSyncOptionsFlow
+    from custom_components.cluster_state_sync.const import CONF_NOTIFY_SERVICES
+
+    flow = ClusterStateSyncOptionsFlow(_entry_with_options({"redis_host": "valkey-2.lan"}))
+    flow.hass = hass
+    result = await flow.async_step_alerts({CONF_NOTIFY_SERVICES: ["notify.phone"]})
+    assert result["data"]["redis_host"] == "valkey-2.lan", "connection override was discarded"
+    assert result["data"][CONF_NOTIFY_SERVICES] == ["notify.phone"]
+
+
+async def test_saving_connection_does_not_discard_alert_options(hass: HomeAssistant) -> None:
+    """And the same in the other direction."""
+    from custom_components.cluster_state_sync.config_flow import ClusterStateSyncOptionsFlow
+    from custom_components.cluster_state_sync.const import CONF_NOTIFY_SERVICES
+
+    entry = _entry_with_options({CONF_NOTIFY_SERVICES: ["notify.phone"]})
+    flow = ClusterStateSyncOptionsFlow(entry)
+    flow.hass = hass
+    result = await flow.async_step_connection({"redis_host": "valkey-3.lan"})
+    assert result["data"][CONF_NOTIFY_SERVICES] == ["notify.phone"], "alert settings were discarded"
+    assert result["data"]["redis_host"] == "valkey-3.lan"
+
+
+async def test_the_alert_options_form_shows_what_is_already_configured(
+    hass: HomeAssistant,
+) -> None:
+    """Reopening the page must not silently offer to reset it to defaults."""
+    from custom_components.cluster_state_sync.config_flow import ClusterStateSyncOptionsFlow
+    from custom_components.cluster_state_sync.const import (
+        CONF_NOTIFY_CONDITIONS,
+        CONF_NOTIFY_SERVICES,
+    )
+
+    flow = ClusterStateSyncOptionsFlow(
+        _entry_with_options(
+            {CONF_NOTIFY_SERVICES: ["notify.phone"], CONF_NOTIFY_CONDITIONS: ["promoted"]}
+        )
+    )
+    flow.hass = hass
+    form = await flow.async_step_alerts()
+    defaults = {
+        str(key): key.default() for key in form["data_schema"].schema if hasattr(key, "default")
+    }
+    assert defaults[CONF_NOTIFY_SERVICES] == ["notify.phone"]
+    assert defaults[CONF_NOTIFY_CONDITIONS] == ["promoted"]
+
+
+# -- options must actually take effect ------------------------------------
+
+
+async def test_changing_options_reloads_the_entry(hass: HomeAssistant) -> None:
+    """🚨 Without this every options page in this integration is a lie.
+
+    `async_setup_entry` reads the config ONCE and hands it to the mirror, the
+    filter and the alert router. Nothing re-reads it. Found on the live pair
+    during the v0.4.2 deploy: the options flow stored `notify_services`
+    correctly and the running router never saw it — so an operator configures
+    their phone, is told it saved, and the house cannot reach them.
+    """
+    from unittest.mock import patch
+
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    from tests.fakes import FakeBackend
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            "redis_host": "valkey.invalid",
+            "cluster_namespace": "testns",
+            "node_id": "node-a",
+            "cluster_secret": "s" * 44,
+            "snapshot_interval": 30,
+            "fileset_enabled": False,
+        },
+    )
+    entry.add_to_hass(hass)
+    with patch("custom_components.cluster_state_sync.RedisBackend", return_value=FakeBackend()):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        with patch.object(
+            hass.config_entries, "async_reload", wraps=hass.config_entries.async_reload
+        ) as reload:
+            hass.config_entries.async_update_entry(
+                entry, options={"notify_services": ["notify.phone"]}
+            )
+            await hass.async_block_till_done()
+
+        assert reload.called, "an options change did not reload the entry"
+
+
+async def test_the_reloaded_entry_sees_the_new_options(hass: HomeAssistant) -> None:
+    """The reload is only worth having if the new value actually arrives."""
+    from unittest.mock import patch
+
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    from custom_components.cluster_state_sync.const import CONF_NOTIFY_SERVICES, DATA_ALERTS
+    from tests.fakes import FakeBackend
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            "redis_host": "valkey.invalid",
+            "cluster_namespace": "testns",
+            "node_id": "node-a",
+            "cluster_secret": "s" * 44,
+            "snapshot_interval": 30,
+            "fileset_enabled": False,
+        },
+    )
+    entry.add_to_hass(hass)
+    with patch("custom_components.cluster_state_sync.RedisBackend", return_value=FakeBackend()):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        assert entry.runtime_data[DATA_ALERTS]._services == ()
+
+        hass.config_entries.async_update_entry(
+            entry, options={CONF_NOTIFY_SERVICES: ["notify.phone"]}
+        )
+        await hass.async_block_till_done()
+
+        assert entry.runtime_data[DATA_ALERTS]._services == ("notify.phone",), (
+            "the reloaded router did not pick up the newly configured service"
+        )

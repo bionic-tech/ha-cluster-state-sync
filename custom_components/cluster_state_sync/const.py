@@ -136,6 +136,115 @@ HISTORY_DATABASES: Final = [HISTORY_DB_SHARED, HISTORY_DB_DEDICATED]
 #: their page is the authority on `db_url` and stays current when we do not.
 RECORDER_DOCS_URL: Final = "https://www.home-assistant.io/integrations/recorder/"
 
+# --- Alerting (v0.4.2) ----------------------------------------------------
+#
+# Everything this integration knows has, until now, been visible only to
+# someone LOOKING at Home Assistant: 18 diagnostic entities, a panel, and
+# repairs. For a product whose premise is "the house keeps working while you
+# are away", the observability story ended one step short of reaching the
+# person who is away.
+
+#: Conditions that can notify. Two tiers by default, and the operator may move
+#: any condition between them -- the defaults are an opinion, not a rule.
+#:
+#: The line the defaults draw: **push what changes whether the house is
+#: protected right now.** Anything that can wait until Saturday is a repair
+#: card, not an interruption. An alarm that cries wolf at setup is one nobody
+#: believes at 3am, which is the only time it matters.
+NOTIFY_PROMOTED: Final = "promoted"
+NOTIFY_RECOVERED: Final = "recovered"
+NOTIFY_BACKEND_LOST: Final = "backend_lost"
+NOTIFY_FILESET_DEGRADED: Final = "fileset_degraded"
+NOTIFY_STATISTICS_SCHEMA: Final = "statistics_schema_mismatch"
+NOTIFY_STATISTICS_GAP: Final = "statistics_gap"
+NOTIFY_STATISTICS_NOT_SEEDED: Final = "statistics_not_seeded"
+NOTIFY_STATISTICS_STALLED: Final = "statistics_stalled"
+#: AR-0065. The one that has now been silent twice.
+NOTIFY_RESTORED_NOTHING: Final = "restored_nothing"
+#: Promoted with hardware missing, so the pre-flight switched entries off.
+NOTIFY_DEVICES_DISABLED: Final = "devices_disabled"
+#: AR-0060. The failover that worked and left nobody a way in.
+NOTIFY_INGRESS_UNREACHABLE: Final = "ingress_unreachable"
+
+NOTIFY_CONDITIONS: Final = (
+    NOTIFY_PROMOTED,
+    NOTIFY_RECOVERED,
+    NOTIFY_BACKEND_LOST,
+    NOTIFY_FILESET_DEGRADED,
+    NOTIFY_INGRESS_UNREACHABLE,
+    NOTIFY_STATISTICS_SCHEMA,
+    NOTIFY_STATISTICS_GAP,
+    NOTIFY_STATISTICS_NOT_SEEDED,
+    NOTIFY_STATISTICS_STALLED,
+    NOTIFY_RESTORED_NOTHING,
+    NOTIFY_DEVICES_DISABLED,
+)
+
+#: Pushed unless the operator says otherwise. The house moving machines is
+#: included even though nothing is broken: a failover measured at 21 seconds is
+#: one you would otherwise learn about from a gap in the logbook, and knowing
+#: the house moved matters even when it moved correctly.
+DEFAULT_NOTIFY_CONDITIONS: Final = (
+    NOTIFY_PROMOTED,
+    NOTIFY_RECOVERED,
+    NOTIFY_BACKEND_LOST,
+    NOTIFY_FILESET_DEGRADED,
+    # AR-0065: a promotion that restored nothing is the exact failure this
+    # product exists to prevent, and it has now gone unnoticed twice --
+    # once as AR-0040, once as AR-0065. If anything earns an interruption
+    # it is this.
+    NOTIFY_RESTORED_NOTHING,
+    # A promotion that came up missing radios changes what the house can DO,
+    # which is the tier this list is for. The pre-flight disables them on
+    # purpose -- degraded beats not starting -- and doing that quietly is how
+    # somebody finds out a fortnight later, when they needed one.
+    NOTIFY_DEVICES_DISABLED,
+    # AR-0060. Safe to have on by default because it can never fire unless
+    # somebody has typed a URL: the probe does not exist otherwise. So this
+    # costs a default install nothing, and spares the operator who DID
+    # configure a front door a second trip through the options to be told
+    # when it stops answering.
+    NOTIFY_INGRESS_UNREACHABLE,
+)
+
+CONF_NOTIFY_CONDITIONS: Final = "notify_conditions"
+#: `notify.*` service names to call. Empty is the normal case and is not a
+#: misconfiguration: a persistent notification always goes to every admin, so
+#: zero configuration still tells somebody.
+CONF_NOTIFY_SERVICES: Final = "notify_services"
+DEFAULT_NOTIFY_SERVICES: Final = ()
+
+# --- Ingress reachability probe (AR-0060) ---------------------------------
+#
+# A failover on the reference pair succeeded completely -- lease moved, radios
+# followed, Home Assistant healthy -- while `home.<domain>` still resolved to
+# the dead node and returned 502. Every probe this cluster owned was green,
+# because every probe this cluster owned looked inwards. Nothing anywhere asked
+# the one question the household actually cares about: can we get in?
+#
+# The infrastructure half of AR-0060 -- DNS, proxies, tunnels, floating
+# addresses -- is the operator's, and `GUIDE-ingress.md` covers it with an
+# explicit no-warranty notice. This is the other half, and only the other half:
+# the cluster now *looks*, and says what it saw.
+
+#: The address a person actually types. Empty by default, which switches the
+#: whole feature off: no entity, no timer, no alert. A probe of a URL nobody
+#: supplied would be a green tick for a check that never ran, which is the
+#: shape of failure this project keeps finding (AR-0040).
+CONF_INGRESS_URL: Final = "ingress_url"
+DEFAULT_INGRESS_URL: Final = ""
+
+#: Whether to verify the certificate at that address.
+#:
+#: On by default, and worth leaving on. It exists because a great many home
+#: setups terminate TLS on an internal certificate the container does not
+#: trust, and against those a verifying probe is red for ever -- which teaches
+#: the operator to switch the feature off, taking the real alarm with it. An
+#: unverified probe still answers AR-0060's question ("did anything answer at
+#: that address"); it simply cannot tell you *who* answered.
+CONF_INGRESS_VERIFY_TLS: Final = "ingress_verify_tls"
+DEFAULT_INGRESS_VERIFY_TLS: Final = True
+
 # --- Long-term statistics replication (ADR-010) ---------------------------
 #
 # Measured on a 3,595-entity estate, 2026-09-08: long-term `statistics` grows
@@ -191,6 +300,20 @@ CONF_RESTORE_MAX_AGE: Final = "restore_max_age"
 CONF_INCLUDE_DOMAINS: Final = "include_domains"
 CONF_INCLUDE_ENTITIES: Final = "include_entities"
 CONF_EXCLUDE_ENTITIES: Final = "exclude_entities"
+
+#: Devices whose entities never cross, whatever the domain allowlist says.
+#:
+#: A domain is the wrong unit for "not this thermostat". `climate` is
+#: replicated because a promoted node genuinely needs to know the setpoints --
+#: but one climate device might be a guest annexe on its own schedule, or a
+#: test device, or the one piece of hardware wired to the node that does NOT
+#: fail over. Excluding it entity-by-entity means listing every entity it
+#: exposes and remembering to come back when a firmware update adds a ninth.
+#:
+#: Stored as device registry IDs rather than names, because a device rename is
+#: an ordinary thing an operator does and must not silently re-enable
+#: replication for it.
+CONF_EXCLUDE_DEVICES: Final = "exclude_devices"
 
 # Leadership sources (AR-0017 / ADR-001 wizard step 3). Every gating layer in
 # ADR-001 keys off one signal; this is how the integration learns it.
@@ -298,6 +421,27 @@ DEFAULT_RESTORE_MAX_AGE: Final = 1800  # don't restore states older than 30m
 # Turning them on is a legitimate choice — they are exactly the states you most
 # want a promoted standby to know — but it should be a decision, and it should
 # be paired with TLS and a dedicated ACL user.
+#: Domains where writing the state machine is a LIE, so the restore must call
+#: the component's own service instead.
+#:
+#: 🚨 `AutomationEntity.is_on` reads `self._async_detach_triggers is not None or
+#: self._is_enabled` -- its OWN state, not `hass.states`. So
+#: `hass.states.async_set("automation.x", "off")` shows "off" in the UI and to
+#: every template while the triggers stay attached and the automation keeps
+#: firing, until the entity next writes its state and silently corrects the
+#: display back to "on".
+#:
+#: That is strictly worse than not replicating the domain at all: it tells an
+#: operator something is parked when it is running. Restoring by service is the
+#: only honest way to cross a domain whose component owns its own state.
+#:
+#: Deliberately NOT extended to `switch` or `light`. Their services command
+#: real hardware, and a restore that turns things on in someone's house is a
+#: much larger decision than a restore that seeds a value.
+RESTORE_BY_SERVICE: Final = {
+    "automation": ("automation", "turn_on", "turn_off"),
+}
+
 SENSITIVE_DOMAINS: Final = frozenset(
     {
         "person",
@@ -531,6 +675,16 @@ STAGED_DIR_NAME: Final = ".cluster_sync_staged"
 #: the integration at startup to raise a repair issue.
 DEGRADED_MARKER_NAME: Final = ".cluster_sync_degraded.json"
 
+#: Written by `ha_device_preflight.py` when it disables a config entry whose
+#: hardware is absent. Lives in `.storage/`, beside the file it edits.
+#:
+#: 🚨 The pre-flight's whole design is 'degraded beats not starting' -- it
+#: switches off entries whose radios are missing so the node comes up. That
+#: is right, and on its own it is silent: a promoted node missing three
+#: radios looks identical to a healthy one, and somebody finds out a
+#: fortnight later when they needed one.
+PREFLIGHT_MARKER_NAME: Final = ".cluster_sync_preflight.json"
+
 
 def statistics_key(namespace: str) -> str:
     """Return the key holding the encrypted long-term statistics window."""
@@ -571,6 +725,25 @@ DATA_CONFIG: Final = "config"
 DATA_STATS: Final = "stats"
 DATA_COORDINATOR: Final = "coordinator"
 DATA_CLUSTER_VIEW: Final = "cluster_view"
+DATA_ALERTS: Final = "alerts"
+#: Entity ids resolved from CONF_EXCLUDE_DEVICES, recomputed when either
+#: registry changes. Cached because the filter runs per entity per flush.
+DATA_EXCLUDED_IDS: Final = "excluded_ids"
+#: AR-0065. False until the boot restore has run (or been positively
+#: skipped). The flush refuses to publish while it is False, because a
+#: leader that publishes first overwrites the very snapshot it is about to
+#: read and restores nothing.
+DATA_RESTORE_DONE: Final = "restore_done"
+
+#: 🚨 How long the flush will wait for the restore before publishing anyway.
+#:
+#: The gate above is opened by `EVENT_HOMEASSISTANT_START`, which always
+#: fires on a healthy boot. This exists for the boot that is not healthy:
+#: a gate that never opens means the leader never publishes, the standby's
+#: snapshot ages out, and the NEXT promotion restores stale state -- which
+#: is worse than the bug the gate was added to fix. Generous, because a
+#: large estate legitimately takes minutes to finish starting.
+RESTORE_GATE_TIMEOUT: Final = 600.0
 
 #: Services. Deliberately only two, and neither of them touches leadership:
 #: the one operator action that bypasses the split-brain guard is
@@ -591,6 +764,11 @@ DATA_STATISTICS: Final = "statistics"
 # from a synchronous entity property, which would be blocking I/O the event
 # loop cannot afford.
 DATA_DEGRADED_MARKER: Final = "degraded_marker"
+#: The ingress probe, or None when no URL is configured (AR-0060). Always
+#: set, never merely absent: `binary_sensor.py` decides whether to create the
+#: entity from this slot, and a missing key and a key holding None read the
+#: same to `.get()` and very differently to `[...]`.
+DATA_INGRESS: Final = "ingress"
 
 # How often the diagnostic coordinator pings the backend (AR-0019). Frequent
 # enough that a dead backend surfaces well inside the failover budget, rare

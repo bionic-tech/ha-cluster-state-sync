@@ -2232,7 +2232,17 @@ def test_the_notify_scripts_record_the_vrrp_state(
     _stub_bin(tmp_path / "bin", "nft", "#!/bin/sh\nexit 0\n")
     _stub_bin(tmp_path / "bin", "python3", "#!/bin/sh\nexit 0\n")
 
-    result = _run(path, tmp_path / "bin", env={"CLUSTER_SYNC_STATE_FILE": str(state)})
+    result = _run(
+        path,
+        tmp_path / "bin",
+        env={
+            "CLUSTER_SYNC_STATE_FILE": str(state),
+            # AR-0064 added a readiness wait before the post-start hooks.
+            # There is no Home Assistant here, so cap it at one second
+            # rather than have this test sit through the real 180.
+            "CLUSTER_SYNC_HA_READY_TIMEOUT": "1",
+        },
+    )
 
     assert result.returncode == 0, result.stderr
     assert state.read_text().strip() == expected
@@ -3404,3 +3414,80 @@ def test_the_env_file_is_sourced_and_exported() -> None:
     master = build_bundle(_compose_cfg(compose_env_file="/srv/.env"))["notify_master.sh"]
     assert "set -a" in master and "/srv/.env" in master, "env must be sourced AND exported"
     assert master.index("set -a") < master.index("docker compose"), "sourced before use"
+
+
+# -- AR-0064: the moment our own ingress guidance needs -------------------
+
+
+def test_post_start_hooks_run_after_home_assistant_answers() -> None:
+    """🚨 AR-0064. The gap was a moment we recommended and did not provide.
+
+    `GUIDE-ingress.md` tells the operator to claim a floating address only
+    **after** Home Assistant answers — the opposite of the radios, because a
+    container's `/dev` is a snapshot at start but an address is not. There was
+    no such moment: `pre-start.d/` is before `docker start` and `post-stop.d/`
+    is after the container stops.
+
+    Firing straight after `docker start` would not have fixed it. The container
+    exists in a second and the instance takes the best part of a minute; an
+    address claimed in between accepts connections and returns 502, which is
+    worse than no address because a health check sees a live host and stops
+    looking.
+    """
+    script = files()["notify_master.sh"]
+    assert "post-start.d" in script, "the hook point our own guidance needs does not exist"
+    assert script.index("docker start") < script.index("post-start.d"), (
+        "post-start hooks must run after Home Assistant is started, not before"
+    )
+    wait = script[script.index("docker start") : script.index("post-start.d")]
+    assert "curl" in wait and "CLUSTER_SYNC_HA_READY" in wait, (
+        "the hooks fire without waiting for Home Assistant to answer — which is "
+        "the whole point of the hook point (AR-0064)"
+    )
+
+
+def test_the_readiness_wait_is_bounded_and_never_blocks_promotion() -> None:
+    """D4 again: a node that is up must not be held back by a probe.
+
+    If Home Assistant never answers, waiting for ever means the hooks never
+    run and an unreachable node stays unreachable. The wait is capped and the
+    hooks run regardless, told what was observed.
+    """
+    script = files()["notify_master.sh"]
+    wait = script[script.index("CLUSTER_SYNC_HA_READY=0") : script.index("post-start.d")]
+    assert "seq 1" in wait, "the wait must be bounded"
+    assert "exit 1" not in wait, "a slow Home Assistant must not abort the promotion"
+    assert "export CLUSTER_SYNC_HA_READY" in wait, (
+        "the hook cannot decide what to do unless it is told whether HA answered"
+    )
+
+
+def test_a_hook_is_told_when_home_assistant_did_not_answer() -> None:
+    """🚨 The honest half.
+
+    Running the hooks blindly would claim an address for a black hole; refusing
+    to run them would leave an unreachable node unreachable. So the promoter
+    reports what it saw and the hook decides — the same division of labour the
+    hook runner already describes.
+    """
+    script = files()["notify_master.sh"]
+    assert "CLUSTER_SYNC_HA_READY=1" in script and "CLUSTER_SYNC_HA_READY=0" in script
+    assert "did NOT answer" in script, "a timeout must be visible in the journal"
+
+
+def test_the_readiness_probe_uses_the_same_url_as_the_promoter() -> None:
+    """One deployment, one answer to 'where is Home Assistant'.
+
+    `_promoter_ha_url` already handles `network_mode: host` by falling back to
+    loopback. A second, hand-written URL here would drift from it and probe the
+    wrong place on exactly the installs that fallback exists for.
+    """
+    from custom_components.cluster_state_sync.bundle import _promoter_ha_url
+
+    cfg = {**COLD, "ha_container_ip": "10.9.9.9"}
+    script = build_bundle(cfg)["notify_master.sh"]
+    assert _promoter_ha_url(cfg) in script
+
+    # ...and the loopback fallback for `network_mode: host`.
+    plain = {k: v for k, v in COLD.items() if k != "ha_container_ip"}
+    assert _promoter_ha_url(plain) in build_bundle(plain)["notify_master.sh"]

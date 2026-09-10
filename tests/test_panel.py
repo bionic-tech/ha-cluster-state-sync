@@ -385,6 +385,11 @@ def test_every_value_interpolated_into_the_panel_html_is_escaped() -> None:
         # HTML this file assembled itself, from the escaping helpers above.
         # Escaping it again would render the markup as text.
         "body",
+        # Same: the replication card, and the device list inside it. Both are
+        # built by `_replicationCard`, which escapes every value it reads from
+        # an entity attribute before it becomes markup.
+        "scopeCard",
+        "devices",
         # NOT markup: an object KEY in `bucket[`${metric}__switch`]`.
         # Escaping it would corrupt the lookup. If `metric` is ever
         # interpolated into HTML, it must be escaped there and removed
@@ -409,3 +414,39 @@ def test_the_panel_has_exactly_one_innerhtml_assignment() -> None:
         f"{len(assignments)} innerHTML assignments; a new one needs the same "
         "escaping review as the first"
     )
+
+
+def test_the_card_heading_names_the_node_that_is_actually_running() -> None:
+    """🚨 AR-0055. The heading must not be parsed out of the entity id.
+
+    Entity ids live in `core.entity_registry`, which the go-bag replicates
+    wholesale, so a node promoted from its peer inherits the peer's ids: every
+    entity on node-b reads `cluster_sync_node-a_…`. Deriving the heading
+    from the id then names the machine that is **not** running, beside a LEADER
+    tag that is correct — at exactly the moment somebody is trying to work out
+    where their house went.
+
+    `binary_sensor.…is_leader` carries `node_id` as an attribute
+    (`binary_sensor.py`'s `extra_state_attributes`) and computes it locally, so
+    it is right on both nodes.
+
+    Structural, because there is no JS runtime here — but it is the half that
+    catches the regression, which is someone "simplifying" the heading back to
+    the parsed name.
+    """
+    js = PANEL_JS.read_text(encoding="utf-8")
+    assert "attributes.node_id" in js, (
+        "the panel no longer reads the locally-computed node_id attribute — a "
+        "promoted node will label its card with the peer's name (AR-0055)"
+    )
+    assert "this._esc(realNode)" in js, "the heading is not rendered from the attribute"
+
+
+def test_the_heading_falls_back_when_the_attribute_is_missing() -> None:
+    """A follower's is_leader sensor exists but may not have been read yet.
+
+    Falling back to the parsed id keeps the card labelled rather than blank,
+    which is the right failure for a cosmetic field.
+    """
+    js = PANEL_JS.read_text(encoding="utf-8")
+    assert "|| node;" in js, "no fallback — a missing attribute would blank the heading"

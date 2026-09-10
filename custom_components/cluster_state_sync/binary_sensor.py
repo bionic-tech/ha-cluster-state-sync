@@ -17,11 +17,13 @@ from .const import (
     DATA_COORDINATOR,
     DATA_DEGRADED_MARKER,
     DATA_FILESET,
+    DATA_INGRESS,
 )
 from .coordinator import BackendHealthCoordinator, ClusterViewCoordinator
 from .entity import ClusterSyncDiagnosticEntity, ClusterViewEntity
 from .fileset import FilesetPublisher
 from .hold import hold_path, read_hold
+from .ingress import IngressProbe
 
 
 async def async_setup_entry(
@@ -33,12 +35,18 @@ async def async_setup_entry(
     runtime = entry.runtime_data
     coordinator: BackendHealthCoordinator = runtime[DATA_COORDINATOR]
     degraded = runtime.get(DATA_DEGRADED_MARKER) is not None
+    probe: IngressProbe | None = runtime.get(DATA_INGRESS)
     async_add_entities(
         [
             BackendConnectivitySensor(coordinator, entry, "backend"),
             FilesetDegradedBinarySensor(coordinator, entry, degraded, runtime.get(DATA_FILESET)),
             IsLeaderBinarySensor(runtime[DATA_CLUSTER_VIEW], entry),
             MaintenanceHoldBinarySensor(coordinator, entry, hass.config.path()),
+            # Only where a front-door address was actually configured. An
+            # ingress entity for a check nobody switched on would read as a
+            # working check, which is the AR-0060 failure with a tick beside
+            # it -- the same reason `RadioSilenceSensor` is conditional.
+            *([IngressReachableBinarySensor(coordinator, entry, probe)] if probe else []),
         ]
     )
 
@@ -247,4 +255,98 @@ class MaintenanceHoldBinarySensor(ClusterSyncDiagnosticEntity, BinarySensorEntit
         return {
             "reason": (self._reason or "no reason given") if self._held else None,
             "flag_file": str(hold_path(self._config_dir)),
+        }
+
+
+class IngressReachableBinarySensor(ClusterSyncDiagnosticEntity, BinarySensorEntity):
+    """Does the address a person types still reach this cluster (AR-0060).
+
+    The failover that produced this entity succeeded on every measure the
+    cluster owned -- lease moved, radios followed, Home Assistant healthy --
+    while `home.<domain>` still pointed at the dead node and returned 502. The
+    house was fine and nobody could open the app. Every probe here looked
+    inwards; this is the one that looks back at itself from the outside.
+
+    🚨 **On is weaker evidence than off.** The request is made by the Home
+    Assistant container, on the node itself, inside the LAN. With split-horizon
+    DNS -- normal for anyone reaching Home Assistant through a tunnel -- the
+    same hostname resolves to a local address from in here, so this can report
+    `Connected` while the tunnel your phone uses is down. It cannot be
+    otherwise: no probe launched from inside a network can test the path that
+    starts outside it. Off, by contrast, is close to conclusive: if the service
+    cannot be reached from a machine on its own network, nobody further away is
+    getting in either. `ingress.py`'s module docstring says the same at length,
+    and so does GUIDE-ingress.md.
+
+    Only ever written by the leader. On a follower it reads unknown with
+    `not_checked_because: not_leader`, rather than leaving the last leader's
+    answer on screen to age -- an entity that says `Connected` about a check
+    that stopped running when the lease moved would be worse than no entity.
+    """
+
+    _attr_translation_key = "ingress_reachable"
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+
+    def __init__(
+        self,
+        coordinator: BackendHealthCoordinator,
+        entry: ConfigEntry,
+        probe: IngressProbe,
+    ) -> None:
+        super().__init__(coordinator, entry, "ingress_reachable")
+        self._probe = probe
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        # Subscribed to the probe, not to the backend health coordinator whose
+        # ticks this entity inherits: the two run on unrelated schedules, and
+        # rendering a probe result only when Valkey next happens to be polled
+        # would make an ingress outage appear up to a minute after it started.
+        self.async_on_remove(self._probe.add_listener(self.async_write_ha_state))
+
+    @property
+    def is_on(self) -> bool | None:
+        """None, not False, until somebody has actually looked.
+
+        A freshly-started leader has not probed yet and a follower never will.
+        Reporting `False` in either case would be an ingress alarm invented by
+        the absence of a measurement -- the exact move this project spent
+        AR-0040 and AR-0046 learning not to make.
+        """
+        return self._probe.last_result.reachable
+
+    @property
+    def available(self) -> bool:
+        # Always available, like every other diagnostic here: "the front door
+        # is not answering" is the reading, and making the entity unavailable
+        # would hide the finding at the moment it is worth the most.
+        return True
+
+    @property
+    def extra_state_attributes(self) -> dict[str, object]:
+        """Enough to act on without opening the log.
+
+        `last_status` is the one that names the culprit: a 502 is a proxy that
+        cannot reach its backend, a 404 is a routing rule pointing at nothing,
+        and no status at all with an error beside it is DNS or a dead listener.
+        Those are three different repairs and an operator woken at 3am should
+        not have to guess which.
+
+        The URL is published with any `user:password@` removed -- see
+        `ingress.redact_credentials`. Entity attributes are visible to every
+        Home Assistant user, kept by the recorder and included in a diagnostics
+        download, so this is the wrong place for a credential to surface.
+        """
+        result = self._probe.last_result
+        return {
+            "url": self._probe.display_url,
+            "last_status": result.status,
+            "last_checked": result.checked_at.isoformat() if result.checked_at else None,
+            "last_error": result.error,
+            "latency_ms": result.latency_ms,
+            "consecutive_failures": self._probe.consecutive_failures,
+            # Present only when the reading is unknown, and says which kind:
+            # `not_leader` is by design, `never_run` means the first interval
+            # has not elapsed yet.
+            "not_checked_because": result.skipped_reason,
         }

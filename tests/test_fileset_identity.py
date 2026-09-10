@@ -572,3 +572,102 @@ def test_an_unconfigured_node_is_not_the_refusal_case(tmp_path: Path) -> None:
 
     assert rc == EXIT_NO_LOCAL_IDENTITY
     assert [e["domain"] for e in _entries_in(storage)] == ["mobile_app"]
+
+
+# -- AR-0066: cluster-wide settings must cross ------------------------------
+
+
+def _ar0066_entry(node: str, **extra: object) -> dict:
+    return {
+        "domain": "cluster_state_sync",
+        "entry_id": f"entry-{node}",
+        "data": {"node_id": node, "ha_container": f"ha-{node}"},
+        "options": dict(extra),
+    }
+
+
+def _ar0066_store(*entries: dict) -> dict:
+    return {
+        "version": 1,
+        "minor_version": 1,
+        "key": "core.config_entries",
+        "data": {"entries": list(entries)},
+    }
+
+
+def test_alerting_configured_on_the_leader_reaches_the_standby() -> None:
+    """🚨 AR-0066, measured on hardware before it was fixed.
+
+    Two failovers produced one notification, and it was the failback **to** the
+    configured node. The promotion **to** the standby sent nothing, because the
+    standby had never heard of the alerting — so the alert announced the house
+    coming home and stayed silent when it left, which is the only direction
+    that matters.
+    """
+    from custom_components.cluster_state_sync.scripts.fileset_identity import graft_entries
+
+    leader = _ar0066_entry(
+        "tiger1", notify_services=["notify.phone"], notify_conditions=["promoted"]
+    )
+    mine = _ar0066_entry("tiger2")
+
+    grafted = graft_entries(_ar0066_store(leader), [mine])
+    got = grafted["data"]["entries"][0]
+
+    assert got["options"]["notify_services"] == ["notify.phone"]
+    assert got["options"]["notify_conditions"] == ["promoted"]
+
+
+def test_identity_is_still_this_node_s_own() -> None:
+    """The whole reason the original rule existed. It must survive the fix.
+
+    A node promoted carrying the leader's `node_id` renews the LEADER's lease,
+    and both nodes then believe they lead.
+    """
+    from custom_components.cluster_state_sync.scripts.fileset_identity import graft_entries
+
+    leader = _ar0066_entry("tiger1", notify_services=["notify.phone"])
+    grafted = graft_entries(_ar0066_store(leader), [_ar0066_entry("tiger2")])
+    got = grafted["data"]["entries"][0]
+
+    assert got["data"]["node_id"] == "tiger2", "the promoted node took the peer's identity"
+    assert got["data"]["ha_container"] == "ha-tiger2", "a host path was inherited"
+
+
+def test_a_field_nobody_listed_stays_local() -> None:
+    """🚨 Default-deny, which is the property the original rule protected.
+
+    A per-node setting added in a year must be preserved without anyone having
+    to remember this function exists.
+    """
+    from custom_components.cluster_state_sync.scripts.fileset_identity import graft_entries
+
+    leader = _ar0066_entry("tiger1", some_future_per_node_thing="the leader's")
+    mine = _ar0066_entry("tiger2", some_future_per_node_thing="ours")
+    grafted = graft_entries(_ar0066_store(leader), [mine])
+
+    assert grafted["data"]["entries"][0]["options"]["some_future_per_node_thing"] == "ours"
+
+
+def test_an_unconfigured_leader_does_not_wipe_the_standby() -> None:
+    """One node's missing configuration must not become two."""
+    from custom_components.cluster_state_sync.scripts.fileset_identity import graft_entries
+
+    leader = _ar0066_entry("tiger1")  # no alerting at all
+    mine = _ar0066_entry("tiger2", notify_services=["notify.phone"])
+    grafted = graft_entries(_ar0066_store(leader), [mine])
+
+    assert grafted["data"]["entries"][0]["options"]["notify_services"] == ["notify.phone"]
+
+
+def test_the_replication_scope_crosses_too() -> None:
+    """A standby replicating a different set restores a different house."""
+    from custom_components.cluster_state_sync.scripts.fileset_identity import graft_entries
+
+    leader = _ar0066_entry("tiger1", include_domains=["climate"], exclude_devices=["dev1"])
+    mine = _ar0066_entry("tiger2", include_domains=["timer"])
+    grafted = graft_entries(_ar0066_store(leader), [mine])
+    got = grafted["data"]["entries"][0]["options"]
+
+    assert got["include_domains"] == ["climate"]
+    assert got["exclude_devices"] == ["dev1"]

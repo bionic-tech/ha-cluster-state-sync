@@ -174,6 +174,18 @@
           "statistics_window_days": "Also how long the standby may be switched off and still catch up completely. 30 days costs about 4.5 MB per update; 90 days about 12.5 MB.",
           "statistics_interval_minutes": "How much history a failover can lose. Home Assistant compiles statistics every five minutes, so anything faster than that republishes the same data."
         }
+      },
+      "alerts": {
+        "title": "Who hears about it",
+        "description": "Every failure this integration can detect is, so far, visible only to somebody **looking** at Home Assistant. For a cluster whose whole point is that the house keeps working while you are away, that stops one step short.\n\n**You can submit this page untouched.** The defaults raise a persistent notification — which every administrator sees — for the four conditions that change whether the house is protected *right now*. The statistics conditions are left off deliberately: they can wait until Saturday, and an alarm that cries wolf is one nobody believes at 3am.\n\n**Adding a notify service is what reaches you when you are out.** Any `notify.` service works — the Home Assistant mobile app, Discord, Slack, Telegram, email. Home Assistant already holds those credentials; this integration never sees them and stores only the service name.\n\nYou can type a service that does not exist yet — a phone you have not paired, for instance. A name that never resolves costs an alert and a warning in the log; it can never stop the cluster.",
+        "data": {
+          "notify_conditions": "Tell me about",
+          "notify_services": "Send to (optional)"
+        },
+        "data_description": {
+          "notify_conditions": "Unticking a condition silences the push only. The repairs card and the diagnostic entities are always raised, so nothing is hidden — you just are not interrupted.",
+          "notify_services": "Leave empty and alerts still reach every administrator as a persistent notification inside Home Assistant."
+        }
       }
     },
     "error": {
@@ -208,37 +220,69 @@
     "statistics_stalled": {
       "title": "Standby's history replication has gone quiet",
       "description": "The standby has not reported applying long-term statistics for several publish intervals ({detail})\n\nThis alarm exists because silence used to be indistinguishable from success: the standby's status expires, the warnings clear themselves, and replication that had stopped looked exactly like replication that was working."
+    },
+    "devices_disabled": {
+      "title": "Promoted without {count} device(s)",
+      "description": "This node started with **{count} config entry(s) switched off** because their hardware is not attached here: {detail}\n\nThat is deliberate. A node missing a radio is more use than one whose integrations fail at setup and stay failed until somebody restarts it by hand — so the promotion pre-flight disables them and lets the node come up.\n\n**But whatever those devices do is not happening.** If this node is expected to have that hardware, check the device path: it usually embeds the unit's serial number, so a *different* physical device on this machine will not match the path the other node wrote. A stable `udev` symlink pointing at whichever unit is present on each host is the usual answer.\n\nRe-enable the entries under **Settings → Devices & services** once the hardware is there. This message clears itself on the next promotion that finds everything."
     }
   },
   "options": {
     "step": {
       "init": {
         "title": "Cluster State Sync options",
+        "menu_options": {
+          "connection": "Backend connection — where Valkey is and how to reach it",
+          "alerts": "Alerts — who hears about a failover, and how",
+          "replication": "Replication — which entities and devices cross to the standby",
+          "ingress": "Front door — whether the address you type still reaches this cluster"
+        }
+      },
+      "connection": {
+        "title": "Backend connection"
+      },
+      "alerts": {
+        "title": "Who hears about it",
+        "description": "Every failure this integration can detect is, so far, visible only to somebody **looking** at Home Assistant. For a cluster whose whole point is that the house keeps working while you are away, that stops one step short.\n\n**You can submit this page untouched.** The defaults raise a persistent notification — which every administrator sees — for the four conditions that change whether the house is protected *right now*. The statistics conditions are left off deliberately: they can wait until Saturday, and an alarm that cries wolf is one nobody believes at 3am.\n\n**Adding a notify service is what reaches you when you are out.** Any `notify.` service works — the Home Assistant mobile app, Discord, Slack, Telegram, email. Home Assistant already holds those credentials; this integration never sees them and stores only the service name.\n\nYou can type a service that does not exist yet — a phone you have not paired, for instance. A name that never resolves costs an alert and a warning in the log; it can never stop the cluster.",
         "data": {
-          "redis_host": "Host",
-          "redis_port": "Port",
-          "redis_password": "Password (leave blank if none)",
-          "redis_db": "Database number",
-          "redis_sentinel_hosts": "Sentinel hosts (comma-separated host:port)",
-          "redis_sentinel_service": "Sentinel master service name",
-          "cluster_namespace": "Cluster namespace",
-          "node_id": "This node's identifier",
-          "cluster_secret": "Cluster secret (must be identical on both nodes)",
-          "redis_use_tls": "Use TLS",
-          "redis_tls_ca_certs": "TLS CA certificate path (blank = system trust store)",
-          "leadership_source": "Leadership signal",
-          "leadership_entity": "Leadership entity (only for the 'entity' signal)",
-          "gate_recorder": "Stop recorder writes on the follower (needs a shared recorder database)",
-          "gate_automations": "Stop automations on the follower (warm standby only)",
-          "snapshot_interval": "Snapshot interval (seconds)",
-          "restore_max_age": "Maximum snapshot age to restore (seconds)"
+          "notify_conditions": "Tell me about",
+          "notify_services": "Send to (optional)"
         },
         "data_description": {
-          "cluster_secret": "Signs every snapshot entry so a node only accepts state written by its peer. Copy this exact value to the other node — a mismatch means neither will restore from the other. Without it, nothing is restored at all.",
-          "redis_use_tls": "Strongly recommended if you mirror person, device_tracker or alarm_control_panel entities, which otherwise cross the network in the clear.",
-          "leadership_source": "Only the leader writes to the shared snapshot. 'always' suits a single node or a cold standby whose HA is stopped. 'entity' follows a flag your Keepalived notify_master/notify_backup scripts toggle. 'lease' takes a TTL lease in Valkey and is the strongest option — it is the split-brain guard, since VRRP alone can dual-master under a partition."
+          "notify_conditions": "Unticking a condition silences the push only. The repairs card and the diagnostic entities are always raised, so nothing is hidden — you just are not interrupted.",
+          "notify_services": "Leave empty and alerts still reach every administrator as a persistent notification inside Home Assistant."
+        }
+      },
+      "ingress": {
+        "title": "Can anyone still get in?",
+        "description": "**Your cluster can fail over perfectly and still leave you locked out.** That is not hypothetical: it happened on the reference pair. The lease moved, the radios followed, Home Assistant came up healthy and ran the house — and the address on the phone still pointed at the machine that had died and returned **502**. Every check the cluster performed was green, because every check the cluster performed looked inwards.\n\nGive it the address **you** type, and whichever node holds the lease will request it once a minute and tell you when it stops answering.\n\n### 🚨 What a green reading does not prove\n\nThe request is made from inside Home Assistant, on the node itself, on your own network. So:\n\n- **It cannot prove somebody outside can reach you.** If you use split-horizon DNS — normal for anyone reaching Home Assistant through a tunnel — this hostname resolves to a local address from in here and to your tunnel from a phone on mobile data. The check then tests a path no outside user ever takes, and stays green while the tunnel is down. No probe launched from inside a network can test the path that starts outside it. For that half, use an external uptime monitor.\n- **It cannot prove *this* node answered.** Something at that address responded. Behind a proxy, or in a warm-standby pair, that may have been the other node.\n- **It cannot prove you can log in.** Redirects are not followed, so an SSO challenge counts as the door working.\n\nA **red** reading is the trustworthy direction: if this cannot reach the address from a machine on the same network as the service, nobody further away is getting in either.\n\nNone of the infrastructure — DNS, proxies, tunnels, floating addresses — is moved by this integration, and it never will be. See `GUIDE-ingress.md`, which carries its own no-warranty notice. This page only makes the cluster **look**.",
+        "data": {
+          "ingress_url": "Your Home Assistant address",
+          "ingress_verify_tls": "Check the certificate"
+        },
+        "data_description": {
+          "ingress_url": "The whole address including the scheme, as in `https://home.example.com`. Leave it empty to switch the check off entirely — that is the default, and no entity or alert is created. 401 and 403 count as reachable: being refused proves something is there to refuse you.",
+          "ingress_verify_tls": "Turn this off if you terminate TLS on a certificate Home Assistant has no reason to trust — an internal CA or a self-signed one. The check still answers “did anything answer at that address”; it just stops asking who. Better than a check that is red for ever and gets switched off along with the real alarm."
+        }
+      },
+      "replication": {
+        "title": "What crosses to the standby",
+        "description": "These four settings decide whether an entity's **live value** is mirrored and restored on the node that takes over. They apply in the order shown, and an exclusion always beats an inclusion.\n\n**Domains** is an allowlist — anything not listed does not cross. The defaults are conservative on purpose: stateful things a promoted node cannot recompute, and nothing whose restore could actuate hardware.\n\n**Adding `light` or `switch` is a real decision.** Restoring one writes a state change, and a state change is what automations trigger on — so a restored value can fire an automation and turn real things on.\n\n`sensor` and `binary_sensor` are absent deliberately: their values are re-read from the device on the new node within seconds, so a restored reading is stale before anyone sees it — and they are the bulk of all state churn. If one genuinely cannot be re-derived, add that single entity below rather than the whole domain.\n\n**This page is not about your configuration.** Entity and device *settings* — enabled, hidden, area, renames — live in `.storage` and are replicated in full by the fileset regardless of anything here.\n\n**`automation` is a special case, and a useful one.** Whether an automation is enabled is a decision you made, and it crosses nowhere by default — a promoted node restores it from *its own* memory of whenever it last ran. Adding `automation` here makes it cross, and it is applied by calling `automation.turn_on`/`turn_off` rather than by writing the state, because an automation's component owns its own state: writing it would show \"off\" while the automation kept firing.",
+        "data": {
+          "include_domains": "Domains that cross",
+          "include_entities": "Also cross these specific entities",
+          "exclude_entities": "Never cross these entities",
+          "exclude_devices": "Never cross anything from these devices"
+        },
+        "data_description": {
+          "include_domains": "Offered from the domains this instance actually has, plus the defaults. You can type one that is not listed yet.",
+          "include_entities": "For a single entity in a domain you do not want wholesale — a utility meter total, a manually-set counter.",
+          "exclude_entities": "Beats everything above. Use for one entity that is specific to this machine.",
+          "exclude_devices": "Shorthand for excluding every entity a device exposes, including ones it gains later. The right tool for hardware wired to one node — a radio that does not fail over."
         }
       }
+    },
+    "error": {
+      "invalid_ingress_url": "That is not an address this can request. Include the scheme and a host, as in `https://home.example.com`."
     }
   },
   "entity": {
@@ -281,6 +325,12 @@
       },
       "statistics_age": {
         "name": "Statistics replication age"
+      },
+      "replicated_domains": {
+        "name": "Replicated domains"
+      },
+      "replication_exclusions": {
+        "name": "Replication exclusions"
       }
     },
     "binary_sensor": {
@@ -295,6 +345,9 @@
       },
       "maintenance_hold": {
         "name": "Maintenance hold"
+      },
+      "ingress_reachable": {
+        "name": "Ingress reachable"
       }
     },
     "button": {
@@ -335,6 +388,21 @@
       "options": {
         "shared": "Shared — one database both machines use (PostgreSQL / MariaDB)",
         "dedicated": "Dedicated — each machine keeps its own SQLite file"
+      }
+    },
+    "notify_conditions": {
+      "options": {
+        "promoted": "Failover — the house has moved to the other node",
+        "restored_nothing": "Failover restored NOTHING from the other node",
+        "recovered": "Recovery — a condition below has cleared",
+        "backend_lost": "Valkey unreachable — the cluster can no longer fail over",
+        "fileset_degraded": "Promoted with an incomplete configuration",
+        "statistics_schema_mismatch": "Statistics replication has stopped (schema)",
+        "statistics_gap": "Statistics history has a gap",
+        "statistics_not_seeded": "Statistics have never been seeded",
+        "statistics_stalled": "Statistics replication has stalled",
+        "ingress_unreachable": "Nobody can get in — your Home Assistant address stopped answering",
+        "devices_disabled": "Promoted with hardware missing, so entries were switched off"
       }
     }
   },

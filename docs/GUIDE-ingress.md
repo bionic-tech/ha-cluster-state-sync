@@ -16,6 +16,9 @@ way in.** This guide is about that half.
 > We would rather write this down and be honest about its limits than leave you
 > to discover the gap during an outage.
 
+> Its companion, [GUIDE-infrastructure.md](GUIDE-infrastructure.md), covers the
+> machines underneath — radios, updates, maintenance reboots and monitoring.
+
 ---
 
 ## The one thing to understand
@@ -160,28 +163,42 @@ container will claim it and the service fails with `address already in use`.
 
 **Does NOT protect:** anything arriving from outside your network.
 
-> [!WARNING]
-> **This integration does not yet give you the right moment to claim it.**
-> The promoter offers two hook points — `pre-start.d/` (before the container
-> starts) and `post-stop.d/` (after it stops). Releasing an address fits
-> `post-stop.d/` perfectly. **Claiming one does not fit either**, because the
-> rule above says claim *after* Home Assistant answers, and there is no
-> post-start moment. Found 2026-09-09 by trying to write the example; tracked
-> as AR-0064.
+> [!TIP]
+> **The promoter gives you the moment this needs.** Three hook points:
 >
-> Two things you can do today:
+> | | runs | for |
+> |---|---|---|
+> | `pre-start.d/` | before `docker start` | radios — a container's `/dev` is a snapshot taken at start |
+> | `post-start.d/` | **after Home Assistant answers** | claiming an address |
+> | `post-stop.d/` | after the container stops | releasing an address |
 >
-> * **Claim in `pre-start.d/` and accept a short window.** The address arrives
->   before Home Assistant is answering, so for roughly its boot time — about
->   25 seconds on the reference fleet — the address is up and returns errors.
->   For a home network that is usually fine. For anything health-checking the
->   address, it is not: the check sees a live host and stops looking.
-> * **Do not use a hook at all.** The promoter writes the current role to
->   `/run/cluster-sync/vrrp-state`. A small systemd unit of your own can watch
->   that file and manage the address independently — claiming only once Home
->   Assistant answers, and releasing whenever the file stops saying `MASTER`.
->   This is more code but it is the shape that actually satisfies both rules,
->   and it does not wait on us.
+> `post-start.d/` is the opposite of the radios on purpose. An address claimed
+> while Home Assistant is still booting accepts connections and returns 502 —
+> worse than no address, because a health check sees a live host and stops
+> looking. So the promoter polls until the instance actually answers, then runs
+> your hooks.
+>
+> It waits up to **180 seconds** (`CLUSTER_SYNC_HA_READY_TIMEOUT` to change it)
+> and then runs them **anyway**, with `CLUSTER_SYNC_HA_READY` set to `1` or
+> `0`. Refusing to run them would leave an unreachable node unreachable;
+> running them blindly would claim an address for a black hole. So it tells you
+> what it saw and your script decides:
+>
+> ```bash
+> #!/usr/bin/env bash
+> # post-start.d/20-vip-claim.sh
+> if [[ "${CLUSTER_SYNC_HA_READY:-0}" != "1" ]]; then
+>     logger -t vip "Home Assistant never answered — NOT claiming the address"
+>     exit 0
+> fi
+> ip addr add 192.168.1.50/24 dev eth0
+> ```
+>
+> Releasing must be unconditional, in `post-stop.d/`, or a demoting node keeps
+> the address and ARP decides your traffic.
+>
+> *(This gap was AR-0064, found by trying to write this very example. Fixed
+> 2026-09-10.)*
 
 ### Pattern B — a health-checking proxy on a third machine
 
@@ -578,11 +595,87 @@ renewal — that note is what tells you whether you need to test again.
 | Moves USB radios (if reachable over IP) | ✅ via hooks you supply |
 | Moves your **address, DNS, proxy or tunnel** | ❌ **yours** |
 | Tells you the cluster cannot fail over | ✅ `binary_sensor.<node>_backend` |
-| Tells you your ingress is broken | ❌ nothing here can see it |
+| Tells you your ingress **stopped answering** | ⚠️ optional, and only from inside — see below |
+| Tells you an **outside** user cannot get in | ❌ **nothing here can see that** |
 
-That last row is the one to sit with. **None of the cluster's probes look at
-whether anyone can still reach it.** If you build an ingress path, monitor it
-separately — from outside, the way a user would.
+The last two rows are the ones to sit with, and the difference between them is
+the whole of the next section.
+
+---
+
+## The front-door check — what the cluster can now see, and what it still cannot
+
+**The answer to "does anything tell me my ingress is broken?" used to be simply
+no**, and that is how the incident behind this page happened: a failover
+that succeeded on every measure the cluster owned — lease moved, radios
+followed, Home Assistant healthy — while the address on the phone still pointed
+at the machine that had died and returned **502**. Every check was green. Nobody
+could open the app.
+
+The infrastructure on this page is still yours, and always will be. What has
+changed is smaller and entirely ours: **the cluster now looks.**
+
+### Switching it on
+
+**Settings → Devices & services → Cluster State Sync → Configure → Front door.**
+
+Type the address *you* type — `https://home.example.com` — and the node holding
+the lease will request it once a minute. You get:
+
+* `binary_sensor.<node>_ingress_reachable`, with the last status code, the last
+  error, the latency and when it was last checked;
+* a push alert (`Nobody can get in`) after **three consecutive failures**, on
+  whatever `notify.` service you already configured under *Alerts*, and an
+  all-clear when it comes back.
+
+It is **off until you type an address**. No entity, no request, no alert.
+
+Only the leader probes. A standby checking the shared address proves nothing
+about the node that is supposed to be answering, and would let the machine
+least able to judge an outage raise the alarm about one.
+
+### 🚨 What a green reading does not prove
+
+This is the part to read twice, because a health check believed further than it
+can see is worse than no health check — it is this page's incident with a tick
+next to it.
+
+The request leaves Home Assistant **on the node itself, inside your own
+network**. Therefore:
+
+* **It cannot prove somebody outside can reach you.** If you run split-horizon
+  DNS — and nearly everyone reaching Home Assistant through a tunnel does —
+  `home.example.com` resolves to a local address from inside the house and to
+  your tunnel endpoint from a phone on mobile data. The probe then tests a path
+  no external user ever takes, and stays green while the tunnel is down. No
+  probe launched from inside a network can test a path that starts outside it.
+  **For that half you still need an external uptime monitor**, exactly as the
+  drill below says.
+* **It cannot prove *this node* answered.** Something at that address served a
+  response. Behind a proxy, or in a warm-standby pair, it may have been the
+  other node.
+* **It cannot prove you can log in.** Redirects are deliberately not followed,
+  so an SSO challenge (`302`, `401`, `403`) counts as the front door working.
+  A door that answers and an identity provider that will let you through are
+  different facts; this measures the first.
+
+A **red** reading is the trustworthy direction. If the service cannot be reached
+from a machine on its own network, nobody further away is getting in either.
+
+### Reading the result
+
+| what you see | what it usually means |
+|---|---|
+| `502`, `503`, `504` | the proxy is up and has nothing alive behind it — the classic post-failover symptom |
+| `404` | a routing rule pointing at something that no longer exists |
+| no status, a connection error | DNS still resolving to the dead node, or nothing listening |
+| `no answer within 10s` | a hung proxy or a tunnel that has not reconnected |
+| `401` / `403` | **not a fault** — your SSO refusing an unauthenticated probe |
+
+If your front door uses a certificate this container has no reason to trust — an
+internal CA, or a self-signed one — untick **Check the certificate** rather than
+turning the whole check off. It then still answers "did anything answer at that
+address", which is the question that matters here.
 
 ---
 

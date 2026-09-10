@@ -780,6 +780,72 @@ def _hooks(kind: str) -> str:
     )
 
 
+#: How long the promoter waits for Home Assistant to answer before running the
+#: `post-start.d/` hooks anyway.
+#:
+#: Generous, because that is the honest number: 46 seconds measured on the
+#: reference leader between our own setup finishing and the instance being
+#: ready. A cap well above it, so an ordinary boot is never reported degraded.
+HA_READY_TIMEOUT_SECONDS = 180
+
+
+def _wait_for_ha(cfg: dict[str, Any]) -> str:
+    """Poll Home Assistant until it answers, then let the hooks run.
+
+    🚨 AR-0064. `pre-start.d/` is before `docker start` and `post-stop.d/` is
+    after the container stops, so this project's own ingress guidance -- claim
+    a floating address only **after** Home Assistant answers -- described a
+    moment that did not exist. It was found by trying to write the example we
+    recommend, not by reasoning about it.
+
+    Running the hooks straight after `docker start` would not have fixed it.
+    The container is up in a second and the instance takes the best part of a
+    minute; an address claimed in between accepts connections and returns 502,
+    which is worse than no address at all because a health check sees a live
+    host and stops looking.
+
+    So the wait is the feature. `curl` is used rather than anything installed,
+    and any HTTP response at all counts -- including 401, which is what a
+    correctly configured instance returns to an unauthenticated request. We are
+    asking "is something serving?", not "may I in?".
+
+    `CLUSTER_SYNC_HA_READY_TIMEOUT` overrides the cap, which a drill or a test
+    needs and an operator with an unusually slow instance may too.
+
+    **The hooks run either way**, with `CLUSTER_SYNC_HA_READY` set to 1 or 0.
+    Refusing to run them on timeout would mean an unreachable node stays
+    unreachable, and running them blindly would claim an address for a black
+    hole -- so the promoter reports what it observed and the hook decides,
+    which is the same division of labour `_hooks` already describes: the
+    promoter provides the moment, the operator provides the script.
+    """
+    # The same URL design D3's probe uses, via the same helper, so the promoter
+    # and its readiness wait cannot disagree about where Home Assistant is --
+    # including the loopback fallback for `network_mode: host`.
+    url = _promoter_ha_url(cfg)
+    return (
+        f"# AR-0064: give the post-start hooks the moment they were promised --\n"
+        f"# Home Assistant ANSWERING, not merely the container existing.\n"
+        f"CLUSTER_SYNC_HA_READY=0\n"
+        f'for _ in $(seq 1 "${{CLUSTER_SYNC_HA_READY_TIMEOUT:-{HA_READY_TIMEOUT_SECONDS}}}"); do\n'
+        f'    if curl -s -o /dev/null -m 2 "{url}" ; then\n'
+        f"        CLUSTER_SYNC_HA_READY=1\n"
+        f"        break\n"
+        f"    fi\n"
+        f"    sleep 1\n"
+        f"done\n"
+        f'if [[ "$CLUSTER_SYNC_HA_READY" == "1" ]]; then\n'
+        f"    logger -t cluster-sync 'Home Assistant is answering; running post-start hooks'\n"
+        f"else\n"
+        f"    logger -t cluster-sync 'Home Assistant did NOT answer within"
+        f" {HA_READY_TIMEOUT_SECONDS}s -- running post-start hooks anyway with"
+        f" CLUSTER_SYNC_HA_READY=0. A hook that claims an address should check it.'\n"
+        f"fi\n"
+        f"export CLUSTER_SYNC_HA_READY\n"
+        f"\n"
+    )
+
+
 def _compose_prefix(cfg: dict[str, Any]) -> str:
     """`docker compose` with this installation's file, profile and env.
 
@@ -896,6 +962,9 @@ def _notify_master(cfg: dict[str, Any], warm: bool) -> str:
             "  logger -t cluster-sync 'device pre-flight failed; starting anyway'\n"
             "\n"
             f"{_start_ha(cfg)}\n"
+            "\n"
+            f"{_wait_for_ha(cfg)}"
+            f"{_hooks('post-start')}"
         )
     # Warm cannot install identity under a live Home Assistant. This instance
     # is already running and holds .storage (and the other stores the swap

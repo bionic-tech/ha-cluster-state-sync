@@ -491,6 +491,17 @@ REQUIRED_RUNTIME_SLOTS = (
     "coordinator",
     "cluster_view",
     "stats",
+    # v0.4.2. Read by the statistics repair path and by `clear_degraded`,
+    # both of which treat a missing router as "alerting is off" rather than
+    # as an error -- so dropping this slot would silently disable every
+    # notification while the cluster went on reporting itself healthy.
+    "alerts",
+    # AR-0060. `binary_sensor.py` decides whether the ingress entity exists at
+    # all from this slot, so a setup path that left it absent would silently
+    # produce no front-door check for an operator who configured one -- the
+    # same blind spot AR-0060 was raised for, now with a settings page
+    # implying it had been closed.
+    "ingress",
 )
 
 

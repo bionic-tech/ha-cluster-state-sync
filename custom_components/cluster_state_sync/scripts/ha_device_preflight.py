@@ -53,6 +53,19 @@ _LOCAL_PREFIXES = ("/dev/",)
 # here also travels across the network for the life of the cluster.
 KEEP_BACKUPS = 5
 
+#: Where the pre-flight leaves a record of what it switched off.
+#:
+#: 🚨 Disabling quietly is the whole failure this file was written to avoid,
+#: one level up. A standby that comes up missing three radios is useful; a
+#: standby that comes up missing three radios and says nothing is how somebody
+#: discovers it a fortnight later, when they needed one.
+#:
+#: The integration reads this at setup and turns it into a repair and a push,
+#: exactly as it already does for the degraded go-bag marker. Written next to
+#: `core.config_entries` because that is the directory this script is already
+#: given and already writes to; the integration is handed the same path.
+PREFLIGHT_MARKER_NAME = ".cluster_sync_preflight.json"
+
 
 class Attachment(Enum):
     """How a device is attached, which decides whether it can follow a failover."""
@@ -222,6 +235,46 @@ def apply_plan(storage_dir: Path, plan: Plan) -> None:
         if entry["entry_id"] in doomed:
             entry["disabled_by"] = "integration"
     target.write_text(json.dumps(payload, indent=2))
+    _write_marker(storage_dir, plan)
+
+
+def _write_marker(storage_dir: Path, plan: Plan) -> None:
+    """Leave a record for the integration to raise an alarm from.
+
+    Written on EVERY apply, including one that disabled nothing -- the file is
+    then removed. Otherwise a marker from a previous promotion outlives the
+    problem and the operator is told about radios that came back, which is the
+    quickest way to make somebody stop reading the alert.
+
+    Best-effort: a marker that cannot be written must not abort a promotion.
+    The node is already starting degraded and the whole point of this script is
+    that degraded beats not starting.
+    """
+    marker = storage_dir / PREFLIGHT_MARKER_NAME
+    try:
+        if not plan.to_disable:
+            marker.unlink(missing_ok=True)
+            return
+        marker.write_text(
+            json.dumps(
+                {
+                    "disabled_at": _stamp(),
+                    "present_count": plan.present_count,
+                    "untouched_count": plan.untouched_count,
+                    "disabled": [
+                        {"entry_id": eid, "domain": domain, "device": device}
+                        for eid, domain, device in plan.details
+                    ],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        sys.stderr.write(
+            f"warning: could not write {marker}; this node is starting with "
+            f"{len(plan.to_disable)} config entries disabled and nothing will say so\n"
+        )
 
 
 def _container_running(name: str) -> bool:

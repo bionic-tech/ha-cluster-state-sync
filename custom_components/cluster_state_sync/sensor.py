@@ -24,6 +24,7 @@ from .const import (
     CLOCK_SKEW_WARN_SECONDS,
     CONF_RADIO_WATCH,
     DATA_CLUSTER_VIEW,
+    DATA_CONFIG,
     DATA_COORDINATOR,
     DATA_DEGRADED_MARKER,
     DATA_FILESET,
@@ -36,6 +37,7 @@ from .coordinator import BackendHealthCoordinator, ClusterViewCoordinator, SyncS
 from .entity import ClusterSyncDiagnosticEntity, ClusterViewEntity, MirrorBackedEntity
 from .fileset import REPLICATED_DIRS, REPLICATED_FILES, FilesetPublisher
 from .includes import scan as scan_includes
+from .scope import replication_scope
 
 
 def watch_patterns(data: Mapping[str, Any]) -> list[str]:
@@ -78,6 +80,8 @@ async def async_setup_entry(
             UnreplicatedReferencesSensor(coordinator, entry, hass.config.path()),
             OversizedEntitiesSensor(coordinator, entry, runtime[DATA_STATS]),
             RecorderSnapshotAgeSensor(coordinator, entry, runtime[DATA_STATS]),
+            ReplicationScopeSensor(coordinator, entry, hass, runtime[DATA_CONFIG]),
+            ReplicationExclusionsSensor(coordinator, entry, hass, runtime[DATA_CONFIG]),
             # Only where statistics replication is actually configured. An
             # age sensor for a mechanism that is switched off would read as
             # a broken mechanism, which is worse than no sensor at all.
@@ -184,6 +188,92 @@ class EntitiesRestoredSensor(ClusterSyncDiagnosticEntity, SensorEntity):
     def extra_state_attributes(self) -> dict[str, str | None]:
         last = self._stats.last_restore_at
         return {"last_restore_at": last.isoformat() if last else None}
+
+
+class ReplicationScopeSensor(ClusterSyncDiagnosticEntity, SensorEntity):
+    """Which domains cross, and which of the ones you run do not.
+
+    Answering "is my thermostat replicated?" previously meant reading
+    `_should_track` and evaluating a four-step precedence chain by hand. The
+    scope is configuration, so nothing was wrong -- it was simply never
+    surfaced, which is the same shape as every other silent thing this project
+    has had to go back and expose.
+
+    `not_replicated_domains` deliberately lists only domains this instance
+    ACTUALLY HAS. Every domain in Home Assistant would be noise; the useful
+    question is "what do I run that is not crossing?".
+    """
+
+    _attr_translation_key = "replicated_domains"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "domains"
+
+    def __init__(
+        self,
+        coordinator: BackendHealthCoordinator,
+        entry: ConfigEntry,
+        hass: HomeAssistant,
+        cfg: dict[str, Any],
+    ) -> None:
+        super().__init__(coordinator, entry, "replicated_domains")
+        self._hass = hass
+        self._cfg = cfg
+
+    @property
+    def native_value(self) -> int:
+        return len(replication_scope(self._hass, self._cfg)["replicated_domains"])
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        scope = replication_scope(self._hass, self._cfg)
+        return {
+            "replicated_domains": scope["replicated_domains"],
+            "not_replicated_domains": scope["not_replicated_domains"],
+            "also_replicated_entities": scope["also_replicated_entities"],
+        }
+
+
+class ReplicationExclusionsSensor(ClusterSyncDiagnosticEntity, SensorEntity):
+    """Everything the operator has explicitly kept local.
+
+    Reads the number of entities that will NOT cross because somebody said so
+    -- named entities plus everything belonging to an excluded device. The
+    device count is not the useful number: excluding one device can hold back
+    fifteen entities, and fifteen is what changes what a promoted node knows.
+    """
+
+    _attr_translation_key = "replication_exclusions"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "entities"
+
+    def __init__(
+        self,
+        coordinator: BackendHealthCoordinator,
+        entry: ConfigEntry,
+        hass: HomeAssistant,
+        cfg: dict[str, Any],
+    ) -> None:
+        super().__init__(coordinator, entry, "replication_exclusions")
+        self._hass = hass
+        self._cfg = cfg
+
+    @property
+    def native_value(self) -> int:
+        scope = replication_scope(self._hass, self._cfg)
+        return len(set(scope["excluded_entities"]) | set(scope["entities_excluded_by_device"]))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        scope = replication_scope(self._hass, self._cfg)
+        return {
+            "excluded_entities": scope["excluded_entities"],
+            "excluded_devices": scope["excluded_devices"],
+            "entities_excluded_by_device": scope["entities_excluded_by_device"],
+            # Not an exclusion the operator chose, so it is reported apart from
+            # the ones they did -- but it IS refused, and a scope report that
+            # omitted it would be lying by omission (AR-0038).
+            "leadership_entity_refused": scope["leadership_entity_refused"],
+        }
 
 
 class FilesetAgeSensor(ClusterSyncDiagnosticEntity, SensorEntity):
