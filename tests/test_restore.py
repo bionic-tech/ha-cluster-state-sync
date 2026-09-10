@@ -949,3 +949,45 @@ async def test_an_unknown_automation_state_falls_back_to_a_state_write(
     backend.stored = {"automation.broken": peer_entry("automation.broken", "unavailable")}
     await boot_with_snapshot(hass, backend, dict(backend.stored), include_domains=["automation"])
     assert hass.states.get("automation.broken").state == "unavailable"
+
+
+async def test_a_device_backed_domain_restores_cosmetically_only(
+    hass: HomeAssistant, backend: FakeBackend
+) -> None:
+    """🚨 Pinning what actually happens if somebody adds `light` or `switch`.
+
+    The restore writes Home Assistant's state machine; it does not command the
+    device. The integration that owns the light still believes what it
+    believed and corrects the value the next time it reports — so the operator
+    gets a reading that flips, fires their automations on the way past, and
+    then reverts. The risk without the benefit.
+
+    `automation` is the exception because it goes through
+    `RESTORE_BY_SERVICE`. Extending that to `light` would mean a promotion
+    switching real things on in someone's house, which this integration
+    deliberately will not do — so the honest answer is to document it, and to
+    have a test that fails if anyone quietly adds one.
+    """
+    from custom_components.cluster_state_sync.const import RESTORE_BY_SERVICE
+
+    assert set(RESTORE_BY_SERVICE) == {"automation"}, (
+        "a domain was added to RESTORE_BY_SERVICE. If it commands hardware, a "
+        "promotion now actuates devices in someone's house — which is a much "
+        "larger decision than seeding a value, and needs its own argument."
+    )
+
+    # And the documentation must keep saying so, in both places it is said.
+    import json
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "custom_components/cluster_state_sync"
+    for name in ("strings.json", "translations/en.json"):
+        d = json.loads((root / name).read_text(encoding="utf-8"))
+        for text in (
+            d["config"]["step"]["domains"]["description"],
+            d["options"]["step"]["replication"]["description"],
+        ):
+            assert "does not actually work" in text, (
+                f"{name}: the light/switch caveat has been dropped — people will "
+                "add those domains expecting them to restore"
+            )

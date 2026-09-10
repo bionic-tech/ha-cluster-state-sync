@@ -371,6 +371,12 @@ BUNDLE_DIR_NAME: Final = "cluster_state_sync_bundle"
 # about. Entries written before versioning are treated as version 1. Landing
 # this alongside the AR-0001 rewrite means the AR-0005 signature field can be a
 # version bump the reader already understands, rather than a second migration.
+# Config-entry schema version. `ClusterStateSyncConfigFlow.VERSION` and
+# `async_migrate_entry` both read this so they cannot drift apart; a test pins
+# that they agree. Distinct from SCHEMA_VERSION below, which versions the
+# on-the-wire snapshot format, not the config entry.
+CONFIG_ENTRY_VERSION: Final = 2
+
 SCHEMA_VERSION: Final = 1
 
 # Seconds a shutdown flush may take before we give up and let HA finish dying.
@@ -452,7 +458,15 @@ SENSITIVE_DOMAINS: Final = frozenset(
 
 # Default entity-domain allowlist — survives failover well, low double-trigger risk.
 # Stateful sensors, modes, vacation/away flags — not transient things like cameras.
+#
+# `automation` leads the list because it is the only domain here that is applied
+# by *calling a service* (`RESTORE_BY_SERVICE`) rather than by writing state, and
+# so the only one whose restore actually takes effect rather than being corrected
+# by the next device poll. It shipped absent from this list until v0.4.4, which
+# meant no fresh install replicated the single most valuable thing we carry —
+# `LEGACY_DEFAULT_INCLUDE_DOMAINS` below exists to migrate those installs.
 DEFAULT_INCLUDE_DOMAINS: Final = [
+    "automation",
     "input_boolean",
     "input_number",
     "input_select",
@@ -465,6 +479,28 @@ DEFAULT_INCLUDE_DOMAINS: Final = [
     "humidifier",
     "water_heater",
 ]
+
+# The allowlist as it shipped before `automation` was added. An entry whose
+# `include_domains` is exactly this set was written by the wizard and never
+# touched by its operator, so migrating it is restoring an intended default
+# rather than overriding a choice. Anything else is a decision somebody made,
+# and the migration leaves it alone. Frozen because it is a historical fact:
+# it must never track DEFAULT_INCLUDE_DOMAINS.
+LEGACY_DEFAULT_INCLUDE_DOMAINS: Final = frozenset(
+    {
+        "input_boolean",
+        "input_number",
+        "input_select",
+        "input_text",
+        "input_datetime",
+        "counter",
+        "timer",
+        "vacuum",
+        "climate",
+        "humidifier",
+        "water_heater",
+    }
+)
 
 # AR-0010: the namespace is interpolated straight into the Redis key, so it is
 # constrained to a charset that cannot forge a key boundary. A colon is the

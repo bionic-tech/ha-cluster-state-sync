@@ -159,8 +159,12 @@ def test_the_optional_inputs_really_are_optional() -> None:
     answer: which entities, and how to be told.
     """
     substituted = _instantiate()
-    assert substituted["triggers"][0]["for"] == {"minutes": 5}
-    assert substituted["triggers"][1]["above"] == 900
+    # Located by id, not by index. The original asserted `triggers[0]` and
+    # `triggers[1]`, which broke the moment a trigger was added in the middle —
+    # and the failure looked like a defaulting bug rather than a renumbering.
+    by_id = {t["id"]: t for t in substituted["triggers"] if "id" in t}
+    assert by_id["backend_unreachable"]["for"] == {"minutes": 5}
+    assert by_id["snapshot_stale"]["above"] == 900
 
 
 def test_the_blueprint_watches_the_fileset() -> None:
@@ -269,3 +273,38 @@ async def test_the_substituted_automation_is_valid(hass) -> None:
 
     assert validated is not None, "Home Assistant rejected the substituted automation"
     assert validated.validation_status is ValidationStatus.OK, validated.validation_error
+
+
+def test_the_blueprint_can_watch_the_front_door() -> None:
+    """AR-0060, for people who use the blueprint rather than the built-in alerts.
+
+    Every other trigger here looks inward — Valkey, the snapshot, the go-bag,
+    what was restored. All of them can be perfectly green while the address a
+    person actually types answers nothing, which is the failure AR-0060 was
+    raised for.
+
+    Checked by wiring rather than by substring: `"ingress" in dumped_yaml`
+    would pass on a blueprint that only mentions it in a description.
+    """
+    blueprint = load(FAILOVER_READINESS)
+    declared = blueprint.data["blueprint"]["input"]
+    assert "ingress_sensor" in declared, "no input to select it"
+    assert "default" in declared["ingress_sensor"], (
+        "the ingress sensor must be optional — most installs have no URL configured"
+    )
+    ids = [t.get("id") for t in blueprint.data["triggers"]]
+    assert "ingress_unreachable" in ids, "the input exists but nothing triggers on it"
+
+
+def test_the_ingress_input_admits_it_cannot_prove_much() -> None:
+    """The honesty that has to travel with this reading wherever it appears.
+
+    A probe from inside the network can be green while an external path is
+    down. Said in the module, the entity, the options page, the guide and the
+    README — and it has to be said here too, because the blueprint is where
+    somebody decides what to be woken for.
+    """
+    text = FAILOVER_READINESS.read_text(encoding="utf-8")
+    block = text[text.index("ingress_sensor:") : text.index("snapshot_age_sensor:")]
+    assert "not proof" in block or "is not" in block
+    assert "split-horizon" in block or "split horizon" in block

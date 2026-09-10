@@ -1082,3 +1082,55 @@ that downloads something that is not JavaScript**. Before suspecting the code:
 Related: §24 is the same shape with a different cause (a cached stale module).
 The content hash fixed that one and cannot fix this one, because the URL is
 new — it is the *answer* that is wrong, not the request.
+
+## 28. Restarting Home Assistant on the leader is a failover
+
+A deploy on 2026-09-10 moved the house without meaning to, and the sequence is
+worth having in front of you because every step of it is correct behaviour:
+
+```
+16:27:14  docker restart homeassistant   (leader, node-a)
+16:27:24  promoter tick — cannot reach HA — RELEASES the lease,
+          drops 4 VirtualHere radios, writes release-holddown (900s)
+16:27:27  the restart command returns.  Three seconds too late.
+~16:28    node-b takes the free lease, promotes, claims the radios
+```
+
+**The promoter probes Home Assistant every 10 seconds and demotes when it cannot
+reach it.** That is the entire point of it — an HA that has died must not keep
+the lease. It has no way to distinguish "died" from "you are restarting me on
+purpose", and it should not guess.
+
+🚨 **So the maintenance hold is not optional politeness before a leader-side
+restart — it is the only thing standing between a deploy and a failover.**
+`/etc/cluster-sync/cluster-hold.sh`, or the hold switch in the panel. Earlier
+deploys in that same session set the hold and stayed MASTER; the one that
+skipped it did not.
+
+**Two things make this worse than a normal failover:**
+
+* **The demoted node's HA can come back up as a BACKUP.** `docker restart`
+  brought Home Assistant back *after* the demotion had run, so both instances
+  were live — the double-automation-firing window, held open indefinitely rather
+  than for the usual few seconds.
+* **node-a owns the Local RFXTRX and it never fails over.** That is the
+  transceiver the firewall RF-recovery watchdog uses, so an accidental promotion
+  of node-b silently removes the fleet's last-resort firewall recovery path.
+
+### The failback, which is a documented path and takes about 45 seconds
+
+Order matters, and getting it backwards leaves the cluster with no eligible node:
+
+1. **Demoted node first:** `cluster-promoter.sh --adopt` — clears its
+   `release-holddown` and records its role, running no notify script.
+2. **Current leader:** write a reason into
+   `<config>/.cluster_sync_handover_request`. Its next tick releases the lease,
+   stops HA there, and consumes the request. A handover deliberately does *not*
+   depend on Home Assistant being unwell — it is the one release that happens
+   while everything is working.
+3. The target takes the free lease on its next tick and promotes; radios follow.
+4. **`--adopt` on the node that handed over**, or its own 900s hold-down leaves
+   the cluster with no standby.
+
+Related: §the hold exists for exactly this, and ADR-006 on why the lease — not a
+second election — decides who is leader.

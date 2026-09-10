@@ -26,6 +26,7 @@ from homeassistant.helpers.selector import (
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
+    SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
@@ -94,6 +95,7 @@ from .const import (
     CONF_STATISTICS_INTERVAL_MINUTES,
     CONF_STATISTICS_WINDOW_DAYS,
     CONF_TOPOLOGY_MODEL,
+    CONFIG_ENTRY_VERSION,
     DEFAULT_CLUSTER_NAMESPACE,
     DEFAULT_DOCKER_NETWORK,
     DEFAULT_FILESET_ENABLED,
@@ -137,6 +139,7 @@ from .const import (
     TOPOLOGY_WARM,
     validate_namespace,
 )
+from .domain_advice import label_for, verdict_for
 from .fileset import REPLICATED_DIRS, REPLICATED_FILES, is_excluded
 from .includes import scan as scan_includes
 from .ingress import InvalidIngressURL, validate_ingress_url
@@ -560,17 +563,37 @@ def _container_schema(d: dict[str, Any]) -> vol.Schema:
     )
 
 
-def _domain_options(hass: HomeAssistant | None) -> list[str]:
-    """Domains to offer, drawn from what this instance actually has.
+def _domain_options(hass: HomeAssistant | None) -> list[SelectOptionDict]:
+    """Domains to offer, each carrying our verdict and the operator's own count.
 
     A fixed list would offer domains the operator does not run and hide the
     ones they do. The defaults are always included even if nothing of that
     domain exists yet, so a default never silently disappears from the form.
+
+    Bare domain names made every option look equally reasonable, and the honest
+    reading of that form was "tick everything you care about". The owner did
+    exactly that on 2026-09-10 and pulled in 2,158 entities, of which 1,970
+    could not benefit from crossing — 1,436 of them `device_tracker`, which
+    rebuilds itself within seconds. Nothing on the form said so.
+
+    So each option now says what we think and why (`domain_advice`), with the
+    number of entities the operator actually has. "device_tracker" and
+    "device_tracker (1436)" are different propositions.
+
+    Ordering is advice too: what is worth replicating sorts first, so the top of
+    the list is the answer for most people and the rest is opt-in.
     """
     found: set[str] = set(DEFAULT_INCLUDE_DOMAINS)
+    counts: dict[str, int] = {}
     if hass is not None:
-        found.update(state.domain for state in hass.states.async_all())
-    return sorted(found)
+        for state in hass.states.async_all():
+            found.add(state.domain)
+            counts[state.domain] = counts.get(state.domain, 0) + 1
+
+    # Worth-it first, then alphabetical inside each group. `not v.worth_it`
+    # sorts False (worth it) before True.
+    ordered = sorted(found, key=lambda d: (not verdict_for(d).worth_it, d))
+    return [SelectOptionDict(value=d, label=label_for(d, count=counts.get(d))) for d in ordered]
 
 
 def _domains_schema(d: dict[str, Any], hass: HomeAssistant | None = None) -> vol.Schema:
@@ -597,8 +620,17 @@ def _domains_schema(d: dict[str, Any], hass: HomeAssistant | None = None) -> vol
                 SelectSelectorConfig(
                     options=_domain_options(hass),
                     multiple=True,
-                    mode=SelectSelectorMode.DROPDOWN,
-                    custom_value=True,
+                    # LIST renders tickboxes; DROPDOWN makes you reopen the menu
+                    # once per domain. Choosing eleven of them was eleven
+                    # separate interactions, which is what this form is for.
+                    #
+                    # `custom_value` is deliberately gone: Home Assistant only
+                    # honours it in DROPDOWN mode, and `_domain_options` already
+                    # offers every default plus every domain this instance
+                    # actually runs. What is lost is typing a domain that is
+                    # neither -- and `include_entities` remains free text for
+                    # exactly that case.
+                    mode=SelectSelectorMode.LIST,
                 )
             ),
             # Escape hatch for one-off entities in a domain you do not want
@@ -806,8 +838,14 @@ def _fileset_schema(d: dict[str, Any], candidates: list[str] | None = None) -> v
                 SelectSelectorConfig(
                     options=list(DEFAULT_FILESET_EXCLUSIONS),
                     multiple=True,
+                    # DROPDOWN, and it is not a downgrade -- it is the truth.
+                    # `custom_value` makes Home Assistant render a multi-select
+                    # as a type-to-add chip box whatever `mode` says, so LIST
+                    # here declared tick boxes the operator never got. These are
+                    # glob patterns; typing one nobody offered is the point of
+                    # the field, so the chip box stays and the mode now matches.
                     custom_value=True,
-                    mode=SelectSelectorMode.LIST,
+                    mode=SelectSelectorMode.DROPDOWN,
                 )
             ),
             vol.Optional(
@@ -835,8 +873,12 @@ def _fileset_schema(d: dict[str, Any], candidates: list[str] | None = None) -> v
                 SelectSelectorConfig(
                     options=list(d.get(CONF_FILESET_EXTRA_CUSTOM, ())),
                     multiple=True,
+                    # The free-text half of the pair above: its only options are
+                    # what is already set, so it exists to be typed into. Same
+                    # correction as the exclusions -- `custom_value` forces the
+                    # chip box, so the mode now says so.
                     custom_value=True,
-                    mode=SelectSelectorMode.LIST,
+                    mode=SelectSelectorMode.DROPDOWN,
                 )
             ),
             vol.Required(
@@ -888,6 +930,13 @@ def _alerts_schema(d: dict[str, Any], hass: HomeAssistant) -> vol.Schema:
                     # revisit made while its integration happens to be down.
                     options=sorted(set(available) | set(chosen)),
                     multiple=True,
+                    # Stays a chip box, and deliberately. Switched to tick boxes
+                    # on 2026-09-10 while making the domain picker multi-select;
+                    # `test_the_alerts_step_offers_loaded_notify_services`
+                    # caught it, and it was right to. You configure alerting
+                    # BEFORE the phone pairs, so the service you need to name
+                    # does not exist yet -- and `custom_value` is the only way
+                    # to name it. That beats the extra round-trips.
                     custom_value=True,
                     mode=SelectSelectorMode.DROPDOWN,
                 )
@@ -950,8 +999,17 @@ def _replication_schema(d: dict[str, Any], hass: HomeAssistant) -> vol.Schema:
                 SelectSelectorConfig(
                     options=_domain_options(hass),
                     multiple=True,
-                    mode=SelectSelectorMode.DROPDOWN,
-                    custom_value=True,
+                    # LIST renders tickboxes; DROPDOWN makes you reopen the menu
+                    # once per domain. Choosing eleven of them was eleven
+                    # separate interactions, which is what this form is for.
+                    #
+                    # `custom_value` is deliberately gone: Home Assistant only
+                    # honours it in DROPDOWN mode, and `_domain_options` already
+                    # offers every default plus every domain this instance
+                    # actually runs. What is lost is typing a domain that is
+                    # neither -- and `include_entities` remains free text for
+                    # exactly that case.
+                    mode=SelectSelectorMode.LIST,
                 )
             ),
             vol.Optional(
@@ -970,7 +1028,10 @@ def _replication_schema(d: dict[str, Any], hass: HomeAssistant) -> vol.Schema:
 class ClusterStateSyncConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle the initial UI setup."""
 
-    VERSION = 1
+    # v2 (0.4.4): `automation` joined DEFAULT_INCLUDE_DOMAINS. Existing entries
+    # whose allowlist is exactly the pre-v2 default are migrated to include it;
+    # see `async_migrate_entry`. Bump CONFIG_ENTRY_VERSION, not this line.
+    VERSION = CONFIG_ENTRY_VERSION
 
     def __init__(self) -> None:
         # Accumulates across steps; each step folds its answers in.
@@ -1221,11 +1282,42 @@ class ClusterStateSyncConfigFlow(ConfigFlow, domain=DOMAIN):
         """
         if user_input is not None:
             self._data.update(user_input)
-            return await self.async_step_container()
+            return await self.async_step_ingress()
 
         return self.async_show_form(
             step_id="alerts",
             data_schema=_alerts_schema(self._data, self.hass),
+        )
+
+    # -- wizard step 4a-ter: can anyone reach it? -------------------------
+
+    async def async_step_ingress(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """The one check the cluster cannot make about itself (AR-0060).
+
+        Placed beside the alerting because it is the same question asked from
+        the other end: the alerts tell you the cluster's opinion of itself, and
+        this asks whether anybody outside can actually get in.
+
+        Skippable, and empty is the default. Offered at install because a
+        setting that exists only under Configure is a setting most people never
+        meet -- and the failure it catches is a promotion that succeeds
+        completely while the front door still points at the dead node.
+        """
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            try:
+                validate_ingress_url(user_input.get(CONF_INGRESS_URL))
+            except InvalidIngressURL as err:
+                _LOGGER.debug("Rejected ingress URL during setup: %s", err)
+                errors[CONF_INGRESS_URL] = "invalid_ingress_url"
+            else:
+                self._data.update(user_input)
+                return await self.async_step_container()
+
+        return self.async_show_form(
+            step_id="ingress",
+            data_schema=_ingress_schema({**self._data, **(user_input or {})}),
+            errors=errors,
         )
 
     # -- wizard step 4b: how Home Assistant is started -------------------

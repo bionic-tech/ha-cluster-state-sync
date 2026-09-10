@@ -40,6 +40,26 @@ blueprint:
             - integration: cluster_state_sync
               domain: binary_sensor
 
+    ingress_sensor:
+      name: Ingress reachable (optional)
+      default: []
+      description: >-
+        The integration's "Ingress reachable" binary sensor, if you configured a
+        front-door URL. Off means the address people actually type did not
+        answer — which a failover can cause and nothing else here would notice,
+        because every other check looks inward. Leave empty to skip.
+
+
+        A green reading is not proof: the request leaves this node inside your
+        own network, so split-horizon DNS can keep it green while an external
+        path is down. Red is trustworthy; green is not.
+      selector:
+        entity:
+          multiple: true
+          filter:
+            - integration: cluster_state_sync
+              domain: binary_sensor
+
     snapshot_age_sensor:
       name: Last snapshot age
       description: >-
@@ -124,6 +144,12 @@ triggers:
   - trigger: state
     id: backend_unreachable
     entity_id: !input backend_sensor
+    to: "off"
+    for: !input backend_grace
+
+  - trigger: state
+    id: ingress_unreachable
+    entity_id: !input ingress_sensor
     to: "off"
     for: !input backend_grace
 
@@ -213,6 +239,22 @@ actions:
                 restore whatever was last written, which is already
                 {{ states(snapshot_age_entity) | int(0) }} seconds old and no
                 longer moving. Check Valkey before relying on a failover.
+
+      - conditions:
+          - condition: trigger
+            id: ingress_unreachable
+        sequence:
+          - variables:
+              title: "Cluster sync: nobody can reach the house"
+              message: >-
+                The configured front-door URL stopped answering. Home Assistant
+                itself may be perfectly healthy — this is the one check that
+                looks from outside in, and a failover that moves the house
+                without moving the way in produces exactly this.
+
+
+                Check DNS, your proxy or your tunnel before assuming the
+                cluster is at fault.
 
       - conditions:
           - condition: trigger

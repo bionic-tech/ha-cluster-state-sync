@@ -110,6 +110,7 @@ from .const import (
     CONF_STATISTICS_INTERVAL_MINUTES,
     CONF_STATISTICS_MAX_BYTES,
     CONF_STATISTICS_WINDOW_DAYS,
+    CONFIG_ENTRY_VERSION,
     DATA_ALERTS,
     DATA_BACKEND,
     DATA_CLUSTER_VIEW,
@@ -149,6 +150,7 @@ from .const import (
     DEGRADED_MARKER_NAME,
     DOMAIN,
     FINAL_FLUSH_TIMEOUT,
+    LEGACY_DEFAULT_INCLUDE_DOMAINS,
     MAX_ATTRIBUTE_BYTES,
     MAX_RECORDER_SNAPSHOT_MINUTES,
     MAX_RESTORE_ENTRIES,
@@ -1024,6 +1026,81 @@ async def _surface_preflight_disables(hass: HomeAssistant, runtime: dict[str, An
     )
 
 
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Bring an older config entry forward to the current schema version.
+
+    v1 -> v2 (0.4.4): `automation` joined `DEFAULT_INCLUDE_DOMAINS`.
+
+    It should have been there from the start. It is the only domain applied by
+    *calling a service* (`RESTORE_BY_SERVICE`) rather than by writing state, so
+    it is the only one whose restore actually takes effect instead of being
+    corrected by the next device poll — and it shipped absent, which meant no
+    install replicated it unless its operator noticed and ticked the box.
+
+    Adding it to the constant fixes every entry that never wrote an explicit
+    allowlist, because `async_setup_entry` falls back to the constant. It does
+    not fix entries the wizard wrote the defaults into, which is most of them.
+
+    The migration is deliberately narrow: an allowlist is rewritten **only** if
+    it is exactly `LEGACY_DEFAULT_INCLUDE_DOMAINS`. That set is a historical
+    fact, frozen, and never tracks the current default. Matching it proves the
+    operator accepted the shipped default and never revisited it, so adding
+    `automation` restores an intended default. Any other value — one domain
+    removed, one added, an empty list — is a decision somebody made, and this
+    migration does not overrule decisions. Those entries are version-stamped
+    and otherwise left exactly as they are.
+    """
+    if entry.version > CONFIG_ENTRY_VERSION:
+        # Written by a newer release than this one. Refuse rather than guess,
+        # the same stance `backend.py` takes on a future snapshot schema: a
+        # downgrade that silently reinterprets config is worse than one that
+        # declines to start.
+        _LOGGER.error(
+            "Config entry is version %d but this build understands at most "
+            "v%d. Refusing to migrate rather than guess at its meaning — "
+            "upgrade the integration, or remove and re-add the entry.",
+            entry.version,
+            CONFIG_ENTRY_VERSION,
+        )
+        return False
+
+    if entry.version == 1:
+        data = dict(entry.data)
+        options = dict(entry.options)
+        migrated: list[str] = []
+        for label, src in (("options", options), ("data", data)):
+            current = src.get(CONF_INCLUDE_DOMAINS)
+            if current and set(current) == LEGACY_DEFAULT_INCLUDE_DOMAINS:
+                src[CONF_INCLUDE_DOMAINS] = list(DEFAULT_INCLUDE_DOMAINS)
+                migrated.append(label)
+
+        if migrated:
+            _LOGGER.info(
+                "Migrating config entry to v%d: added `automation` to the "
+                "replicated domains in %s. This entry carried the pre-v%d "
+                "default unchanged, so `automation` was never replicated — "
+                "the one domain whose restore actually takes effect. Untick "
+                "it in the options flow if that is not what you want.",
+                CONFIG_ENTRY_VERSION,
+                " and ".join(migrated),
+                CONFIG_ENTRY_VERSION,
+            )
+        else:
+            _LOGGER.debug(
+                "Migrating config entry to v%d: the domain allowlist is not "
+                "the pre-v%d default, so it is a deliberate choice and is "
+                "left untouched.",
+                CONFIG_ENTRY_VERSION,
+                CONFIG_ENTRY_VERSION,
+            )
+
+        hass.config_entries.async_update_entry(
+            entry, data=data, options=options, version=CONFIG_ENTRY_VERSION
+        )
+
+    return True
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Cluster State Sync from a config entry."""
     cfg = {**entry.data, **entry.options}
@@ -1512,6 +1589,24 @@ async def _final_flush(mirror: StateMirror) -> None:
         _LOGGER.debug("Final flush failed", exc_info=True)
 
 
+#: Entries this integration is reloading on purpose, so the unload below can
+#: tell a reload from a removal.
+#:
+#: 🚨 Without this, changing ANY option on the leader fails the house over.
+#:
+#: `async_unload_entry` releases the cluster lease, and its comment has always
+#: said "unload covers reloads and reconfiguration" -- correct, and harmless
+#: while nothing reloaded on an options change. Adding the update listener
+#: (which fixed options silently doing nothing) turned every settings change on
+#: the leader into a real promotion. Observed on the reference pair 2026-09-10:
+#: two options submissions, and the house moved to the standby.
+#:
+#: A removal must still release the lease -- a node that has genuinely stopped
+#: running the integration should not make the peer wait out the full TTL. Only
+#: a reload we initiated keeps it.
+_RELOADING: set[str] = set()
+
+
 async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Reload so a changed setting actually applies.
 
@@ -1524,7 +1619,14 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
     The cost is a few seconds without replication on a node whose operator is
     deliberately changing its configuration, which is the right moment to pay.
     """
-    await hass.config_entries.async_reload(entry.entry_id)
+    _RELOADING.add(entry.entry_id)
+    try:
+        await hass.config_entries.async_reload(entry.entry_id)
+    finally:
+        # In a `finally`: a reload that raised must not leave the entry marked,
+        # or the NEXT unload -- possibly a real removal -- would keep the lease
+        # and cost the peer a full TTL to take over.
+        _RELOADING.discard(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -1562,7 +1664,16 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # on the one kind of shutdown that was entirely orderly.
         cfg = runtime.get(DATA_CONFIG) or {}
         node_id = cfg.get(CONF_NODE_ID) or default_node_id()
-        if not await _hold_blocks_release(hass, hass.config.path(), "reload"):
+        if entry.entry_id in _RELOADING:
+            # 🚨 Our own options reload. Releasing here hands the lease to the
+            # peer and the house moves because somebody changed a setting --
+            # observed on the reference pair 2026-09-10, twice in a row.
+            #
+            # The entry comes straight back up a second later with the same
+            # node_id, so keeping the lease is not a lie: this node is still
+            # the leader and is about to prove it by renewing.
+            _LOGGER.debug("Reloading on an options change; keeping the lease")
+        elif not await _hold_blocks_release(hass, hass.config.path(), "reload"):
             await _release_leadership(backend, node_id)
         await backend.close()
     return True
@@ -1747,6 +1858,46 @@ def _entry_from_state(state: State, node_id: str) -> SnapshotEntry:
 # ---------------------------------------------------------------------------
 
 
+def _initial_state_is_pinned(hass: HomeAssistant, entity_id: str) -> bool:
+    """Has this automation's config pinned its startup state?
+
+    `initial_state` is Home Assistant's documented way of saying "force this
+    automation on or off at every startup, *regardless of what was restored*".
+    HA applies it in `async_added_to_hass`, where it deliberately overrides
+    `async_get_last_state()`.
+
+    Our restore runs later — on `EVENT_HOMEASSISTANT_START` — and applies
+    automations by calling a service. A command lands after a pin, so without
+    this check we win, and we should not: an operator who wrote
+    `initial_state: false` opted that automation out of restore. Re-enabling it
+    at every promotion is the integration overriding an explicit instruction,
+    and on the estate this was found on it would have armed an automation whose
+    hardware is not wired.
+
+    🚨 This reads a private attribute, which is against this repo's
+    public-APIs-only rule, and it is a deliberate exception. Home Assistant
+    exposes `initial_state` on no public API at all — not a property, not in
+    `extra_state_attributes` — so the alternatives were to read it or to keep
+    overriding operators. `tests/test_initial_state.py` pins that
+    `_initial_state` still exists on the tested HA version, so a bump that
+    moves it fails CI loudly. If it ever moves without that test catching it,
+    this returns False and we are back to the old behaviour — no worse than
+    before, which is why the fallback is silent rather than fatal.
+    """
+    if not entity_id.startswith("automation."):
+        return False
+    try:
+        from homeassistant.components.automation import DATA_COMPONENT
+
+        component = hass.data.get(DATA_COMPONENT)
+        if component is None:
+            return False
+        entity = component.get_entity(entity_id)
+    except (ImportError, AttributeError, KeyError):  # pragma: no cover - defensive
+        return False
+    return entity is not None and getattr(entity, "_initial_state", None) is not None
+
+
 async def _restore_from_snapshot(
     hass: HomeAssistant,
     backend: ClusterBackend,
@@ -1887,6 +2038,7 @@ async def _restore_from_snapshot(
     skipped_unparseable = 0
     skipped_refused = 0
     skipped_future = 0
+    skipped_pinned = 0
     clamped_future = 0
 
     for entity_id, entry in entries.items():
@@ -1950,6 +2102,18 @@ async def _restore_from_snapshot(
         # would have said so: a promotion that comes up silently cold, which is
         # the exact failure AR-0013 was raised to prevent.
         service = RESTORE_BY_SERVICE.get(entity_id.split(".", 1)[0])
+        if _initial_state_is_pinned(hass, entity_id):
+            # The operator pinned this one's startup state in config. That is
+            # an explicit opt-out of restore; honour it rather than command
+            # over the top of it.
+            _LOGGER.info(
+                "Not restoring %s — its config pins `initial_state`, which "
+                "Home Assistant treats as authoritative at every startup. "
+                "Remove the pin if this automation should follow the cluster.",
+                entity_id,
+            )
+            skipped_pinned += 1
+            continue
         try:
             if service is not None and entry.state in (STATE_ON, STATE_OFF):
                 # This domain's component owns its own state, so writing the
@@ -2033,7 +2197,7 @@ async def _restore_from_snapshot(
         _LOGGER.warning(
             "Restored NOTHING from a snapshot that held %d entries. %s Skipped: "
             "%d local-newer, %d own-node, %d oversized, %d unparseable, %d "
-            "implausibly-future, %d refused.",
+            "implausibly-future, %d refused, %d initial_state-pinned.",
             len(entries),
             reason,
             skipped_local_newer,
@@ -2042,6 +2206,7 @@ async def _restore_from_snapshot(
             skipped_unparseable,
             skipped_future,
             skipped_refused,
+            skipped_pinned,
         )
 
     # AR-0020: make staleness explicit rather than implicit. A promotion
@@ -2070,7 +2235,8 @@ async def _restore_from_snapshot(
     _LOGGER.info(
         "Restored %d entities from snapshot (skipped: %d local-newer, "
         "%d own-node, %d oversized, %d unparseable, %d "
-        "implausibly-future, %d refused) — source meta=%s",
+        "implausibly-future, %d refused, %d initial_state-pinned) — "
+        "source meta=%s",
         restored,
         skipped_local_newer,
         skipped_own_node,
@@ -2078,6 +2244,7 @@ async def _restore_from_snapshot(
         skipped_unparseable,
         skipped_future,
         skipped_refused,
+        skipped_pinned,
         meta,
     )
     if skipped_refused:

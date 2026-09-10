@@ -445,16 +445,44 @@ def test_domain_options_include_what_the_instance_actually_runs() -> None:
 
     class _States:
         def async_all(self):
-            return [_State("light"), _State("switch"), _State("media_player")]
+            # device_tracker twice: the count in the label has to come from the
+            # operator's own instance, and a domain with one entity cannot
+            # prove that.
+            return [
+                _State("light"),
+                _State("switch"),
+                _State("media_player"),
+                _State("device_tracker"),
+                _State("device_tracker"),
+            ]
 
     class _Hass:
         states = _States()
 
     options = _domain_options(_Hass())
-    assert "media_player" in options, "must offer domains this instance has"
+    values = [o["value"] for o in options]
+
+    assert "media_player" in values, "must offer domains this instance has"
     for d in DEFAULT_INCLUDE_DOMAINS:
-        assert d in options, "a default must never vanish from the form"
-    assert options == sorted(options), "stable order, so the form does not reshuffle"
+        assert d in values, "a default must never vanish from the form"
+
+    # Every option carries our verdict and the operator's own entity count, so
+    # the reason not to tick something is where the ticking happens rather than
+    # in a document nobody opens.
+    labels = {o["value"]: o["label"] for o in options}
+    assert (
+        "rebuilds itself" in labels["device_tracker"] or "not needed" in labels["device_tracker"]
+    ), "a self-rebuilding domain must say so on the form"
+    assert "cosmetic" in labels["media_player"], "a device-backed domain must say so"
+    assert "(1)" in labels["media_player"], "the operator's own count belongs in the label"
+    assert "(2)" in labels["device_tracker"], "counts must be per domain, not a constant"
+    assert "replicate" in labels["input_boolean"], "the domain that guards automations"
+
+    # Worth-replicating first, then the rest. Not alphabetical overall: the top
+    # of the list should be the answer for most people.
+    worth = [o["value"] for o in options if o["label"].split(" — ")[1].startswith("replicate")]
+    assert values[: len(worth)] == worth, "recommended domains must sort first"
+    assert worth == sorted(worth), "stable order inside the group"
 
 
 async def test_the_statistics_step_appears_only_when_there_is_history_to_replicate(
@@ -566,7 +594,10 @@ async def test_submitting_the_alerts_step_untouched_is_a_complete_setup(
     assert defaults[CONF_NOTIFY_SERVICES] == []
 
     result = await flow.async_step_alerts(defaults)
-    assert result["step_id"] == "container"
+    assert result["step_id"] == "ingress", (
+        "the ingress step now sits between alerts and container — both ask the "
+        "same question from opposite ends"
+    )
     assert flow._data[CONF_NOTIFY_CONDITIONS] == list(DEFAULT_NOTIFY_CONDITIONS)
 
 
@@ -768,3 +799,90 @@ async def test_the_reloaded_entry_sees_the_new_options(hass: HomeAssistant) -> N
         assert entry.runtime_data[DATA_ALERTS]._services == ("notify.phone",), (
             "the reloaded router did not pick up the newly configured service"
         )
+
+
+async def test_an_options_change_does_not_hand_the_lease_to_the_peer(
+    hass: HomeAssistant,
+) -> None:
+    """🚨 Changing a setting on the leader must not fail the house over.
+
+    `async_unload_entry` releases the lease, and its comment has always said
+    "unload covers reloads and reconfiguration" — correct, and harmless while
+    nothing reloaded on an options change. The update listener that fixed
+    options silently doing nothing turned every settings change on the leader
+    into a real promotion.
+
+    Observed on the reference pair 2026-09-10: two options submissions, and the
+    house moved to the standby. Both times the operator was only editing a
+    field.
+    """
+    from unittest.mock import patch
+
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    from tests.fakes import FakeBackend
+
+    backend = FakeBackend()
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            "redis_host": "valkey.invalid",
+            "cluster_namespace": "testns",
+            "node_id": "node-a",
+            "cluster_secret": "s" * 44,
+            "snapshot_interval": 30,
+            "fileset_enabled": False,
+        },
+    )
+    entry.add_to_hass(hass)
+    with patch("custom_components.cluster_state_sync.RedisBackend", return_value=backend):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        backend.lease_holder = "node-a"
+        hass.config_entries.async_update_entry(entry, options={"snapshot_interval": 45})
+        await hass.async_block_till_done()
+
+    assert backend.lease_holder == "node-a", (
+        "an options change released the cluster lease — the peer would promote "
+        "and the house would move because somebody edited a setting"
+    )
+
+
+async def test_a_real_removal_still_releases_the_lease(hass: HomeAssistant) -> None:
+    """The other direction, and it matters just as much.
+
+    A node that has genuinely stopped running the integration must hand the
+    lease back, or the peer waits out the full TTL before it can promote —
+    failover budget burned for nothing, on the one shutdown that was entirely
+    orderly.
+    """
+    from unittest.mock import patch
+
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    from tests.fakes import FakeBackend
+
+    backend = FakeBackend()
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            "redis_host": "valkey.invalid",
+            "cluster_namespace": "testns",
+            "node_id": "node-a",
+            "cluster_secret": "s" * 44,
+            "snapshot_interval": 30,
+            "fileset_enabled": False,
+        },
+    )
+    entry.add_to_hass(hass)
+    with patch("custom_components.cluster_state_sync.RedisBackend", return_value=backend):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        backend.lease_holder = "node-a"
+        assert await hass.config_entries.async_unload(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert backend.lease_holder is None, (
+        "an orderly shutdown kept the lease and cost the peer a full TTL"
+    )

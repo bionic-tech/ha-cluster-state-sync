@@ -97,6 +97,65 @@ DOMAIN = "cluster_state_sync"
 #: Nothing here can affect leadership, identity or any host path. They are the
 #: operator's answers to "what should this cluster do", which must be the same
 #: on both halves or the pair is not one cluster.
+#: Settings that belong to THIS MACHINE and must never be inherited.
+#:
+#: The originals: `node_id`, because a node promoted holding its peer's id
+#: renews the PEER's lease and both then believe they lead; and the host paths,
+#: because an inherited `ha_config_path` sends the swap to a directory that
+#: does not exist and an inherited `ha_container_ip` writes firewall rules for
+#: the wrong address.
+PER_NODE_FIELDS: frozenset[str] = frozenset(
+    {
+        # Identity. The split brain this whole module exists to prevent.
+        "node_id",
+        "peer_host",
+        # Where Home Assistant lives on THIS host. Measured to differ on the
+        # reference pair by a whole path component (finding F4).
+        "ha_config_path",
+        "ha_container",
+        "ha_container_ip",
+        "ha_uid",
+        "ha_start_mode",
+        "compose_file",
+        "compose_profile",
+        "compose_service",
+        "compose_env_file",
+        "docker_network",
+        # A path to a file on this host's filesystem, not a shared value.
+        "redis_tls_ca_certs",
+        # Host firewall and hardware. The warm model generates rules per host,
+        # and the radios attached to each node genuinely differ -- node-a
+        # has five, node-b four.
+        "iot_subnets",
+        "block_discovery",
+        "radio_watch",
+        # AR-0038: refused ahead of every list anyway, and it names an entity
+        # that is a statement about THIS node.
+        "leadership_entity",
+        # Changing it regenerates host-side scripts, so it is a deliberate
+        # reconfigure on each node rather than something that drifts across.
+        "topology_model",
+        # 🚨 Cluster-wide in meaning, and it CANNOT cross by this mechanism.
+        #
+        # The go-bag is sealed with a key derived from the secret, and this
+        # graft runs on the already-decrypted copy. A standby holding the old
+        # secret cannot open a go-bag written with the new one, so it never
+        # reaches the point where it could learn it. Rotating the cluster
+        # secret is therefore a two-node operation, by hand, and saying so here
+        # is worth more than a field that would silently never arrive.
+        "cluster_secret",
+    }
+)
+
+#: Answered during setup and meaningless afterwards. Neither inherited nor
+#: preserved-with-intent; they simply do not describe a running cluster.
+WIZARD_ONLY_FIELDS: frozenset[str] = frozenset(
+    {
+        "accept_risk",
+        "history_matters",
+    }
+)
+
 CLUSTER_WIDE_FIELDS: frozenset[str] = frozenset(
     {
         # Who gets told, and about what (v0.4.2).
@@ -109,6 +168,50 @@ CLUSTER_WIDE_FIELDS: frozenset[str] = frozenset(
         "include_entities",
         "exclude_entities",
         "exclude_devices",
+        # 🚨 The front door is the CLUSTER's, not the machine's — and leaving it
+        # out reproduced AR-0066 exactly, in the feature added after that
+        # allowlist was written. A promoted standby would inherit no URL,
+        # probe nothing, and report `not_checked_because: never_run` while the
+        # operator believed they had an ingress check. Caught before a drill
+        # rather than by one.
+        "ingress_url",
+        "ingress_verify_tls",
+        # --- added 2026-09-10, when 59 keys turned out to have 8 decisions ---
+        #
+        # Everything below describes the CLUSTER: where the shared store is,
+        # how often it is written, what is kept and for how long. A standby
+        # running different answers is a standby that behaves differently from
+        # the node it replaced, discovered on the day it replaces it.
+        "cluster_namespace",
+        "redis_host",
+        "redis_port",
+        "redis_db",
+        "redis_username",
+        "redis_password",
+        "redis_use_tls",
+        "redis_use_sentinel",
+        "redis_sentinel_hosts",
+        "redis_sentinel_service",
+        "leadership_source",
+        "snapshot_interval",
+        "restore_max_age",
+        "settle_delay",
+        "history_database",
+        "statistics_enabled",
+        "statistics_interval_minutes",
+        "statistics_max_bytes",
+        "statistics_window_days",
+        "fileset_enabled",
+        "fileset_exclusions",
+        "fileset_extra_paths",
+        "fileset_extra_custom",
+        "fileset_hot_interval",
+        "fileset_max_bytes",
+        "fileset_stale_after",
+        "recorder_snapshot_enabled",
+        "recorder_snapshot_minutes",
+        "gate_automations",
+        "gate_recorder",
     }
 )
 

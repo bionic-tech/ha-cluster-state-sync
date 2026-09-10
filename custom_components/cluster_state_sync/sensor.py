@@ -35,7 +35,7 @@ from .const import (
 )
 from .coordinator import BackendHealthCoordinator, ClusterViewCoordinator, SyncStats
 from .entity import ClusterSyncDiagnosticEntity, ClusterViewEntity, MirrorBackedEntity
-from .fileset import REPLICATED_DIRS, REPLICATED_FILES, FilesetPublisher
+from .fileset import FilesetPublisher
 from .includes import scan as scan_includes
 from .scope import replication_scope
 
@@ -573,6 +573,23 @@ class UnreplicatedReferencesSensor(ClusterSyncDiagnosticEntity, SensorEntity):
     Zero is the healthy reading. Anything above it is the number of files a
     promoted standby would be missing, and the attributes name them.
 
+    🚨 Corrected 2026-09-10, having spent six days crying wolf on the very
+    estate it was written for. It reported `12` — the same twelve — long after
+    the fix landed, because it tested against `REPLICATED_DIRS`/
+    `REPLICATED_FILES` alone. Those are a *floor*: `fileset._candidates` also
+    walks `includes.scan` and adds everything it finds, which is precisely the
+    fix made for the 2026-09-04 incident. So every path this sensor was reading
+    out of `scan.paths` was already in the go-bag, and the reading could only
+    ever be a false alarm. Verified against the standby: all twelve present.
+
+    An amber warning that is always wrong is worse than no warning, because it
+    teaches an operator to ignore the colour.
+
+    What genuinely does not travel, and is what this now counts: a reference
+    reaching **outside** the config directory, one pointing at a file that is
+    **absent**, and one the scanner could not **read**. Those the go-bag cannot
+    carry however hard it follows includes.
+
     Counts only what a parser can see. `python_scripts/`, `custom_templates/`,
     ZHA's `zigbee.db` and anything an integration opens by path at runtime are
     invisible to it -- so zero here means "nothing *referenced* is missing",
@@ -608,14 +625,26 @@ class UnreplicatedReferencesSensor(ClusterSyncDiagnosticEntity, SensorEntity):
             result = await self.hass.async_add_executor_job(scan_includes, self._config_dir)
         except Exception:  # noqa: BLE001 - a diagnostic must never break setup
             return
-        gap = sorted(p for p in result.paths if not _is_replicated(p))
+        # A path inside the config directory that the scan resolved is carried:
+        # `fileset._candidates` runs the same scan and adds everything it
+        # returns. Counting those was this sensor's bug, not its purpose.
+        outside = [t for _, t in result.outside]
+        absent = [t for _, t in result.missing]
+        unreadable = [f for f, _ in result.unreadable]
+        gap = sorted(outside + absent + unreadable)
+
         detail: dict[str, Any] = {"missing_from_go_bag": gap}
-        if result.outside:
-            detail["outside_config_dir"] = [t for _, t in result.outside]
-        if result.missing:
-            detail["referenced_but_absent"] = [t for _, t in result.missing]
-        if result.unreadable:
-            detail["unreadable"] = [f for f, _ in result.unreadable]
+        if outside:
+            detail["outside_config_dir"] = outside
+        if absent:
+            detail["referenced_but_absent"] = absent
+        if unreadable:
+            detail["unreadable"] = unreadable
+        # Transparency: how much the include-following is doing for you. Not a
+        # warning — these are carried — but an operator who sees 0 above and a
+        # large number here can tell the scan is working rather than idle.
+        detail["carried_by_include_scan"] = len(result.paths)
+
         if (len(gap), detail) != (self._count, self._detail):
             self._count, self._detail = len(gap), detail
             self.async_write_ha_state()
@@ -629,9 +658,6 @@ class UnreplicatedReferencesSensor(ClusterSyncDiagnosticEntity, SensorEntity):
         return self._detail
 
 
-def _is_replicated(rel: str) -> bool:
-    """Would the go-bag already carry this path?"""
-    return rel.split("/")[0] in REPLICATED_DIRS or rel in REPLICATED_FILES
 
 
 class RadioSilenceSensor(ClusterSyncDiagnosticEntity, SensorEntity):

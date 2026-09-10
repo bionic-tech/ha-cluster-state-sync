@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 from pathlib import Path
 import stat
 
@@ -671,3 +672,129 @@ def test_the_replication_scope_crosses_too() -> None:
 
     assert got["include_domains"] == ["climate"]
     assert got["exclude_devices"] == ["dev1"]
+
+
+def test_the_ingress_url_crosses_to_the_standby() -> None:
+    """🚨 AR-0066's shape, a second time, in a feature added afterwards.
+
+    The front door belongs to the cluster, not the machine. Left out of the
+    allowlist, a promoted standby inherits no URL, probes nothing, and sits at
+    `not_checked_because: never_run` while the operator believes they have an
+    ingress check — the silence the probe was built to end, relocated.
+    """
+    from custom_components.cluster_state_sync.scripts.fileset_identity import graft_entries
+
+    leader = _ar0066_entry(
+        "tiger1", ingress_url="https://home.example.com/", ingress_verify_tls=True
+    )
+    grafted = graft_entries(_ar0066_store(leader), [_ar0066_entry("tiger2")])
+    got = grafted["data"]["entries"][0]
+
+    assert got["options"]["ingress_url"] == "https://home.example.com/"
+    assert got["options"]["ingress_verify_tls"] is True
+    assert got["data"]["node_id"] == "tiger2", "identity must still be local"
+
+
+# -- the class, not the instance -------------------------------------------
+
+
+def test_every_config_key_is_classified() -> None:
+    """🚨 The trap that bit twice in one day, closed as a class.
+
+    A setting absent from all three lists is preserved locally by default —
+    which is the safe direction for split brain and the *silent* direction for
+    everything else. Change it on the leader and the standby keeps the old
+    value until the day it promotes, which is the day you find out.
+
+    It has already happened twice:
+
+    * AR-0066 — `notify_services` never crossed, so the failover alert fired on
+      the recovery and never on the emergency.
+    * Hours later, `ingress_url` never crossed, so a promoted node inherited no
+      front door and reported "never checked" while looking healthy.
+
+    Both were the same omission. 59 keys existed and 8 had been thought about.
+    This turns "remember to classify it" into "the suite will not let you
+    forget", which is the only version that survives a year.
+    """
+    import re
+
+    from custom_components.cluster_state_sync.scripts.fileset_identity import (
+        CLUSTER_WIDE_FIELDS,
+        PER_NODE_FIELDS,
+        WIZARD_ONLY_FIELDS,
+    )
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    const = (root / "custom_components" / "cluster_state_sync" / "const.py").read_text(
+        encoding="utf-8"
+    )
+    keys = set(re.findall(r'^CONF_[A-Z_]+: Final = "([a-z_]+)"', const, re.M))
+    assert keys, "no CONF_ keys found — has const.py been restructured?"
+
+    classified = CLUSTER_WIDE_FIELDS | PER_NODE_FIELDS | WIZARD_ONLY_FIELDS
+    unclassified = sorted(keys - classified)
+    assert not unclassified, (
+        f"{len(unclassified)} config key(s) belong to no list: {unclassified}. "
+        "Decide for each whether it describes the CLUSTER (add to "
+        "CLUSTER_WIDE_FIELDS, so a standby runs the same answers), THIS MACHINE "
+        "(PER_NODE_FIELDS, with the reason), or only the setup wizard "
+        "(WIZARD_ONLY_FIELDS). Leaving it out means it silently never crosses."
+    )
+
+
+def test_no_key_is_in_two_minds() -> None:
+    """Cluster-wide and per-node are opposites. One key cannot be both."""
+    from custom_components.cluster_state_sync.scripts.fileset_identity import (
+        CLUSTER_WIDE_FIELDS,
+        PER_NODE_FIELDS,
+        WIZARD_ONLY_FIELDS,
+    )
+
+    for a, b, names in (
+        (CLUSTER_WIDE_FIELDS, PER_NODE_FIELDS, "cluster-wide and per-node"),
+        (CLUSTER_WIDE_FIELDS, WIZARD_ONLY_FIELDS, "cluster-wide and wizard-only"),
+        (PER_NODE_FIELDS, WIZARD_ONLY_FIELDS, "per-node and wizard-only"),
+    ):
+        assert not (a & b), f"{sorted(a & b)} is listed as both {names}"
+
+
+def test_the_identity_fields_are_still_per_node() -> None:
+    """🚨 The one classification that cannot be got wrong.
+
+    A node promoted holding its peer's `node_id` renews the PEER's lease, and
+    both then believe they lead — the split brain this module exists for. The
+    host paths matter almost as much: an inherited `ha_config_path` sends the
+    swap to a directory that is not there.
+    """
+    from custom_components.cluster_state_sync.scripts.fileset_identity import (
+        CLUSTER_WIDE_FIELDS,
+        PER_NODE_FIELDS,
+    )
+
+    for key in ("node_id", "ha_config_path", "ha_container", "ha_container_ip"):
+        assert key in PER_NODE_FIELDS, f"{key} must never be inherited"
+        assert key not in CLUSTER_WIDE_FIELDS
+
+
+def test_the_cluster_secret_is_documented_as_uncrossable() -> None:
+    """It is cluster-wide in meaning and cannot travel by this route.
+
+    The go-bag is sealed with a key derived from the secret, and this graft
+    runs on the already-decrypted copy — so a standby holding the old secret
+    cannot open a go-bag written with the new one, and never reaches the point
+    where it could learn it. Listing it as per-node is not a mistake; rotating
+    the secret is a two-node operation by hand, and the code says so.
+    """
+    from custom_components.cluster_state_sync.scripts import fileset_identity
+
+    assert "cluster_secret" in fileset_identity.PER_NODE_FIELDS
+    root = pathlib.Path(__file__).resolve().parent.parent
+    source = (
+        root / "custom_components" / "cluster_state_sync" / "scripts" / "fileset_identity.py"
+    ).read_text(encoding="utf-8")
+    block = source[source.index("PER_NODE_FIELDS") : source.index("WIZARD_ONLY_FIELDS")]
+    assert "cluster_secret" in block and "CANNOT cross" in block, (
+        "the reason must travel with the classification, or somebody will "
+        "'fix' it by moving it to the cluster-wide list"
+    )
