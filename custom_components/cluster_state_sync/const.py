@@ -207,6 +207,28 @@ DEFAULT_NOTIFY_CONDITIONS: Final = (
     NOTIFY_INGRESS_UNREACHABLE,
 )
 
+#: The alert conditions as they shipped before `ingress_unreachable` was added
+#: to the defaults. An entry whose choices are exactly this set accepted the
+#: shipped default and never revisited it, so adding the newer condition
+#: restores an intended default rather than overruling a decision. Frozen: it is
+#: a historical fact and must never track DEFAULT_NOTIFY_CONDITIONS.
+#:
+#: Filed after a real outage on 2026-09-11. The front door was unreachable for
+#: 61 minutes; the probe caught it in 105 seconds and raised at ~3 minutes, the
+#: card appeared in Home Assistant -- and the push was suppressed, because this
+#: estate's entry predated the condition existing. Detection worked perfectly
+#: and nobody was told.
+LEGACY_DEFAULT_NOTIFY_CONDITIONS: Final[frozenset[str]] = frozenset(
+    {
+        "promoted",
+        "restored_nothing",
+        "devices_disabled",
+        "recovered",
+        "backend_lost",
+        "fileset_degraded",
+    }
+)
+
 CONF_NOTIFY_CONDITIONS: Final = "notify_conditions"
 #: `notify.*` service names to call. Empty is the normal case and is not a
 #: misconfiguration: a persistent notification always goes to every admin, so
@@ -375,7 +397,7 @@ BUNDLE_DIR_NAME: Final = "cluster_state_sync_bundle"
 # `async_migrate_entry` both read this so they cannot drift apart; a test pins
 # that they agree. Distinct from SCHEMA_VERSION below, which versions the
 # on-the-wire snapshot format, not the config entry.
-CONFIG_ENTRY_VERSION: Final = 2
+CONFIG_ENTRY_VERSION: Final = 3
 
 SCHEMA_VERSION: Final = 1
 

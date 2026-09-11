@@ -151,6 +151,7 @@ from .const import (
     DOMAIN,
     FINAL_FLUSH_TIMEOUT,
     LEGACY_DEFAULT_INCLUDE_DOMAINS,
+    LEGACY_DEFAULT_NOTIFY_CONDITIONS,
     MAX_ATTRIBUTE_BYTES,
     MAX_RECORDER_SNAPSHOT_MINUTES,
     MAX_RESTORE_ENTRIES,
@@ -895,9 +896,16 @@ async def _setup_ingress_probe(
                 (
                     f"The house is running here, but {probe.display_url} has not "
                     f"answered for {probe.consecutive_failures} checks "
-                    f"({result.error or 'no reason given'}). Nothing is wrong with the "
-                    "cluster -- the way IN to it is broken, which looks identical from "
-                    "a phone. Check DNS, the reverse proxy or the tunnel."
+                    f"({result.error or 'no reason given'}). The cluster is fine -- "
+                    "the way IN to it is broken, which looks identical from a phone.\n\n"
+                    "NOTHING WILL FAIL OVER. The promoter checks Home Assistant at "
+                    "127.0.0.1, so a node that is healthy to itself and unreachable "
+                    "to you looks perfectly well, and keeps the lease indefinitely. "
+                    "This will not clear on its own.\n\n"
+                    "Check, in this order: this node's own IP address on its service "
+                    "interface (an interface can keep its link and lose its address, "
+                    "and its VLANs can survive while the parent does not), then DNS, "
+                    "then the reverse proxy or tunnel."
                 ),
             )
 
@@ -1064,9 +1072,10 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         return False
 
-    if entry.version == 1:
-        data = dict(entry.data)
-        options = dict(entry.options)
+    data = dict(entry.data)
+    options = dict(entry.options)
+
+    if entry.version < 2:
         migrated: list[str] = []
         for label, src in (("options", options), ("data", data)):
             current = src.get(CONF_INCLUDE_DOMAINS)
@@ -1094,9 +1103,52 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 CONFIG_ENTRY_VERSION,
             )
 
-        hass.config_entries.async_update_entry(
-            entry, data=data, options=options, version=CONFIG_ENTRY_VERSION
-        )
+    if entry.version < 3:
+        # v2 -> v3 (0.5.1): `ingress_unreachable` joined DEFAULT_NOTIFY_CONDITIONS.
+        #
+        # Filed from a real outage on 2026-09-11. `192.168.1.87` vanished from
+        # the leader's interface during an unattended upgrade; the front door was
+        # unreachable for 61 minutes. The probe caught it in 105 seconds and the
+        # router raised at three failures, so the card appeared in Home Assistant
+        # exactly as designed -- and the push never went, because this estate's
+        # entry was created before the condition existed and `_push_if_enabled`
+        # gates on the operator's chosen set.
+        #
+        # Detection was perfect. Nobody was told. That is the worst shape a
+        # monitoring defect can take, because every dashboard says it is working.
+        #
+        # Same narrowness as the domain migration above: only an untouched
+        # default is rewritten. Somebody who deliberately unticked conditions
+        # made a decision, and a migration does not overrule decisions.
+        notify_migrated: list[str] = []
+        for label, src in (("options", options), ("data", data)):
+            current = src.get(CONF_NOTIFY_CONDITIONS)
+            if current and set(current) == LEGACY_DEFAULT_NOTIFY_CONDITIONS:
+                src[CONF_NOTIFY_CONDITIONS] = list(DEFAULT_NOTIFY_CONDITIONS)
+                notify_migrated.append(label)
+
+        if notify_migrated:
+            _LOGGER.info(
+                "Migrating config entry to v%d: added `ingress_unreachable` to "
+                "the alert conditions in %s. Without it the cluster notices that "
+                "nobody can reach the house and says nothing -- it shows a card "
+                "here and sends no push. Untick it in the options flow if that "
+                "is not what you want.",
+                CONFIG_ENTRY_VERSION,
+                " and ".join(notify_migrated),
+            )
+        else:
+            _LOGGER.debug(
+                "Migrating config entry to v%d: the alert conditions are not the "
+                "pre-v%d default, so they are a deliberate choice and are left "
+                "untouched.",
+                CONFIG_ENTRY_VERSION,
+                CONFIG_ENTRY_VERSION,
+            )
+
+    hass.config_entries.async_update_entry(
+        entry, data=data, options=options, version=CONFIG_ENTRY_VERSION
+    )
 
     return True
 

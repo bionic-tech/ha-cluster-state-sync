@@ -18,20 +18,31 @@ from custom_components.cluster_state_sync import async_migrate_entry
 from custom_components.cluster_state_sync.config_flow import ClusterStateSyncConfigFlow
 from custom_components.cluster_state_sync.const import (
     CONF_INCLUDE_DOMAINS,
+    CONF_NOTIFY_CONDITIONS,
     CONFIG_ENTRY_VERSION,
     DEFAULT_INCLUDE_DOMAINS,
+    DEFAULT_NOTIFY_CONDITIONS,
     DOMAIN,
     LEGACY_DEFAULT_INCLUDE_DOMAINS,
+    LEGACY_DEFAULT_NOTIFY_CONDITIONS,
 )
 
 
-def _v1(options: dict[str, Any] | None = None, data: dict[str, Any] | None = None):
+def _entry(version: int, options: dict[str, Any] | None = None, data: dict[str, Any] | None = None):
     return MockConfigEntry(
         domain=DOMAIN,
-        version=1,
+        version=version,
         data=data if data is not None else {"redis_host": "valkey.lan"},
         options=options if options is not None else {},
     )
+
+
+def _v1(options: dict[str, Any] | None = None, data: dict[str, Any] | None = None):
+    return _entry(1, options, data)
+
+
+def _v2(options: dict[str, Any] | None = None, data: dict[str, Any] | None = None):
+    return _entry(2, options, data)
 
 
 # -- the constants themselves ----------------------------------------------
@@ -159,3 +170,66 @@ async def test_migrating_twice_changes_nothing_the_second_time(hass: HomeAssista
 
     assert await async_migrate_entry(hass, entry) is True
     assert dict(entry.options) == once
+
+
+# -- v2 -> v3: the alert condition that arrived after most entries existed ---
+
+
+def test_the_legacy_notify_set_is_frozen_history_too() -> None:
+    """One condition apart, and that difference is the whole migration."""
+    assert set(DEFAULT_NOTIFY_CONDITIONS) - LEGACY_DEFAULT_NOTIFY_CONDITIONS == {
+        "ingress_unreachable"
+    }
+    assert LEGACY_DEFAULT_NOTIFY_CONDITIONS - set(DEFAULT_NOTIFY_CONDITIONS) == set()
+
+
+async def test_untouched_alert_conditions_gain_ingress_unreachable(hass: HomeAssistant) -> None:
+    """🚨 The 61-minute outage this exists to prevent a repeat of.
+
+    2026-09-11: the leader lost its address, the front door was unreachable for
+    an hour, the probe caught it in 105 seconds and the router raised a card at
+    three failures — and no push was sent, because the estate's entry predated
+    the condition existing. Detection was perfect and nobody was told.
+    """
+    entry = _v2(options={CONF_NOTIFY_CONDITIONS: sorted(LEGACY_DEFAULT_NOTIFY_CONDITIONS)})
+    entry.add_to_hass(hass)
+
+    assert await async_migrate_entry(hass, entry) is True
+
+    assert "ingress_unreachable" in entry.options[CONF_NOTIFY_CONDITIONS]
+    assert set(entry.options[CONF_NOTIFY_CONDITIONS]) == set(DEFAULT_NOTIFY_CONDITIONS)
+    assert entry.version == CONFIG_ENTRY_VERSION
+
+
+async def test_deliberately_chosen_alert_conditions_are_left_alone(hass: HomeAssistant) -> None:
+    """Somebody who wants only promotion alerts keeps only promotion alerts."""
+    chosen = ["promoted"]
+    entry = _v2(options={CONF_NOTIFY_CONDITIONS: list(chosen)})
+    entry.add_to_hass(hass)
+
+    assert await async_migrate_entry(hass, entry) is True
+
+    assert entry.options[CONF_NOTIFY_CONDITIONS] == chosen
+    assert entry.version == CONFIG_ENTRY_VERSION
+
+
+async def test_a_v1_entry_receives_both_migrations(hass: HomeAssistant) -> None:
+    """🚨 The one a stepwise migration gets wrong.
+
+    An entry that skipped a release must collect every step, not just the last.
+    Written because the v1→v2 code was `if entry.version == 1`, which would have
+    stamped a v1 entry straight to v3 and silently skipped the alert conditions.
+    """
+    entry = _v1(
+        options={
+            CONF_INCLUDE_DOMAINS: sorted(LEGACY_DEFAULT_INCLUDE_DOMAINS),
+            CONF_NOTIFY_CONDITIONS: sorted(LEGACY_DEFAULT_NOTIFY_CONDITIONS),
+        }
+    )
+    entry.add_to_hass(hass)
+
+    assert await async_migrate_entry(hass, entry) is True
+
+    assert "automation" in entry.options[CONF_INCLUDE_DOMAINS], "v1->v2 step was skipped"
+    assert "ingress_unreachable" in entry.options[CONF_NOTIFY_CONDITIONS], "v2->v3 step was skipped"
+    assert entry.version == CONFIG_ENTRY_VERSION
