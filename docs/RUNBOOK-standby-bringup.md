@@ -73,7 +73,7 @@ The repository is private, so HACS cannot install it. It is a file copy.
 
 ```bash
 # on the standby host
-git clone git@github.com:boywiz/ha-cluster-state-sync.git /tmp/csr
+git clone git@github.com:bionic-tech/ha-cluster-state-sync.git /tmp/csr
 cd /tmp/csr && git checkout v0.2.0
 cp -r custom_components/cluster_state_sync /path/to/config/custom_components/
 chown -R <ha-uid>:<ha-gid> /path/to/config/custom_components/cluster_state_sync

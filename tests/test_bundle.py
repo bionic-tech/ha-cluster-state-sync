@@ -3491,3 +3491,42 @@ def test_the_readiness_probe_uses_the_same_url_as_the_promoter() -> None:
     # ...and the loopback fallback for `network_mode: host`.
     plain = {k: v for k, v in COLD.items() if k != "ha_container_ip"}
     assert _promoter_ha_url(plain) in build_bundle(plain)["notify_master.sh"]
+
+
+def test_the_promoter_unit_does_not_flood_the_journal() -> None:
+    """🚨 Both settings, because either alone is wrong.
+
+    The unit runs every 10 seconds and systemd narrates each invocation with
+    three lines of its own. Measured on the reference node 2026-09-11: 15 lines
+    a minute, ~21,600 a day, none carrying information — and during a real
+    outage that morning the operator could not find the DHCP and link events in
+    the window, because the heartbeat had buried them.
+
+    `LogLevelMax` alone is the trap. It drops systemd's narration AND the
+    promoter's own output, which arrives on stderr at info. Measured: 0 promoter
+    messages survived. `SyslogLevel=notice` lifts that output above the cut, and
+    with both set the promoter still spoke (3 messages) while the heartbeat
+    went. One without the other is a silent promoter or a noisy journal.
+    """
+    from custom_components.cluster_state_sync.bundle import _promoter_service
+
+    unit = _promoter_service()
+
+    assert "LogLevelMax=notice" in unit, "systemd's per-tick narration is not filtered"
+    assert "SyslogLevel=notice" in unit, (
+        "without this the filter above also silences the promoter's own messages — "
+        "a quiet journal and a cluster that cannot tell you anything"
+    )
+
+
+def test_the_promoter_timer_is_not_slowed_down_to_fix_logging() -> None:
+    """The tidiness was free; failover latency is not.
+
+    Ten seconds against a 30-second lease TTL is three chances to renew before
+    it lapses. Two would still work and one would not, so the interval has very
+    little room in it — and none of it should be spent on log volume, which the
+    unit settings already solve.
+    """
+    from custom_components.cluster_state_sync.bundle import _promoter_timer
+
+    assert "OnUnitActiveSec=10s" in _promoter_timer()

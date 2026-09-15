@@ -2,6 +2,7 @@
   "domain": "cluster_state_sync",
   "name": "Cluster State Sync",
   "after_dependencies": [
+    "http",
     "recorder"
   ],
   "codeowners": [
@@ -9,10 +10,10 @@
   ],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/boywiz/ha-cluster-state-sync",
+  "documentation": "https://github.com/bionic-tech/ha-cluster-state-sync",
   "integration_type": "service",
   "iot_class": "local_push",
-  "issue_tracker": "https://github.com/boywiz/ha-cluster-state-sync/issues",
+  "issue_tracker": "https://github.com/bionic-tech/ha-cluster-state-sync/issues",
   "loggers": [
     "redis"
   ],
@@ -20,5 +21,5 @@
   "requirements": [
     "redis>=5.0.0,<7"
   ],
-  "version": "0.5.1"
+  "version": "0.5.2"
 }

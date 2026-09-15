@@ -7,6 +7,10 @@ before anything else.** It rules some setups out.
 > **Unfamiliar with a term used here?** [GLOSSARY.md](GLOSSARY.md) defines every
 > one, assuming no Home Assistant, Docker or clustering background.
 
+> **Want it worked through instead?** [EXAMPLE-two-node-install.md](EXAMPLE-two-node-install.md) is one concrete pass through this runbook with every value filled in, ending in a drill
+> that proves the failover. This page is the reference; that one is the
+> walkthrough.
+
 ## 0. The shortest useful version
 
 If you read nothing else:
@@ -592,3 +596,38 @@ tier-1 rsync that ADR-006 retired. Put the other node's hostname; the form will
 not submit while it is blank.
 
 </details>
+
+---
+
+## Removing it again
+
+Removing the integration does **not** remove what it generated on the host, and
+nothing else will tell you that.
+
+1. **Delete the config entry** — Settings → Devices & Services → Cluster State
+   Sync → the three-dot menu → Delete. This stops the mirroring and removes the
+   entities and the device.
+2. **Delete the integration folder** — `config/custom_components/cluster_state_sync/`
+   — then restart Home Assistant.
+3. **Stop and remove the host units**, on **both** nodes, if you installed the
+   bundle:
+   ```bash
+   sudo systemctl disable --now cluster-promoter.timer cluster-fileset-pull.timer
+   sudo rm -f /etc/systemd/system/cluster-promoter.{service,timer}
+   sudo rm -f /etc/systemd/system/cluster-fileset-pull.{service,timer}
+   sudo systemctl daemon-reload
+   sudo rm -rf /etc/cluster-sync /run/cluster-sync
+   ```
+   🚨 **Leave the promoter running and you keep a timer taking a lease and
+   restarting Home Assistant on leadership changes, with nothing left to explain
+   why.** This is the step people forget.
+4. **Check the firewall**, for a warm-standby install. If a follower ruleset was
+   loaded, the node is still gated: `sudo nft list ruleset`. The bundle ships
+   `nft-safety-revert.sh` for exactly this.
+5. **Optionally clear the shared store** — the snapshot and go-bag outlive the
+   integration:
+   ```bash
+   redis-cli ... --scan --pattern 'ha:cluster_state_sync:<namespace>:*' | xargs redis-cli ... DEL
+   ```
+
+Moved here from the README on 2026-09-12.

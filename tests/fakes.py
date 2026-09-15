@@ -157,3 +157,34 @@ class FakeBackend(ClusterBackend):
         """The entries passed to the most recent successful write."""
         assert self.writes, "no snapshot was ever written"
         return self.writes[-1]
+
+
+def render_schema_for_frontend(schema, custom_serializer):
+    """Serialise a config-flow schema the way Home Assistant serialises it.
+
+    🚨 Home Assistant changed the library underneath this between 2026.6.4 and
+    2026.9.2, and changed nothing a symbol check can see.
+
+    Until 2026.6.x it used `voluptuous_serialize.convert`. 2026.9.x replaced
+    `voluptuous` wholesale with **probatio**, which installs itself under the
+    name `voluptuous` at Home Assistant import time (`install_as_voluptuous`) —
+    so `import voluptuous` in this process is `probatio._vol_shim`, and
+    `cv.custom_serializer` now returns probatio's `_Unsupported` sentinel.
+
+    The old `convert()` does not recognise that sentinel. It does not raise: it
+    RETURNS it, so the caller gets a non-iterable object where a list of fields
+    used to be, and the failure surfaces as `TypeError: '_Unsupported' object is
+    not iterable` several lines away from the cause.
+
+    These tests exist to catch a wizard step whose schema cannot be rendered,
+    which the operator meets as an error where a form should be. That is worth
+    keeping working across the version this repository pins and the version it
+    is moving to, so this tries the new path first and falls back.
+    """
+    try:
+        from probatio.codecs import to_field_list
+    except ImportError:
+        import voluptuous_serialize
+
+        return voluptuous_serialize.convert(schema, custom_serializer=custom_serializer)
+    return to_field_list(schema, custom_serializer=custom_serializer)

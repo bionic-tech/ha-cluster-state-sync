@@ -557,12 +557,13 @@ async def test_every_wizard_step_survives_the_frontend(hass: HomeAssistant, mode
     Production change this catches: any custom validator in any step's schema.
     """
     from homeassistant.helpers import config_validation as cv
-    import voluptuous_serialize
+
+    from tests.fakes import render_schema_for_frontend
 
     def render(result: dict) -> None:
         schema = result.get("data_schema")
         if schema is not None:
-            voluptuous_serialize.convert(schema, custom_serializer=cv.custom_serializer)
+            render_schema_for_frontend(schema, custom_serializer=cv.custom_serializer)
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
@@ -617,11 +618,12 @@ async def test_every_wizard_step_survives_the_frontend(hass: HomeAssistant, mode
 def _serialised_fields(schema) -> dict[str, dict]:
     """What the frontend actually receives for a step."""
     from homeassistant.helpers import config_validation as cv
-    import voluptuous_serialize
+
+    from tests.fakes import render_schema_for_frontend
 
     return {
         f["name"]: f
-        for f in voluptuous_serialize.convert(schema, custom_serializer=cv.custom_serializer)
+        for f in render_schema_for_frontend(schema, custom_serializer=cv.custom_serializer)
     }
 
 
@@ -833,6 +835,19 @@ async def test_reconfigure_can_fix_a_host_path_without_deleting_the_entry(
     with patch("custom_components.cluster_state_sync.RedisBackend") as backend_cls:
         backend_cls.return_value.connect.return_value = None
         result = await hass.config_entries.flow.async_configure(flow_id, {"next_step_id": "finish"})
+        # 🚨 Inside the patch, and not optional.
+        #
+        # A successful reconfigure ends in `async_update_reload_and_abort`,
+        # which schedules a reload of the entry as a background task. Returning
+        # here left that task in flight: `verify_cleanup` reported a lingering
+        # task at teardown and Home Assistant logged "Setup of config entry ...
+        # cancelled". Intermittent, because whether the task had got far enough
+        # to matter depended on machine load — which is the worst kind of red,
+        # since the habit it teaches is re-running until green.
+        #
+        # It has to be inside the `with`: outside it, the reload reaches the
+        # real `RedisBackend` and tries to open a socket the harness blocks.
+        await hass.async_block_till_done()
 
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "reconfigure_successful"
@@ -970,9 +985,9 @@ def test_a_remote_host_gets_ssh_commands_and_a_warning() -> None:
     text = _transfer_commands(
         {CONF_HA_CONTAINER: "ha"},
         "/config/bundle",
-        {"host": "tiger2.lan", "user": "deploy", "key_path": "/home/me/.ssh/id_ed25519"},
+        {"host": "node-b.lan", "user": "deploy", "key_path": "/home/me/.ssh/id_ed25519"},
     )
-    assert "deploy@tiger2.lan" in text
+    assert "deploy@node-b.lan" in text
     assert "-i /home/me/.ssh/id_ed25519" in text
     assert "runs its own wizard" in text
 
@@ -1047,7 +1062,8 @@ async def test_dedicated_database_plus_history_offers_ONLY_cold(
     past a caveat.
     """
     from homeassistant.helpers import config_validation as cv
-    import voluptuous_serialize
+
+    from tests.fakes import render_schema_for_frontend
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
@@ -1075,7 +1091,7 @@ async def test_dedicated_database_plus_history_offers_ONLY_cold(
     )
     assert result["step_id"] == "topology"
 
-    rendered = voluptuous_serialize.convert(
+    rendered = render_schema_for_frontend(
         result["data_schema"], custom_serializer=cv.custom_serializer
     )
     field = next(f for f in rendered if f["name"] == "topology_model")
@@ -1092,7 +1108,8 @@ async def test_a_shared_database_keeps_both_models_available(
 ) -> None:
     """One database both nodes use has nothing to swap, so warm is fine."""
     from homeassistant.helpers import config_validation as cv
-    import voluptuous_serialize
+
+    from tests.fakes import render_schema_for_frontend
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
@@ -1105,7 +1122,7 @@ async def test_a_shared_database_keeps_both_models_available(
     result = await hass.config_entries.flow.async_configure(
         flow_id, {"history_matters": True, "history_database": "shared"}
     )
-    rendered = voluptuous_serialize.convert(
+    rendered = render_schema_for_frontend(
         result["data_schema"], custom_serializer=cv.custom_serializer
     )
     field = next(f for f in rendered if f["name"] == "topology_model")
@@ -1122,7 +1139,8 @@ async def test_not_caring_about_history_leaves_both_models_available(
 ) -> None:
     """The restriction exists to protect history. No history, no restriction."""
     from homeassistant.helpers import config_validation as cv
-    import voluptuous_serialize
+
+    from tests.fakes import render_schema_for_frontend
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
@@ -1135,7 +1153,7 @@ async def test_not_caring_about_history_leaves_both_models_available(
     result = await hass.config_entries.flow.async_configure(
         flow_id, {"history_matters": False, "history_database": "dedicated"}
     )
-    rendered = voluptuous_serialize.convert(
+    rendered = render_schema_for_frontend(
         result["data_schema"], custom_serializer=cv.custom_serializer
     )
     field = next(f for f in rendered if f["name"] == "topology_model")

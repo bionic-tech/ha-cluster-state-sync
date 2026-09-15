@@ -1,0 +1,102 @@
+name: Bug report
+description: Something behaved differently from how it is documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before anything else: if this is a security problem, close this and read
+        [SECURITY.md](../blob/main/SECURITY.md).** A public issue is the wrong place
+        for it, and cannot be taken back.
+
+        Everything below exists because it has actually been needed to diagnose
+        something. If a field does not apply, say so rather than deleting it —
+        "not applicable" is information.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+      placeholder: |
+        After a promotion, the standby came up with every automation switched off.
+        I expected the ones that were on before the failover to still be on.
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: |
+        **Settings → Devices & Services → Cluster State Sync → ⋮ → Download diagnostics.**
+
+        It is deliberately a file you download rather than something uploaded for
+        you: open it, read it, then decide. Passwords, the cluster secret, TLS
+        material, hostnames, paths and your ingress URL are all withheld, and
+        config values are allowlisted — anything the integration does not
+        explicitly mark safe is `**REDACTED**`, so a setting added in a later
+        release is withheld by default rather than published by accident.
+
+        Node names appear as `node-9c4e17`: stable, so relationships between
+        nodes survive, and not reversible into a hostname.
+      placeholder: Paste the JSON here, or attach the file.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: read-it
+    attributes:
+      label: Confirmation
+      options:
+        - label: I opened the diagnostics file and I am content for its contents to be public.
+          required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines
+      description: |
+        `Settings → System → Logs`, or from the host:
+        `docker logs <container> 2>&1 | grep cluster_state_sync`
+
+        Lines worth looking for: `ALERT raised`, `Restored ... from snapshot`,
+        `Leadership change`, `Not restoring`, `Refusing to restore`.
+
+        🚨 Home Assistant logs are **not** redacted for you. Check them before
+        pasting — they contain entity names, and sometimes tokens.
+      render: shell
+
+  - type: dropdown
+    id: which-node
+    attributes:
+      label: Which node was this on
+      options:
+        - The node that held the lease (leader)
+        - The standby
+        - Both
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: when
+    attributes:
+      label: When did it happen
+      options:
+        - During a promotion or failover
+        - During normal running
+        - At Home Assistant startup
+        - While changing settings
+        - During installation or the wizard
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Can you reproduce it
+      description: |
+        If yes, the steps. If it happened once and you cannot make it happen
+        again, say that — "once, and I cannot reproduce it" is a useful and
+        honest answer, and several real defects here were exactly that shape.

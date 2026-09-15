@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Any
 
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import CALLBACK_TYPE, CoreState, Event, HomeAssistant, callback
@@ -78,12 +79,38 @@ class AlertRouter:
         conditions: tuple[str, ...] | list[str],
         services: tuple[str, ...] | list[str],
         node_id: str,
+        state: dict[str, Any] | None = None,
     ) -> None:
         self._hass = hass
         self._conditions = set(conditions)
         self._services = tuple(services)
         self._node_id = node_id
-        self._active: set[str] = set()
+        #: 🚨 Edge state that must OUTLIVE a reload, and the reason is measured.
+        #:
+        #: Every options change reloads the entry, and a reload used to build a
+        #: router with an empty `_active`. So every condition that was still
+        #: true raised again -- and pushed again. On the reference estate,
+        #: 2026-09-11: three identical "Promoted without 1 device(s)" pushes in
+        #: forty minutes from three reloads, and `devices_disabled` is true on
+        #: EVERY start while a device stays disabled, so it was not an edge
+        #: case, it was every restart forever.
+        #:
+        #: It cut the other way too. A fault that cleared after a reload sent no
+        #: all-clear, because `async_clear` found nothing active to clear -- and
+        #: left its card on the repairs page, because `_dismiss` only runs from
+        #: there. An ingress alert raised at 09:36 was still sitting there
+        #: twenty minutes after the fault was fixed.
+        #:
+        #: An alert channel that repeats itself is one people stop reading,
+        #: which costs exactly the alert that matters.
+        #:
+        #: Deliberately in memory, not on disk: a genuine Home Assistant restart
+        #: SHOULD re-evaluate everything from scratch. What must not re-evaluate
+        #: is a reload, which is an implementation detail of changing a setting
+        #: and should be invisible.
+        state = {} if state is None else state
+        self._state = state
+        self._active: set[str] = state.setdefault("active", set())
         self._took_over_from: str | None = None
         #: 🚨 Held back until Home Assistant has finished starting.
         #:
@@ -99,7 +126,7 @@ class AlertRouter:
         #: before we are, and its whole job is to still be there when you look.
         self._pending: list[tuple[str, str]] = []
         self._started = hass.state is CoreState.running
-        self._last_sent: dict[str, float] = {}
+        self._last_sent: dict[str, float] = state.setdefault("last_sent", {})
         #: Services already reported missing. Logged once, not once per tick:
         #: a typo in a service name should be findable, not deafening.
         self._warned: set[str] = set()
@@ -154,15 +181,30 @@ class AlertRouter:
         repair sites can call this unconditionally.
         """
         if condition in self._active:
+            _LOGGER.debug("%s is already active; not raising it again", condition)
             return
         self._active.add(condition)
+        # INFO, not debug, and the reason is the whole of 2026-09-11.
+        #
+        # The front door was unreachable for 61 minutes. The probe caught it in
+        # 105 seconds and this router raised at three failures -- and the log
+        # said NOTHING, because raising was silent. Afterwards it was impossible
+        # to tell from the record whether the alert had fired and been gated, or
+        # never fired at all; persistent notifications stopped being entities in
+        # 2023, so the card leaves no queryable trace either.
+        #
+        # An alerting system that cannot show you it alerted is indistinguishable
+        # from one that is broken. This line costs nothing and settles it.
+        _LOGGER.info("ALERT raised: %s -- %s", condition, title)
         await self._dispatch(condition, title, message, sticky=True)
 
     async def async_clear(self, condition: str, title: str, message: str) -> None:
         """Announce that a condition has stopped being true."""
         if condition not in self._active:
+            _LOGGER.debug("%s was not active; nothing to clear", condition)
             return
         self._active.discard(condition)
+        _LOGGER.info("ALERT cleared: %s -- %s", condition, title)
         # The card goes: a cleared condition must not leave something on the
         # repairs page demanding attention it no longer deserves.
         self._dismiss(condition)
@@ -253,6 +295,18 @@ class AlertRouter:
         worth having, because somebody is still holding their phone.
         """
         if gate not in self._conditions:
+            # Also INFO. A suppressed push is a decision the operator made, and
+            # the one time it matters is exactly when they are asking why their
+            # phone stayed quiet. Saying which condition, and that it is a
+            # choice rather than a fault, is the difference between a two-minute
+            # answer and an afternoon.
+            _LOGGER.info(
+                "Not pushing %s: `%s` is not in this entry's alert conditions. "
+                "The card is still shown here. Tick it in the options flow if "
+                "you want it on your phone.",
+                key,
+                gate,
+            )
             return
         if rate_limit:
             now = time.monotonic()

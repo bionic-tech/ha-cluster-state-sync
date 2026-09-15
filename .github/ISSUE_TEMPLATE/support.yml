@@ -1,0 +1,44 @@
+name: Help using it
+description: It is not behaving as you expected, and you are not sure whether that is a bug.
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        No need to decide whether it is a bug — describe what you see and we will work it out.
+
+        Worth checking first, because they answer most questions here:
+
+        - [Known limitations](../blob/main/docs/KNOWN-LIMITATIONS.md) — things that are true, unfixed and deliberate
+        - [Choosing domains](../blob/main/docs/GUIDE-choosing-domains.md) — what is worth replicating and what is not
+        - [Troubleshooting](../blob/main/docs/TROUBLESHOOTING.md)
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What you expected, and what happened instead
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics (optional, but it usually answers the question immediately)
+      description: |
+        **Settings → Devices & Services → Cluster State Sync → ⋮ → Download diagnostics.**
+
+        You get a file rather than an upload, so you can read it before deciding.
+        Secrets, hostnames, paths and your ingress URL are withheld; node names
+        appear as a stable digest like `node-9c4e17`.
+
+  - type: dropdown
+    id: shape
+    attributes:
+      label: What does your cluster look like
+      options:
+        - Two nodes, one Valkey, no Sentinel
+        - Two nodes with Valkey Sentinel
+        - More than two nodes
+        - Still setting it up — it has not run yet
+    validations:
+      required: true

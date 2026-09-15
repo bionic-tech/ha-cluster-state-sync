@@ -447,6 +447,50 @@ def _require_identity(value: str, flag: str) -> str:
     return value
 
 
+#: Marker the integration writes into a hold it set itself, so that an
+#: automatic hold and an operator's hold are distinguishable. An operator's
+#: hold is indefinite and must stay that way; only an automatic one expires.
+AUTO_HOLD_MARKER = "cluster_state_sync:auto-hold"
+
+
+def _hold_is_expired(hold_path: pathlib.Path) -> tuple[bool, str | None]:
+    """Has a self-expiring hold outlived its deadline?
+
+    🚨 The expiry has to live HERE, not in the integration that set it.
+
+    An automatic hold exists to cover Home Assistant restarting. If Home
+    Assistant never comes back, the thing that set the hold is gone -- so
+    nothing inside it can ever clear it, and a cluster would sit held forever
+    on a dead node. The promoter is the only participant still running, which
+    makes it the only place the deadline can be enforced.
+
+    A hold with no `expires:` line never expires. That is the operator's hold
+    and the behaviour it has always had: a person said "not yet", and only a
+    person says otherwise.
+
+    An unparseable or absent deadline is treated as NO expiry, deliberately.
+    Guessing that a malformed hold has lapsed would resume failover during
+    exactly the maintenance somebody asked us to sit out.
+    """
+    try:
+        text = hold_path.read_text(encoding="utf-8")
+    except OSError:
+        return False, None
+    for line in text.splitlines():
+        if not line.lower().startswith("expires:"):
+            continue
+        stamp = line.split(":", 1)[1].strip()
+        try:
+            deadline = datetime.fromisoformat(stamp)
+        except ValueError:
+            return False, None
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=UTC)
+        now = datetime.now(UTC)
+        return now > deadline, stamp
+    return False, None
+
+
 def _holddown_path(state_path: pathlib.Path) -> pathlib.Path:
     """Where M3's release hold-down marker lives, by default.
 
@@ -634,6 +678,21 @@ def run(
         holddown = holddown_path if holddown_path is not None else _holddown_path(state_path)
 
         held = hold_path is not None and hold_path.is_file()
+        if held:
+            assert hold_path is not None  # narrowed by `held`
+            expired, deadline = _hold_is_expired(hold_path)
+            if expired:
+                # Say it plainly. A hold that lapses silently looks identical
+                # to one that was never set, and the difference matters if the
+                # node it was covering is the one that never came back.
+                print(
+                    f"cluster promoter: the maintenance hold expired at {deadline} "
+                    "and is being ignored. It was set automatically to cover a "
+                    "restart; Home Assistant has not returned, so failover is "
+                    "live again.",
+                    file=sys.stderr,
+                )
+                held = False
         if held and not force_path.exists():
             # Maintenance hold (hold.py). Renew what we have, never take what
             # is free, and never demote. Two branches collapse into one here

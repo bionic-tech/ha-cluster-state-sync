@@ -171,3 +171,20 @@ Both are also wired to buttons on the generated dashboard
 > scripts the runtime modules never import, so nothing in a running Home
 > Assistant can execute them. Verified independently by homelab, 2026-09-02.
 
+---
+
+## Configuration reference
+
+| Setting | Default | What it does |
+|---|---|---|
+| Cluster namespace | `default` | Logical cluster ID — must match across all nodes that should share state. Allows multiple clusters on one Valkey. |
+| Node ID | `hostname-<6 chars of the install UUID>` | Used to attribute state writes; we never restore states this node wrote itself. |
+| Snapshot interval | 5s | How often the buffer flushes to Redis. Lower = less data loss on failover, more write pressure. |
+| Restore max age | 1800s (30m) | Snapshots older than this are ignored on startup. Stops a node coming back after a week from restoring ancient garbage. |
+| Include domains | see `const.py` | Entity domains we mirror. Defaults to `input_*`, `counter`, `timer`, `vacuum`, `climate`, `humidifier`, `water_heater`. **`person`, `device_tracker` and `alarm_control_panel` are opt-in** — see `SENSITIVE_DOMAINS`. Edit `DEFAULT_INCLUDE_DOMAINS` to extend. |
+| Gate automations | `off` | Warm standby only. Stops the *automation engine* on a follower, so both nodes do not fire your automations during an overlap. Off by default — turning it on means a promoted node needs its automations re-enabled by the promotion path. |
+| Gate recorder | `off` | Warm standby only. Stops a follower writing history, so two nodes do not interleave rows into a shared recorder database. |
+| Entities that prove a radio is receiving | *(empty — off)* | Globs, e.g. `sensor.*_rssi_numeric`. Creates a **Radio silence** sensor: seconds since the freshest of them last changed. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#diagnostics). |
+
+Moved here from the README on 2026-09-11: it was the only place these
+settings were documented, and the README had grown to a 32-minute read.

@@ -241,7 +241,9 @@ host scripts because the container is unprivileged.
   - [ADR-005](./ADR-005-generate-not-control.md) — how the wizard's host bundle is delivered, and why the integration does not apply it itself
 - Design templates: 06 (Infrastructure & Cloud), 02 (Backend), 26 (Disaster Recovery & BCP), 23 (Incident Response)
 - Adversarial review: AR-0001 (delta-not-full-state), AR-0017 (no leader election), AR-0004 (location/alarm exposure) — see the internal adversarial review and the internal backlog
-- Original design: [root README](../../README.md), [integration README](../../custom_components/cluster_state_sync/README.md)
+- Original design: [root README](../../README.md). The integration README
+  carried a second copy until 2026-09-12, when it was reduced to a pointer;
+  the original text is in git history.
 
 ## Implementation status of the four layers — 2026-08-26
 

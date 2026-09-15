@@ -305,7 +305,7 @@ async def test_every_step_schema_survives_the_frontend(hass: HomeAssistant) -> N
     """🚨 The test that was missing, and the reason this flow never once worked.
 
     Home Assistant does not hand a voluptuous schema to the browser. It converts
-    it to JSON with `voluptuous_serialize.convert(schema,
+    it to JSON with `render_schema_for_frontend(schema,
     custom_serializer=cv.custom_serializer)` — exactly as
     `helpers/data_entry_flow.py` does — and that converter cannot handle an
     arbitrary callable.
@@ -320,13 +320,14 @@ async def test_every_step_schema_survives_the_frontend(hass: HomeAssistant) -> N
     schema the flow shows.
     """
     from homeassistant.helpers import config_validation as cv
-    import voluptuous_serialize
+
+    from tests.fakes import render_schema_for_frontend
 
     def render(result) -> None:
         """Do what Home Assistant does before sending a step to the browser."""
         schema = result.get("data_schema")
         if schema is not None:
-            voluptuous_serialize.convert(schema, custom_serializer=cv.custom_serializer)
+            render_schema_for_frontend(schema, custom_serializer=cv.custom_serializer)
 
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}

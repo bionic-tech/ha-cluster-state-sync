@@ -35,7 +35,7 @@ eleven entity names**, on every install. That is not a dashboard anyone gets by 
 **Rejected: creating a real Lovelace dashboard.** Home Assistant makes its own map dashboard this
 way (`dashboards_collection.async_create_item`), so it demonstrably works. But `DashboardsCollection`
 is a local inside `lovelace`'s `async_setup` and is not exposed on `hass.data`; reaching it means
-another integration's internals. CONTRIBUTING.md is explicit that surviving minor
+another integration's internals. [CONTRIBUTING.md](../../CONTRIBUTING.md) is explicit that surviving minor
 Home Assistant bumps is the thing this design exists to protect, and a sidebar convenience is not
 worth spending that on.
 

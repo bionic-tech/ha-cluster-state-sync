@@ -658,8 +658,6 @@ class UnreplicatedReferencesSensor(ClusterSyncDiagnosticEntity, SensorEntity):
         return self._detail
 
 
-
-
 class RadioSilenceSensor(ClusterSyncDiagnosticEntity, SensorEntity):
     """Seconds since anything the operator called a radio was last heard from.
 

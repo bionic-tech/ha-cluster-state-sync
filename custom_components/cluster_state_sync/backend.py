@@ -332,6 +332,23 @@ class ClusterBackend(ABC):
         """
 
 
+class _PrebuiltSSLContext:
+    """Stands in for `redis`'s `RedisSSLContext`, returning a ready context.
+
+    `redis` only ever calls `.get()` on that object, so a two-line stand-in is
+    enough and avoids subclassing a private class whose constructor signature
+    has changed between releases.
+    """
+
+    __slots__ = ("context",)
+
+    def __init__(self, context: Any) -> None:
+        self.context = context
+
+    def get(self) -> Any:
+        return self.context
+
+
 class RedisBackend(ClusterBackend):
     """Redis / Valkey backend.
 
@@ -502,6 +519,8 @@ class RedisBackend(ClusterBackend):
                 health_check_interval=30,
                 **self._tls_kwargs,
             )
+        # Build the TLS context off the event loop before anything connects.
+        await self._warm_tls_context()
         # Force a connection round-trip so we fail fast on bad config.
         await self._client.ping()
         _LOGGER.info(
@@ -509,6 +528,63 @@ class RedisBackend(ClusterBackend):
             self._use_sentinel,
             self._namespace,
         )
+
+    async def _warm_tls_context(self) -> None:
+        """Build the SSL context in an executor, not on the event loop.
+
+        Home Assistant reported us three times on every connect:
+
+            Detected blocking call to load_default_certs ... inside the event
+            loop by custom integration 'cluster_state_sync' at backend.py:506
+
+        `redis` builds its `SSLContext` lazily, inside `RedisSSLContext.get()`,
+        on whichever thread first opens a connection -- and that call reads the
+        system trust store from disk. `redis` 6.4 accepts no pre-built context
+        (`SSLConnection` has no `ssl_context` parameter), so the context cannot
+        simply be handed over.
+
+        What it does expose is `ConnectionPool.connection_class`. So: build the
+        context once in a worker thread, then point the pool at a subclass that
+        hands every connection that finished object instead of building its own.
+        Without the subclass this would warm one connection and leave every
+        later one blocking again, because each builds its own `RedisSSLContext`.
+
+        🚨 Wrapped in a bare `except` on purpose, and it must stay that way.
+        This is an optimisation reaching into another library's internals on the
+        cluster's critical connect path. If `redis` reorganises, the right
+        outcome is the warning coming back -- not a cluster that cannot reach
+        its backend. Failure here costs a log line; failure of `connect()` costs
+        the house.
+        """
+        if not self._use_tls or self._client is None:
+            return
+        try:
+            pool = self._client.connection_pool
+            base = pool.connection_class
+            if not isinstance(base, type):
+                # Under test the pool is a mock, and subclassing a mock
+                # produces something that is not a connection class. Nothing to
+                # warm and nothing worth pretending: leave the pool alone.
+                return
+
+            probe = pool.make_connection()
+            loop = asyncio.get_running_loop()
+            context = await loop.run_in_executor(None, probe.ssl_context.get)
+
+            class _WarmedSSLConnection(base):  # type: ignore[misc, valid-type]
+                """Every connection reuses the context built above."""
+
+                def __init__(self, *args: Any, **kwargs: Any) -> None:
+                    super().__init__(*args, **kwargs)
+                    self.ssl_context = _PrebuiltSSLContext(context)
+
+            pool.connection_class = _WarmedSSLConnection
+        except Exception:  # noqa: BLE001 -- see this method's docstring
+            _LOGGER.debug(
+                "Could not pre-build the TLS context off the event loop; "
+                "Home Assistant may warn about a blocking call on connect",
+                exc_info=True,
+            )
 
     async def close(self) -> None:
         if self._client is not None:

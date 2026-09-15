@@ -18,3 +18,35 @@ ExecStart=/etc/cluster-sync/cluster-promoter.sh
 # if something outside the promoter's own control -- systemd, the kernel --
 # is also stuck.
 TimeoutStartSec=150s
+
+# Silence the heartbeat, keep everything the promoter actually says.
+#
+# This unit runs every 10 seconds and systemd narrates each invocation
+# with three lines of its own: Starting, Deactivated successfully,
+# Finished. Measured on the reference node 2026-09-11: 15 lines a
+# minute, ~21,600 a day, none of which carry information. The promoter
+# is SILENT on a normal tick -- every one of its messages is an
+# exception or an event worth reading.
+#
+# Not merely untidy. During a real outage that morning the operator
+# could not find the DHCP and link events in the window: the heartbeat
+# had buried them. A log nobody can search during an incident is doing
+# harm, not nothing.
+#
+# LogLevelMax filters both this unit's own output and what systemd
+# writes ABOUT it. systemd's narration is info (6), so notice (5)
+# drops it.
+#
+# SyslogLevel is the other half and is not optional -- verified by
+# measurement, because LogLevelMax alone silenced the promoter too.
+# It writes to stderr, which systemd records at info by default, so
+# the same filter caught it. Recording at notice puts it above the cut.
+#
+#   LogLevelMax alone -> heartbeat gone, promoter ALSO gone
+#   both together     -> heartbeat gone, promoter intact
+#
+# Deliberately NOT solved by slowing the timer. Ten seconds against a
+# 30-second lease TTL is three chances to renew before it lapses;
+# stretching it trades failover latency for tidiness.
+LogLevelMax=notice
+SyslogLevel=notice

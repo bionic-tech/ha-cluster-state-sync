@@ -832,3 +832,12 @@ DATA_INGRESS: Final = "ingress"
 # enough that a dead backend surfaces well inside the failover budget, rare
 # enough that it is not itself load.
 HEALTH_POLL_INTERVAL: Final = 60
+
+#: Shown as the example address in the ingress step.
+#:
+#: 🚨 It lives here rather than in `strings.json` because Home Assistant's own
+#: validator refuses a URL inside a translated string -- "use description
+#: placeholders instead" -- and it is right to: a literal URL cannot be
+#: localised, and a translator has no way to know whether it is an example or
+#: something to click.
+INGRESS_URL_EXAMPLE: Final = "https://home.example.com"

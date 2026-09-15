@@ -1,0 +1,44 @@
+name: Suggestion
+description: An idea for something it should do, or do differently.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ideas are welcome, including ones that turn out to be declined — a good
+        argument for something that does not get built is still worth having on
+        the record.
+
+        Two things to know before writing, so you are not disappointed:
+
+        - **[Known limitations](../blob/main/docs/KNOWN-LIMITATIONS.md)** lists
+          things that are deliberate rather than missing. Some of them look
+          exactly like bugs worth fixing.
+        - **[CONTRIBUTING.md](../blob/main/CONTRIBUTING.md)** lists what is
+          declined and why — monkey-patching Home Assistant, moving work onto the
+          host, and making the promoter clever. Those are not "no" to your
+          problem, only to those routes.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve
+      description: |
+        The problem, not the solution. "My standby comes up without X" leads
+        somewhere; "add a setting for X" narrows it to one answer before anyone
+        has looked.
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you think it should do
+    validations:
+      required: true
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: How you handle it today
+      description: Often the most useful field — it says how much the problem actually costs.

@@ -20,7 +20,7 @@ Three surfaces, three failure modes.
 
 **We use no private Home Assistant API.** No underscore-prefixed imports, no
 monkey-patching, no core fork — checked, and it is the whole point of
-[the design](../README.md#what-it-deliberately-is-not). The nineteen symbols we
+[the design](../README.md#what-it-does-not-do). The nineteen symbols we
 do import are listed in `scripts/ha_compat_check.py` and verified weekly.
 
 ---

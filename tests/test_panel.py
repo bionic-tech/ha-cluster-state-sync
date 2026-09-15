@@ -51,8 +51,11 @@ def test_the_panel_discovers_entities_rather_than_naming_them() -> None:
     """
     js = PANEL_JS.read_text(encoding="utf-8")
     assert "cluster_sync_" in js and "match(" in js, "must derive node ids from entity ids"
-    # The fleet's own node id must never have leaked into a shipped file.
-    assert "node" not in js
+    # No node id may be baked into a shipped file. Asserting on the shape
+    # rather than on this fleet's own hostname keeps the test meaningful in the
+    # published copy, where that hostname does not appear to begin with.
+    baked = re.findall(r"[\"'][a-z][a-z0-9-]*-[0-9a-f]{6}[\"']", js)
+    assert not baked, f"a node id is hardcoded in the panel: {baked}"
 
 
 def test_registration_failure_never_breaks_setup() -> None:

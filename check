@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
 # Local gate — run everything CI would, before pushing.
 #
-# GitHub Actions has not run since 2026-05-28 (billing), so for now this is the
-# only gate that actually fires. It is weaker than CI in one specific way: it
-# relies on someone remembering to run it. Install the hook to remove that:
+# CI is the authority; this runs the same gates locally so a push does not have
+# to be the first place a problem shows up. It is weaker than CI in one specific
+# way: it relies on someone remembering to run it. Install the hook to remove
+# that:
+#
+# 🚨 A green run here says nothing about whether CI is running at all. This
+# comment used to record that Actions had been off since 2026-05-28 for billing
+# — and by the time that was stale, it was explaining away a CI that had been
+# failing to start on every push, because ci.yml defined a job twice and GitHub
+# rejects the file outright. A local gate that is trusted BECAUSE the remote one
+# is assumed dead is the worst of both.
+#
 #
 #     ./check --install-hook
 #

@@ -25,6 +25,7 @@ from custom_components.cluster_state_sync.alerts import (
 )
 from custom_components.cluster_state_sync.const import (
     DEFAULT_NOTIFY_CONDITIONS,
+    DOMAIN,
     NOTIFY_CONDITIONS,
     NOTIFY_FILESET_DEGRADED,
     NOTIFY_PROMOTED,
@@ -33,12 +34,15 @@ from custom_components.cluster_state_sync.const import (
 )
 
 
-def _router(hass: HomeAssistant, *, conditions=None, services=("notify.tester",), node="tiger1"):
+def _router(
+    hass: HomeAssistant, *, conditions=None, services=("notify.tester",), node="tiger1", state=None
+):
     return AlertRouter(
         hass,
         conditions=DEFAULT_NOTIFY_CONDITIONS if conditions is None else conditions,
         services=services,
         node_id=node,
+        state=state,
     )
 
 
@@ -452,3 +456,93 @@ async def test_restored_nothing_is_pushed_by_default(hass: HomeAssistant, pushes
     await hass.async_block_till_done()
     assert len(pushes) == 1
     assert "28" in pushes[0].data["message"]
+
+
+# -- surviving a reload -----------------------------------------------------
+#
+# Every options change reloads the entry. Before the state below was carried
+# across, a reload built a router with nothing raised — so everything still
+# true announced itself again, and anything that had cleared lost its
+# all-clear. Measured on the reference estate 2026-09-11: three identical
+# "Promoted without 1 device(s)" pushes in forty minutes.
+
+
+async def test_a_reload_does_not_re_announce_what_is_still_wrong(
+    hass: HomeAssistant, pushes
+) -> None:
+    """🚨 The duplicate-push bug, which is the one people actually feel.
+
+    `devices_disabled` is true on every start while a device stays disabled, so
+    without this a restart or any settings change pushes it again, forever. An
+    alert channel that repeats itself is one people stop reading.
+    """
+    state: dict = {}
+
+    before = _router(hass, state=state)
+    await before.async_raise(NOTIFY_FILESET_DEGRADED, "Go-bag degraded", "the first time")
+    assert len(pushes) == 1
+
+    # The reload: same state handed to a brand-new router.
+    after = _router(hass, state=state)
+    await after.async_raise(NOTIFY_FILESET_DEGRADED, "Go-bag degraded", "still degraded")
+
+    assert len(pushes) == 1, "a reload re-announced a condition that never went away"
+
+
+async def test_a_fault_that_clears_after_a_reload_still_says_so(
+    hass: HomeAssistant, pushes
+) -> None:
+    """The other half: whoever was woken is owed the all-clear.
+
+    Without the carried state `async_clear` finds nothing active, returns
+    early, and the operator is never told it recovered.
+    """
+    state: dict = {}
+
+    before = _router(hass, state=state)
+    await before.async_raise(NOTIFY_FILESET_DEGRADED, "Go-bag degraded", "raised")
+    assert f"{DOMAIN}_{NOTIFY_FILESET_DEGRADED}" in _cards(hass)
+
+    after = _router(hass, state=state)
+    await after.async_clear(NOTIFY_FILESET_DEGRADED, "Go-bag fine", "recovered")
+
+    assert len(pushes) == 2, "the all-clear was swallowed by the reload"
+    assert f"{DOMAIN}_{NOTIFY_FILESET_DEGRADED}" not in _cards(hass), (
+        "the card was orphaned — `_dismiss` only runs from `async_clear`, so a "
+        "reload in between leaves it on the repairs page for ever"
+    )
+
+
+async def test_a_flap_window_also_survives_a_reload(hass: HomeAssistant, pushes) -> None:
+    """Rate limiting lives in the same state, and for the same reason.
+
+    A reload that reset `_last_sent` would let a flapping condition push again
+    immediately — the exact spam the window exists to prevent.
+    """
+    state: dict = {}
+
+    before = _router(hass, state=state)
+    await before.async_event(NOTIFY_PROMOTED, "Moved", "one")
+    sent = len(pushes)
+
+    after = _router(hass, state=state)
+    await after.async_raise(NOTIFY_FILESET_DEGRADED, "Go-bag degraded", "two")
+
+    assert state["last_sent"], "the flap window was not carried across the reload"
+    assert len(pushes) > sent
+
+
+async def test_a_fresh_start_does_announce_again(hass: HomeAssistant, pushes) -> None:
+    """A genuine restart is NOT a reload, and should re-evaluate everything.
+
+    The state is deliberately in memory and dropped on a real unload, so this
+    is the behaviour a new boot gets — anything still wrong is news again.
+    """
+    first = _router(hass, state={})
+    await first.async_raise(NOTIFY_FILESET_DEGRADED, "Go-bag degraded", "before the restart")
+    assert len(pushes) == 1
+
+    second = _router(hass, state={})  # no state carried: a fresh start
+    await second.async_raise(NOTIFY_FILESET_DEGRADED, "Go-bag degraded", "after the restart")
+
+    assert len(pushes) == 2, "a genuine restart must still report what is wrong"

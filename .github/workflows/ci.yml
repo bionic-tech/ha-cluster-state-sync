@@ -237,6 +237,79 @@ jobs:
       - name: Run the suite against it
         run: pytest -q -rs
 
+  supported-versions:
+    name: Which releases do we promise?
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # 🚨 `hacs.json` declares a MINIMUM, which is a promise about every release
+    # above it — not about the one version `requirements-dev.txt` pins. Home
+    # Assistant ships monthly, so that promise grows by one untested release
+    # every month unless something goes and checks.
+    #
+    # Derived rather than hardcoded: a hardcoded matrix is a matrix that stops
+    # including the release that broke you.
+    outputs:
+      matrix: ${{ steps.derive.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - id: derive
+        run: |
+          set -euo pipefail
+          m=$(python scripts/ha_version_matrix.py --json)
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"
+          python scripts/ha_version_matrix.py >> "$GITHUB_STEP_SUMMARY"
+
+  compatibility:
+    name: HA ${{ matrix.ha }}
+    needs: supported-versions
+    runs-on: ubuntu-latest
+    # Non-blocking on the OLDER releases is deliberately NOT the policy here.
+    # A failure against any version in the declared range is a real failure:
+    # somebody is running that version because hacs.json said they could.
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.supported-versions.outputs.matrix) }}
+    services:
+      valkey:
+        image: valkey/valkey:8.1
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      CLUSTER_SYNC_TEST_VALKEY: "127.0.0.1:6379"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # 🚨 Must be the version Home Assistant requires. Resolving with an
+          # older interpreter does not fail: pip walks BACKWARDS to the newest
+          # release that interpreter can run. Doing this locally with a system
+          # python3.12 silently installed HA 2025.1.4 — twenty months behind the
+          # pin — and the suite went green against it, proving nothing.
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables shellcheck
+      - name: Install this exact Home Assistant, and the harness that pins it
+        run: |
+          set -euo pipefail
+          pip install --upgrade pip
+          grep -v '^pytest-homeassistant-custom-component==' requirements-dev.txt > /tmp/dev.txt
+          pip install -r /tmp/dev.txt
+          pip install "homeassistant==${{ matrix.ha }}" pytest-homeassistant-custom-component
+          got=$(python -c "import homeassistant.const as c;print(c.__version__)")
+          [ "$got" = "${{ matrix.ha }}" ] || {
+            echo "::error::asked for ${{ matrix.ha }}, resolved to $got"; exit 1; }
+      - name: API surface and recorder schema
+        run: python scripts/ha_compat_check.py | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Suite
+        run: pytest -q -rs
+
   hassfest:
     name: Validate (hassfest)
     runs-on: ubuntu-latest
@@ -263,42 +336,3 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
-
-  canary:
-    name: Canary (latest HA harness)
-    runs-on: ubuntu-latest
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    # Deliberately NON-BLOCKING. The pinned job above is the gate; this one is
-    # early warning. A red canary means the next Home Assistant release will
-    # break us, which is worth knowing before production moves rather than
-    # after.
-    continue-on-error: true
-    services:
-      valkey:
-        image: valkey/valkey:8.1
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "valkey-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-    env:
-      CLUSTER_SYNC_TEST_VALKEY: "127.0.0.1:6379"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-      - name: Install nftables (for ruleset syntax checks)
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables
-      - name: Install the NEWEST harness, not the pin
-        run: |
-          pip install --upgrade pip
-          grep -vE '^pytest-homeassistant-custom-component==' requirements-dev.txt > /tmp/reqs.txt
-          pip install -r /tmp/reqs.txt
-          pip install --upgrade pytest-homeassistant-custom-component
-      - name: Report which Home Assistant this is
-        run: python -c "import homeassistant.const as c; print('HA', c.__version__)"
-      - name: Run tests
-        run: pytest -q -rs

@@ -2096,3 +2096,61 @@ def test_a_failed_heartbeat_never_changes_a_decision(tmp_path: pathlib.Path) -> 
     )
     assert rc == 0, "a broken heartbeat failed the whole tick"
     assert recorded, "the promotion did not happen because a diagnostic failed"
+
+
+# -- an automatic hold that outlives its deadline ---------------------------
+
+
+def test_a_hold_with_no_expiry_never_expires(tmp_path) -> None:
+    """🚨 An operator's hold is indefinite, and must stay that way.
+
+    Guessing that a hold has lapsed would resume failover during exactly the
+    maintenance somebody asked us to sit out.
+    """
+    hold = tmp_path / "hold"
+    hold.write_text("somebody is under the floor\n", encoding="utf-8")
+    expired, _ = cluster_promoter._hold_is_expired(hold)
+    assert expired is False
+
+
+def test_an_automatic_hold_lapses_once_its_deadline_passes(tmp_path) -> None:
+    """The expiry lives HERE because nothing else is still running.
+
+    If Home Assistant never comes back, the integration that set the hold is
+    gone and cannot clear it. The promoter is the only participant left, so it
+    is the only place a deadline can be enforced.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    hold = tmp_path / "hold"
+    past = datetime.now(UTC) - timedelta(seconds=1)
+    hold.write_text(
+        f"cluster_state_sync:auto-hold\nexpires: {past.isoformat()}\n", encoding="utf-8"
+    )
+    expired, stamp = cluster_promoter._hold_is_expired(hold)
+    assert expired is True
+    assert stamp
+
+
+def test_an_automatic_hold_inside_its_deadline_still_holds(tmp_path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    hold = tmp_path / "hold"
+    future = datetime.now(UTC) + timedelta(seconds=300)
+    hold.write_text(
+        f"cluster_state_sync:auto-hold\nexpires: {future.isoformat()}\n", encoding="utf-8"
+    )
+    expired, _ = cluster_promoter._hold_is_expired(hold)
+    assert expired is False
+
+
+def test_an_unparseable_deadline_is_treated_as_no_deadline(tmp_path) -> None:
+    """Fail towards holding, not towards resuming.
+
+    A malformed deadline means we do not know when it lapses. Resuming failover
+    on a guess is the one outcome worse than holding slightly too long.
+    """
+    hold = tmp_path / "hold"
+    hold.write_text("cluster_state_sync:auto-hold\nexpires: banana\n", encoding="utf-8")
+    expired, _ = cluster_promoter._hold_is_expired(hold)
+    assert expired is False

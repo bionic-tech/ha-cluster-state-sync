@@ -212,6 +212,31 @@ async def test_missing_leadership_entity_is_treated_as_follower(
     assert not backend.writes
 
 
+async def flush_until_written(hass: HomeAssistant, backend, limit: int = 10) -> int:
+    """Advance the clock until the leader has written, or give up loudly.
+
+    🚨 Third attempt, and the first two are worth recording because both were
+    wrong in instructive ways.
+
+    The first added a post-setup state change and a second `advance`, getting
+    the failure rate from roughly one in twelve to one in twenty. The second —
+    mine — waited for leadership to resolve, which is not what gates the flush
+    at all (`_scheduled_flush` returns early on `DATA_RESTORE_DONE`, AR-0065's
+    guard), and whose repeated `async_block_till_done()` could let a flush
+    consume the pending revision before the test made its change. It took the
+    rate to about one in three: a fix that made it worse while looking like
+    diligence.
+
+    Both were attempts to make a race unlikely. This waits for the outcome
+    instead, with a bound, so it is either deterministic or it fails saying so.
+    """
+    for _ in range(limit):
+        if backend.writes:
+            return len(backend.writes)
+        await advance(hass)
+    return len(backend.writes)
+
+
 async def test_lease_holder_writes(hass: HomeAssistant, backend: FakeBackend) -> None:
     """With the Valkey lease, the node holding it writes."""
     hass.states.async_set("input_boolean.one", "on")
@@ -232,8 +257,7 @@ async def test_lease_holder_writes(hass: HomeAssistant, backend: FakeBackend) ->
     # fires before the lease check has resolved leadership, writing nothing is
     # correct behaviour, not a regression. Measured at ~1 failure in 20 runs
     # with a single advance, including run in isolation.
-    await advance(hass)
-    await advance(hass)
+    await flush_until_written(hass, backend)
 
     assert backend.writes
 
@@ -254,10 +278,8 @@ async def test_lease_lost_to_peer_stops_writes(hass: HomeAssistant, backend: Fak
     # As above: guarantee an unflushed change rather than racing setup.
     hass.states.async_set("input_boolean.one", "off")
     await hass.async_block_till_done()
-    await advance(hass)
-    await advance(hass)
-    writes_while_leader = len(backend.writes)
-    assert writes_while_leader
+    writes_while_leader = await flush_until_written(hass, backend)
+    assert writes_while_leader, "the leader never wrote, even given ten intervals"
 
     backend.lease_holder = "node-b"
     hass.states.async_set("input_boolean.one", "off")

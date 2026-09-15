@@ -391,7 +391,9 @@ def test_this_version_has_a_release_note() -> None:
     upgrade, at the moment it costs the most.
     """
     version = json.loads((COMPONENT / "manifest.json").read_text(encoding="utf-8"))["version"]
-    note = REPO / "docs" / f"RELEASE-{version}.md"
+    # Named for the git tag rather than the manifest version -- release.yml
+    # builds the GitHub release body from `github.ref_name`, which carries the v.
+    note = REPO / "docs" / "releases" / f"v{version}.md"
     assert note.exists(), (
         f"manifest.json says {version} but {note.relative_to(REPO)} does not exist. "
         "Every version gets a release note, and any change to the contracts in this "

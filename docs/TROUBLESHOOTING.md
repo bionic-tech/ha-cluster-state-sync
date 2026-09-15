@@ -392,6 +392,225 @@ is needed.
 
 ## Getting help
 
-Include: `cluster-hold.sh status` and `/run/cluster-sync/vrrp-state` from both
-nodes, `docker logs <ha-container> | grep -c "Starting Home Assistant"`, and the
-promoter's recent output (`journalctl -u cluster-promoter --since "10 min ago"`).
+### Start with the diagnostics file
+
+**Settings → Devices & Services → Cluster State Sync → ⋮ → Download diagnostics.**
+
+It carries the version, the config entry version, which node holds the lease,
+snapshot age and size, what was restored at the last start, the replication
+scope, and which alert conditions are on — which is most of what any question
+here turns out to be about.
+
+**You get a file, not an upload.** That is deliberate: open it, read it, then
+decide whether to attach it. Nothing leaves the house without somebody having
+looked first.
+
+**What it withholds**, so you know what you are reading:
+
+| | |
+|---|---|
+| Never included | passwords, the cluster secret, TLS material |
+| Never included | hostnames, addresses, file paths, your ingress URL |
+| Never included | entity IDs, and the names of your notify services |
+| Shown as a count | excluded entities and devices — *"1 item(s), values withheld"* |
+| Shown as an alias | node names, as `node-9c4e17` |
+
+The aliases are stable and not reversible. The same node always gets the same
+one, so *"the leader is node-9c4e17 and this node is node-9c4e17"* still reads
+correctly, without publishing a hostname.
+
+🚨 **Config values are allowlisted, not denylisted.** Anything the integration
+does not explicitly mark safe appears as `**REDACTED**`. A setting added in a
+later release is therefore withheld by default rather than published by
+accident — which is the failure that cannot be undone once it is in a public
+issue.
+
+### Then the two things it cannot see
+
+The integration can only report on itself. The promoter is a host-side timer, so
+add from **both** nodes:
+
+```bash
+/etc/cluster-sync/cluster-hold.sh status
+cat /run/cluster-sync/vrrp-state
+journalctl -u cluster-promoter --since "10 min ago"
+```
+
+⚠️ **And check your logs before pasting them.** Home Assistant's logs are *not*
+redacted for you — they carry entity names, and occasionally tokens. The
+diagnostics file is cleaned; the log is not.
+
+Lines worth finding: `ALERT raised`, `Restored … from snapshot`,
+`Leadership change`, `Not restoring`, `Refusing to restore`.
+
+### Where to send it
+
+A bug goes to the issue tracker, which asks for exactly the above.
+
+🚨 **A security problem does not.** This integration runs scripts as root on two
+machines and decides which one controls your house. Read `SECURITY.md` and use
+the private advisory form — a public issue cannot be taken back.
+
+---
+
+## Diagnostics
+
+Every way this integration fails is quiet by design, so it exposes its own
+health as entities. Backend errors are deliberately swallowed — a Redis outage
+must never crash Home Assistant — which makes these the *only* place that
+failure becomes visible.
+
+<details>
+<summary><strong>All fourteen diagnostic entities, grouped by what they tell you</strong> (click to expand)</summary>
+
+**Replication health**
+
+| Entity | What it tells you |
+|---|---|
+| **Entities tracked** | How many entities this node is mirroring. Compare against what you expect; this is the number that makes a broken filter obvious. |
+| **Last snapshot age** | Seconds since this node's last *successful* write. Climbs and never resets if the flush loop stalls. Reads *unknown*, never zero, if nothing has ever been written. |
+| **Shared snapshot age** | Age of what is actually in the store — the peer's writes included. This is what a promotion would restore *from*. |
+| **Entities restored** | How many entities the last restore actually seeded. **A promotion that restored zero is the failure this integration exists to prevent.** |
+| **Backend** | Connectivity to Valkey/Redis, polled every 60s. |
+
+**Cluster shape**
+
+| Entity | What it tells you |
+|---|---|
+| **Is leader** | Whether this node currently holds the lease. |
+| **Cluster leader** | Which node does — by name, from the store, so both nodes agree or visibly do not. |
+| **Cluster members** | How many nodes have checked in recently. |
+| **Clock skew** | The spread between members' clocks. The restore's max-age window is meaningless once this is large, so it warns well before that cliff. |
+| **Maintenance hold** | Whether failover is currently suspended here. |
+
+**Go-bag (config replication)**
+
+| Entity | What it tells you |
+|---|---|
+| **Fileset age** | How stale the replicated config is. |
+| **Fileset degraded** | The go-bag was stale or missing at promotion. It marks degraded and **never blocks the promotion** (D4) — a standby with old config still beats no standby. |
+| **Unreplicated config references** | Files your `configuration.yaml` includes that would *not* cross to the peer. This exists because a promoted node once came up in recovery mode behind a promotion that reported success at every step. |
+
+**Radios**
+
+| Entity | What it tells you |
+|---|---|
+| **Radio silence** | Seconds since anything you called a radio was last heard from. Off until you configure the globs. |
+
+🚨 **Read the `status` attribute, not only the value.** It has three states, and
+two of them read `unknown`:
+
+| `status` | means |
+|---|---|
+| `ok` | at least one radio has reported — the number is real |
+| `no_matches` | the globs match nothing — a configuration problem |
+| `no_reports` | entities matched, none has ever reported — **the radio is deaf** |
+
+`no_reports` is the loudest condition the sensor can find and it is deliberately
+not a large number, because "never" has no age — a value threshold alone can
+never fire on it.
+
+⚠ **This measurement needs a device that transmits unprompted.** If every
+entity you watch belongs to a switch or a remote, you are measuring human
+activity, not radio liveness: after a restart it reads `no_reports` until
+somebody presses something. Check your own longest normal gap between packets
+before setting any threshold — on the fleet this was built for it is **nine
+hours**.
+
+🚨 **Watch one radio's signals per list.** The sensor reports the *freshest*
+match, which is right within a radio and wrong across radios: a Wi-Fi RSSI
+sensor reporting every 60 seconds will hold the number near zero through a
+completely dead Zigbee or RF radio. Watching more entities looks safer and is
+the exact opposite.
+
+It also reads near-zero for the first few minutes after a Home Assistant
+restart — Home Assistant writes every entity's state as it starts, so a low
+value there says nothing about whether a packet has actually arrived. Set any
+alert threshold longer than your instance's boot time.
+
+</details>
+
+Radio silence is the answer to a gap the failover design does not close and
+still will not: Home Assistant can be perfectly healthy while every radio behind
+it is dead. On this fleet a Zigbee daemon livelocked — 78% CPU, no output for 32
+minutes, its healthcheck reporting `healthy` — and the whole house lost Zigbee
+with every signal the cluster watches staying green.
+
+It **does not trigger failover**. Promoting because a radio died would move the
+house onto a node whose radios may be no better. And it does not pick your
+threshold: only you know your own traffic, and a quiet house at 4am legitimately
+produces no RF for a long while. What is diagnostic is a number that *used* to
+move and has stopped. Full treatment in
+GOTCHAS §18.
+
+### Alerting — built in since v0.4.2
+
+Exposing the sensors is only half the job. Every way this integration fails is
+quiet by design: the backend goes away and the flush loop just stops, the peer
+stops writing and the snapshot ages, a promotion restores nothing at all and
+logs one line about it. Nothing in the house changes, so nobody looks — and
+every surface listed above needs you to be *at home, looking at a screen*,
+which is the one situation this product is not built for.
+
+So the integration now tells you itself. **The wizard's "Who hears about it"
+step is optional and submitting it untouched is a complete setup:** four
+conditions, delivered as a persistent notification that every administrator
+sees. Change it later under **Settings → Devices & services → Cluster State
+Sync → Configure → Alerts**.
+
+| Condition | Default | |
+|---|---|---|
+| **Failover** — the house moved to the other node | push | a 21-second failover is otherwise invisible |
+| **Recovery** — a condition below cleared | push | an alarm that stops without a word is one you cannot trust |
+| **Valkey unreachable** | push | the house keeps running; it can no longer **fail over** |
+| **Promoted with an incomplete configuration** | push | the cluster promotes anyway (decision D4) — this is the only thing that says so |
+| Statistics: schema mismatch, gap, not seeded, stalled | card only | real, but they can wait until Saturday |
+
+Add any `notify.` service — the companion app, Discord, Slack, Telegram, email
+— and those pushes reach you when you are out. Home Assistant already holds
+those credentials; this integration stores only the service name.
+
+Unticking a condition silences the **push** only. The repair card and the
+diagnostic entities are raised regardless, so nothing is hidden — you are
+simply not interrupted.
+
+> [!NOTE]
+> **Alerting cannot be more available than the thing it runs on.** These
+> notifications come from Home Assistant, on a node that is up. They will not
+> reach you if the whole house is down, and *"Valkey unreachable"* is reported
+> by the very component that needs Valkey. Something outside the cluster should
+> watch the cluster — see GUIDE-ingress.md.
+
+### The blueprint — for thresholds and actions of your own
+
+The built-in alerting covers the conditions the integration knows it is in. A
+blueprint also ships, for the ones only you can define — a snapshot-age limit
+you pick, or an action that is a light rather than a notification:
+
+[![Open your Home Assistant instance and show the blueprint import dialog with a specific blueprint pre-filled.](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fbionic-tech%2Fha-cluster-state-sync%2Fblob%2Fmain%2Fblueprints%2Fautomation%2Fcluster_state_sync%2Ffailover_readiness.yaml)
+
+Or **Settings → Automations & scenes → Blueprints → Import blueprint** and paste:
+
+```
+https://github.com/bionic-tech/ha-cluster-state-sync/blob/main/blueprints/automation/cluster_state_sync/failover_readiness.yaml
+```
+
+It watches three things, because they fail differently:
+
+| Trigger | What it means | Also built in? |
+|---|---|---|
+| **Backend unreachable** (past a grace period) | Nothing is being written. A promotion now restores whatever was last saved, or nothing. | **Yes** — you will get two alerts if you enable both |
+| **Snapshot age above a limit** | The backend is *up* and the flush loop stopped anyway — the harder failure to spot, and the one the Backend sensor cannot see. | No — the threshold is yours |
+| **Restored zero entities** | This node promoted cold. Nothing came across from the peer. | No |
+
+That third one is the reason the blueprint exists rather than a line in the
+docs saying "alert on snapshot age". Restoring nothing was a real defect for the
+entire life of this project, it was found by running the thing rather than by
+testing it, and its only symptom was an INFO line nobody read.
+
+If you run both, untick **Valkey unreachable** in the integration or drop the
+backend trigger from the automation. Two alerts for one fault is how people
+learn to ignore both.
+
+Moved here from the README on 2026-09-11, where it was 159 lines of a
+document nobody was finishing.

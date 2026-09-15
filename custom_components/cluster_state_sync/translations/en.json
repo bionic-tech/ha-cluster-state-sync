@@ -26,8 +26,7 @@
         },
         "data_description": {
           "cluster_secret": "Signs every snapshot entry so a node only accepts state written by its peer. Copy this exact value to the other node — a mismatch means neither will restore from the other. Without it, nothing is restored at all.",
-          "redis_use_tls": "Strongly recommended if you mirror person, device_tracker or alarm_control_panel entities, which otherwise cross the network in the clear.",
-          "leadership_source": "Only the leader writes to the shared snapshot. 'always' suits a single node or a cold standby whose HA is stopped. 'entity' follows a flag your Keepalived notify_master/notify_backup scripts toggle. 'lease' takes a TTL lease in Valkey and is the strongest option — it is the split-brain guard, since VRRP alone can dual-master under a partition."
+          "redis_use_tls": "Strongly recommended if you mirror person, device_tracker or alarm_control_panel entities, which otherwise cross the network in the clear."
         }
       },
       "sentinel": {
@@ -48,8 +47,7 @@
         },
         "data_description": {
           "cluster_secret": "Signs every snapshot entry so a node only accepts state written by its peer. Copy this exact value to the other node — a mismatch means neither will restore from the other. Without it, nothing is restored at all.",
-          "redis_use_tls": "Strongly recommended if you mirror person, device_tracker or alarm_control_panel entities, which otherwise cross the network in the clear.",
-          "leadership_source": "Only the leader writes to the shared snapshot. 'always' suits a single node or a cold standby whose HA is stopped. 'entity' follows a flag your Keepalived notify_master/notify_backup scripts toggle. 'lease' takes a TTL lease in Valkey and is the strongest option — it is the split-brain guard, since VRRP alone can dual-master under a partition."
+          "redis_use_tls": "Strongly recommended if you mirror person, device_tracker or alarm_control_panel entities, which otherwise cross the network in the clear."
         }
       },
       "topology": {
@@ -63,6 +61,9 @@
           "gate_automations": "Stop automations on the follower (warm standby only)",
           "ha_config_path": "Home Assistant config path ON THE HOST (not /config)",
           "ha_container": "Home Assistant container name"
+        },
+        "data_description": {
+          "leadership_source": "Only the leader writes to the shared snapshot. 'always' suits a single node or a cold standby whose HA is stopped. 'entity' follows a flag your Keepalived notify_master/notify_backup scripts toggle. 'lease' takes a TTL lease in Valkey and is the strongest option — it is the split-brain guard, since VRRP alone can dual-master under a partition."
         }
       },
       "warm": {
@@ -195,7 +196,7 @@
           "ingress_verify_tls": "Check the certificate"
         },
         "data_description": {
-          "ingress_url": "The whole address including the scheme, as in `https://home.example.com`. Leave it empty to switch the check off entirely — that is the default, and no entity or alert is created. 401 and 403 count as reachable: being refused proves something is there to refuse you.",
+          "ingress_url": "The whole address including the scheme, as in {example_url}. Leave it empty to switch the check off entirely — that is the default, and no entity or alert is created. 401 and 403 count as reachable: being refused proves something is there to refuse you.",
           "ingress_verify_tls": "Turn this off if you terminate TLS on a certificate Home Assistant has no reason to trust — an internal CA or a self-signed one. The check still answers “did anything answer at that address”; it just stops asking who. Better than a check that is red for ever and gets switched off along with the real alarm."
         }
       }
@@ -206,7 +207,7 @@
       "fileset_needs_secret": "A cluster secret is required to encrypt the replicated fileset. Set one on the backend step before enabling this.",
       "must_accept": "You must accept before continuing. This software carries no warranty.",
       "unsafe_shell_value": "One of these values contains a character that cannot be used here — most likely a quote, a space, a backtick, or one of ; & | $ ( ). These values are written into scripts this host runs as root, so anything that could change what those scripts do is refused. Check the container name, config path, Valkey host, username and peer address.",
-      "invalid_ingress_url": "That is not an address this can request. Include the scheme and a host, as in `https://home.example.com`."
+      "invalid_ingress_url": "That is not an address this can request. It needs both a scheme and a host name — the field description above shows the shape."
     },
     "abort": {
       "already_configured": "This node is already configured for this cluster namespace.",
@@ -273,7 +274,7 @@
           "ingress_verify_tls": "Check the certificate"
         },
         "data_description": {
-          "ingress_url": "The whole address including the scheme, as in `https://home.example.com`. Leave it empty to switch the check off entirely — that is the default, and no entity or alert is created. 401 and 403 count as reachable: being refused proves something is there to refuse you.",
+          "ingress_url": "The whole address including the scheme, as in {example_url}. Leave it empty to switch the check off entirely — that is the default, and no entity or alert is created. 401 and 403 count as reachable: being refused proves something is there to refuse you.",
           "ingress_verify_tls": "Turn this off if you terminate TLS on a certificate Home Assistant has no reason to trust — an internal CA or a self-signed one. The check still answers “did anything answer at that address”; it just stops asking who. Better than a check that is red for ever and gets switched off along with the real alarm."
         }
       },
@@ -295,7 +296,7 @@
       }
     },
     "error": {
-      "invalid_ingress_url": "That is not an address this can request. Include the scheme and a host, as in `https://home.example.com`."
+      "invalid_ingress_url": "That is not an address this can request. It needs both a scheme and a host name — the field description above shows the shape."
     }
   },
   "entity": {

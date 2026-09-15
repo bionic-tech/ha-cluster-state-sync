@@ -114,6 +114,13 @@ def test_the_source_url_points_at_this_repository() -> None:
     url = raw["blueprint"].get("source_url", "")
     assert url.startswith("https://")
     assert url.endswith("blueprints/automation/cluster_state_sync/failover_readiness.yaml")
+    # 🚨 And at the repository it is actually published from. It named the
+    # author's personal account while every other link named the organisation,
+    # so an operator's "check for updates" would have reached a 404 -- silently,
+    # because Home Assistant does not report a source_url it cannot fetch.
+    assert "bionic-tech/ha-cluster-state-sync" in url, (
+        f"source_url points somewhere the blueprint is not published: {url}"
+    )
 
 
 # -- does it actually produce a working automation? -------------------------

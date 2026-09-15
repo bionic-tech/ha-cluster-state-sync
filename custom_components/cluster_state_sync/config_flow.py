@@ -127,6 +127,7 @@ from .const import (
     HA_START_MODES,
     HISTORY_DATABASES,
     HISTORY_DB_DEDICATED,
+    INGRESS_URL_EXAMPLE,
     LEADERSHIP_SOURCES,
     MAX_STATISTICS_INTERVAL_MINUTES,
     MAX_STATISTICS_WINDOW_DAYS,
@@ -1318,6 +1319,7 @@ class ClusterStateSyncConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="ingress",
             data_schema=_ingress_schema({**self._data, **(user_input or {})}),
             errors=errors,
+            description_placeholders={"example_url": INGRESS_URL_EXAMPLE},
         )
 
     # -- wizard step 4b: how Home Assistant is started -------------------
@@ -1542,7 +1544,10 @@ class ClusterStateSyncOptionsFlow(OptionsFlow):
                 return self._save(user_input)
         merged = {**self.entry.data, **self.entry.options, **(user_input or {})}
         return self.async_show_form(
-            step_id="ingress", data_schema=_ingress_schema(merged), errors=errors
+            step_id="ingress",
+            data_schema=_ingress_schema(merged),
+            errors=errors,
+            description_placeholders={"example_url": INGRESS_URL_EXAMPLE},
         )
 
     def _save(self, user_input: dict[str, Any]) -> FlowResult:

@@ -37,6 +37,7 @@ to fail over and did not.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 import os
 import pathlib
 
@@ -127,3 +128,77 @@ def clear_hold(config_dir: str) -> None:
         hold_path(config_dir).unlink()
     except FileNotFoundError:
         return
+
+
+#: Written into a hold this integration set itself, so it can be told apart
+#: from one a person set. The promoter looks for the `expires:` line; this
+#: marker is what stops the integration ever clearing somebody else's hold.
+AUTO_HOLD_MARKER = "cluster_state_sync:auto-hold"
+
+#: How long an automatic hold covers a restart before lapsing on its own.
+#:
+#: 🚨 The expiry is enforced by the PROMOTER, not here. If Home Assistant never
+#: comes back, this integration is gone and nothing inside it could ever clear
+#: the hold — a cluster would sit held forever on a dead node, which is the
+#: exact failure the hold exists to avoid causing.
+#:
+#: 300 seconds, and the number is not arbitrary:
+#:
+#: * the slowest Home Assistant restart measured on the reference pair was 65s,
+#:   so this covers it nearly five times over;
+#: * the promoter's probe grace is 600s and is anchored to the state file's
+#:   mtime, which a hold does NOT touch — so the grace clock runs *underneath*
+#:   this hold rather than being reset by it. A crash during an automatic hold
+#:   therefore still demotes at ~600s, exactly as it would without one.
+#:
+#: That second point is the whole design. It was verified by reading the
+#: promoter rather than assumed, and the assumption had been the opposite.
+AUTO_HOLD_SECONDS = 300
+
+
+def set_auto_hold(config_dir: str, seconds: int = AUTO_HOLD_SECONDS) -> bool:
+    """Hold failover across a restart this integration is about to perform.
+
+    Returns True if a hold was written. Returns False, and writes nothing, when
+    a hold already exists — an operator's hold is indefinite by design, and
+    stamping an expiry onto it would quietly resume failover during exactly the
+    maintenance they asked us to sit out.
+    """
+    try:
+        path = hold_path(config_dir)
+        if path.is_file():
+            return False
+        deadline = datetime.now(UTC) + timedelta(seconds=seconds)
+        path.write_text(
+            f"{AUTO_HOLD_MARKER}\n"
+            f"Home Assistant is restarting; failover is held until it returns.\n"
+            f"expires: {deadline.isoformat()}\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        # Never fatal, and silent like the rest of this module. Failing to set
+        # the hold means a restart behaves as it did before this existed, which
+        # is survivable; failing a shutdown because of it is not.
+        return False
+    return True
+
+
+def clear_auto_hold(config_dir: str) -> bool:
+    """Remove a hold this integration set, and only one it set.
+
+    🚨 The marker check is the safety. On start-up we cannot know whether the
+    hold on disk is ours from the last shutdown or one a person set while we
+    were down — and clearing theirs would resume failover in the middle of
+    their maintenance, which is worse than leaving ours in place for its
+    remaining few minutes.
+    """
+    try:
+        path = hold_path(config_dir)
+        if not path.is_file():
+            return False
+        if AUTO_HOLD_MARKER not in path.read_text(encoding="utf-8", errors="replace"):
+            return False
+        path.unlink()
+    except OSError:
+        return False
+    return True

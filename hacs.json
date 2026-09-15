@@ -1,5 +1,6 @@
 {
   "name": "Cluster State Sync",
   "homeassistant": "2026.6.4",
-  "render_readme": false
+  "render_readme": false,
+  "hide_default_branch": true
 }

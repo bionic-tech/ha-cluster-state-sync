@@ -11,7 +11,17 @@ asyncio_mode = "auto"
 # pytest-homeassistant-custom-component blocks real sockets by default; that is
 # the behaviour we want, so a test that quietly tries to reach a real Redis or a
 # real HA instance fails loudly instead of passing on someone's workstation.
-addopts = "--strict-markers"
+# 🚨 `--timeout` is here because a hang cost twenty minutes of wall clock on
+# 2026-09-11 before anyone knew it was a hang rather than a slow suite. One
+# async test sat idle in the event loop awaiting a future that never resolved;
+# `py-spy` found it, and the run had used 47 seconds of CPU in 21 minutes.
+#
+# It did not reproduce on the next run, so this is not a fix — it is the
+# difference between a flake that announces itself with a test name and one
+# that looks like the machine being slow. 300s is far above the slowest real
+# test here (the whole suite is ~1350 tests in ~260s), so it cannot fire on
+# anything but a genuine stall, including on a slower CI runner.
+addopts = "--strict-markers --timeout=300 --timeout-method=thread"
 
 [tool.ruff]
 target-version = "py314"

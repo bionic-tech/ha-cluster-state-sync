@@ -287,13 +287,13 @@ def test_the_candidate_list_renders_as_tick_boxes(tmp_path: pathlib.Path) -> Non
     and found the candidates. Free text has its own field.
     """
     from homeassistant.helpers import config_validation as cv
-    import voluptuous_serialize
 
     from custom_components.cluster_state_sync.config_flow import _fileset_schema
+    from tests.fakes import render_schema_for_frontend
 
     fields = {
         f["name"]: f.get("selector", {}).get("select", {})
-        for f in voluptuous_serialize.convert(
+        for f in render_schema_for_frontend(
             _fileset_schema({}, ["python_scripts"]), custom_serializer=cv.custom_serializer
         )
     }

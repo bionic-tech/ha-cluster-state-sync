@@ -18,8 +18,12 @@ long-term history.
 
 When the active machine dies, the standby notices and takes over — **working
 again in about a hundred seconds**, with your accounts, integrations and last
-known states already there. A measured failover on the reference pair took
-**21 seconds** when only Home Assistant failed.
+known states already there.
+
+That number is for losing the **machine**. Home Assistant failing on its own,
+with the machine still up, takes about **ten and a half minutes** instead. That
+is deliberate: a short wait would hand your house to the other box every time
+Home Assistant was slow to restart.
 
 ---
 
@@ -68,25 +72,29 @@ genuinely bother you, then yes.
   `binary_sensor.<node>_backend` and alert on it.
 * **There is no automation leader election.** During the overlap window both
   instances fire automations. This is deliberate and documented.
+* **Radios follow only if they are on the network.** Over USB-over-IP they move
+  with the failover; two of the three on the reference machine do. One plugged
+  straight into a machine cannot, and that is a plug rather than software. Read
+  the radio guide before buying hardware.
 
 ---
 
 ## Getting started
 
-1. **Read the [radio guide](https://github.com/boywiz/ha-cluster-state-sync/blob/main/docs/GUIDE-radios.md)** if you have Zigbee, Z-Wave or 433 MHz hardware. It decides what is possible.
+1. **Read the [radio guide](https://github.com/bionic-tech/ha-cluster-state-sync/blob/main/docs/GUIDE-radios.md)** if you have Zigbee, Z-Wave or 433 MHz hardware. It decides what is possible.
 2. **Add the integration** and follow the wizard. It asks what you want in
    plain language and refuses combinations that cannot work.
-3. **Follow the [installation runbook](https://github.com/boywiz/ha-cluster-state-sync/blob/main/docs/RUNBOOK-installation.md)** for the host side.
+3. **Follow the [installation runbook](https://github.com/bionic-tech/ha-cluster-state-sync/blob/main/docs/RUNBOOK-installation.md)** for the host side.
 
 Every term used in the documentation is defined in the
-**[glossary](https://github.com/boywiz/ha-cluster-state-sync/blob/main/docs/GLOSSARY.md)** — no prior Home Assistant, Docker or
+**[glossary](https://github.com/bionic-tech/ha-cluster-state-sync/blob/main/docs/GLOSSARY.md)** — no prior Home Assistant, Docker or
 clustering knowledge assumed.
 
 ---
 
 ## If something goes wrong
 
-**[TROUBLESHOOTING.md](https://github.com/boywiz/ha-cluster-state-sync/blob/main/docs/TROUBLESHOOTING.md)** is organised by symptom — "the standby
+**[TROUBLESHOOTING.md](https://github.com/bionic-tech/ha-cluster-state-sync/blob/main/docs/TROUBLESHOOTING.md)** is organised by symptom — "the standby
 promoted then demoted itself", "radios do not work after promotion", "history
 is not replicating" — with the fix for each, including which of two
 reasonable-looking fixes is the wrong one.

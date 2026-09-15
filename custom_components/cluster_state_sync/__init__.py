@@ -45,6 +45,7 @@ from homeassistant.const import (
     EVENT_HOMEASSISTANT_START,
     EVENT_HOMEASSISTANT_STOP,
     EVENT_STATE_CHANGED,
+    RESTART_EXIT_CODE,
     STATE_OFF,
     STATE_ON,
     Platform,
@@ -59,6 +60,7 @@ from homeassistant.core import (
     callback,
 )
 from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
@@ -186,7 +188,7 @@ from .crypto import (
 )
 from .fileset import FilesetPublisher
 from .gating import ServiceGate
-from .hold import read_hold
+from .hold import AUTO_HOLD_SECONDS, clear_auto_hold, read_hold, set_auto_hold
 from .ingress import (
     INGRESS_FAILURES_BEFORE_ALARM,
     INGRESS_PROBE_INTERVAL,
@@ -208,6 +210,15 @@ PLATFORMS: list[Platform] = [
     Platform.SENSOR,
     Platform.SWITCH,
 ]
+
+
+#: There is no YAML configuration for this integration and there never will be
+#: -- every setting arrives through the config flow. Saying so explicitly is
+#: what `async_setup` existing otherwise implies the opposite of: Home Assistant
+#: warns that an integration defining `async_setup` should declare one of these,
+#: because without it a user's `cluster_state_sync:` block in configuration.yaml
+#: is accepted and silently ignored.
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -1219,6 +1230,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         conditions=cfg.get(CONF_NOTIFY_CONDITIONS, DEFAULT_NOTIFY_CONDITIONS),
         services=cfg.get(CONF_NOTIFY_SERVICES, DEFAULT_NOTIFY_SERVICES),
         node_id=node_id,
+        # Survives our own reload; see `_ALERT_STATE`.
+        state=_ALERT_STATE.setdefault(entry.entry_id, {}),
     )
 
     runtime: dict[str, Any] = {
@@ -1476,11 +1489,72 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     #    (a CancelledError handler in the loop and this listener), which could
     #    both fire and race over the same live dict.
     async def _on_stop(_event: Event) -> None:
-        if await leadership.async_is_leader():
+        leading = await leadership.async_is_leader()
+        if leading:
             await _final_flush(mirror)
+
+        # 🚨 A RESTART is not a shutdown, and Home Assistant tells us which.
+        #
+        # `async_stop` assigns `exit_code` BEFORE firing this event, so at this
+        # point `RESTART_EXIT_CODE` means "coming back" and 0 means "going
+        # away". Read from Home Assistant's source rather than assumed, because
+        # the whole design turns on it.
+        #
+        # On a restart we hold, so the promoter does not read the gap as a
+        # dead node and move the house.
+        #
+        # ⚠️ SCOPE, and it is narrower than the incident that prompted it.
+        # Home Assistant maps SIGTERM and SIGINT -- what `docker restart` and
+        # `docker stop` send -- to exit_code 0, i.e. "shutting down". Only the
+        # restart service and SIGHUP set RESTART_EXIT_CODE. So a host-side
+        # `docker restart` lands in the shutdown branch below and releases the
+        # lease, and the 2026-09-10 failover would happen again.
+        #
+        # That is correct rather than a gap to close here: from inside, a
+        # SIGTERM IS a shutdown, and releasing so the peer promotes at once
+        # beats making it wait out the TTL. What this covers is the restart a
+        # person triggers from the interface and never thinks to hold for.
+        #
+        # On a genuine shutdown we do the opposite and release below, because
+        # somebody stopping Home Assistant deliberately wants the peer to take
+        # over now rather than wait out the TTL.
+        #
+        # Only the leader holds. A standby that held during its own restart
+        # would refuse a lease that came free because the LEADER died in that
+        # window -- turning its restart into delayed failover, which is the
+        # failure this feature exists to prevent, pointed the other way.
+        # Say what was decided and why, every time. On the first hardware test
+        # of this the hold simply did not appear, and with Home Assistant down
+        # there was no way to tell whether `leading` was false or the exit code
+        # was not a restart -- two very different faults. A shutdown is exactly
+        # when you cannot go back and look.
+        _LOGGER.info(
+            "Shutting down: leader=%s exit_code=%s (%s). %s",
+            leading,
+            hass.exit_code,
+            "restart" if hass.exit_code == RESTART_EXIT_CODE else "shutdown",
+            (
+                "Holding failover."
+                if leading and hass.exit_code == RESTART_EXIT_CODE
+                else "Not holding; the lease will be released below unless an "
+                "operator hold says otherwise."
+            ),
+        )
+
+        if leading and hass.exit_code == RESTART_EXIT_CODE:
+            if set_auto_hold(hass.config.path()):
+                _LOGGER.info(
+                    "Home Assistant is restarting: holding failover for %ds so this "
+                    "does not look like a dead node. The hold expires on its own if "
+                    "Home Assistant does not come back, so a genuine crash still "
+                    "fails over.",
+                    AUTO_HOLD_SECONDS,
+                )
+
         # Hand the lease back on the way out so the peer promotes immediately
         # rather than waiting out the TTL -- unless the operator has said this
-        # is planned work rather than a departure.
+        # is planned work rather than a departure, or we have just said so
+        # ourselves on the line above.
         if not await _hold_blocks_release(hass, hass.config.path(), "shutdown"):
             await _release_leadership(backend, node_id)
 
@@ -1581,6 +1655,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # two more sections to a flow that does not take effect made it worse.
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
 
+    # We are back, so the hold we set on the way out has done its job. Only
+    # ours is removed -- `clear_auto_hold` checks for our marker, because a
+    # hold set by a person while we were down is theirs to clear.
+    if clear_auto_hold(hass.config.path()):
+        _LOGGER.info(
+            "Cleared the automatic maintenance hold set when Home Assistant restarted; "
+            "failover is live again."
+        )
+
     _LOGGER.info(
         "Cluster State Sync ready — node=%s namespace=%s interval=%ds tracking=%d entities",
         node_id,
@@ -1658,6 +1741,18 @@ async def _final_flush(mirror: StateMirror) -> None:
 #: a reload we initiated keeps it.
 _RELOADING: set[str] = set()
 
+#: Alert edge-state, keyed by entry_id, that must outlive a reload.
+#:
+#: `hass.data[DOMAIN][entry_id]` is popped on unload, so a router rebuilt after
+#: a reload used to start with nothing raised -- re-announcing every condition
+#: that was still true, and losing the all-clear for any that had cleared. Held
+#: here for the same reason `_RELOADING` is: a reload is an implementation
+#: detail of changing a setting, and should be invisible to the operator.
+#:
+#: NOT persisted to disk on purpose. A real Home Assistant restart should
+#: re-evaluate from scratch; it is only the reload that must be transparent.
+_ALERT_STATE: dict[str, dict[str, Any]] = {}
+
 
 async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Reload so a changed setting actually applies.
@@ -1685,6 +1780,12 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Tear down on entry removal."""
     if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         return False
+
+    if entry.entry_id not in _RELOADING:
+        # A genuine unload or removal. The next setup is a fresh start and
+        # should re-announce whatever is still wrong; only a reload is meant to
+        # be invisible.
+        _ALERT_STATE.pop(entry.entry_id, None)
 
     runtime = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     if not runtime:

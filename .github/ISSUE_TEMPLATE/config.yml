@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security problem
+    url: https://github.com/bionic-tech/ha-cluster-state-sync/blob/main/SECURITY.md
+    about: Do not open a public issue. This integration runs scripts as root on two machines.
+  - name: Question about what replicates, or what to tick
+    url: https://github.com/bionic-tech/ha-cluster-state-sync/blob/main/docs/GUIDE-choosing-domains.md
+    about: Which domains are worth replicating, and the scenarios where the usual answer flips.

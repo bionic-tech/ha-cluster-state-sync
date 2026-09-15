@@ -96,7 +96,21 @@ async def test_a_second_press_while_one_is_running_is_refused(hass: HomeAssistan
     release = asyncio.Event()
 
     def _slow(*_args: object) -> int:
-        started.set()
+        # 🚨 `started.set()` directly here is a thread-safety bug, and an
+        # intermittent one — which is the worst kind.
+        #
+        # This runs in an executor thread. `asyncio.Event.set()` calls
+        # `loop.call_soon`, which raises `RuntimeError: Non-thread-safe
+        # operation invoked on an event loop other than the current one` — but
+        # only SOMETIMES, because CPython's check returns early while the loop
+        # is not marked running. When it does raise, `button.py` catches it and
+        # logs "Writing the statistics seed failed", so `started` is never set
+        # and the `await started.wait()` below blocks forever.
+        #
+        # That hung a full suite run for twenty minutes on 2026-09-11 and did
+        # not reproduce on the next one. `--timeout` in pyproject.toml is what
+        # eventually named it.
+        hass.loop.call_soon_threadsafe(started.set)
         # Block in the executor, as the real write does on a large database.
         asyncio.run_coroutine_threadsafe(release.wait(), hass.loop).result(timeout=5)
         return 1

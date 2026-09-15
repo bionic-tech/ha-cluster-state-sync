@@ -24,7 +24,7 @@ blueprint:
     shout.
   domain: automation
   author: cluster_state_sync
-  source_url: https://github.com/boywiz/ha-cluster-state-sync/blob/main/blueprints/automation/cluster_state_sync/failover_readiness.yaml
+  source_url: https://github.com/bionic-tech/ha-cluster-state-sync/blob/main/blueprints/automation/cluster_state_sync/failover_readiness.yaml
   homeassistant:
     min_version: "2024.10.0"
   input:
