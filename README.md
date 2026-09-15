@@ -81,6 +81,9 @@ graph LR
   thing the other one needs.
 - **Container or Core installs.** Home Assistant OS cannot run the failover half
   yet; see the roadmap.
+- **Home Assistant 2026.6.4 or newer.** Every release from there to 2026.9.2 has
+  been verified with a full suite run — 2026.6.4, 2026.7.4, 2026.8.3, 2026.9.2 —
+  rather than only the oldest and newest.
 - **Your radios decide a lot.** On USB-over-IP (VirtualHere, `usbip`) they move
   with the lease. Plugged straight into a machine, they cannot. Read
   [GUIDE-radios.md](docs/GUIDE-radios.md) before buying hardware.

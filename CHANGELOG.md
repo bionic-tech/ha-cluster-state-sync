@@ -9,6 +9,7 @@ note itself.
 
 | Version | Tag | What it was for |
 |---|---|---|
+| **0.5.3** | [`v0.5.3`](docs/releases/v0.5.3.md) | Verified against every Home Assistant release it claims to support — 2026.6.4 through 2026.9.2, each a full suite run — and now says so. Found that 2026.9 swapped `voluptuous` for `probatio` under the same import name, which no symbol check and no breaking-changes section would show you. |
 | **0.5.2** | [`v0.5.2`](docs/releases/v0.5.2.md) | Two defects in the machinery that reports defects: a reload re-announced every alert that was still true, and the TLS context was built on the event loop. Plus the promoter drowning its own journal, and a diagnostics platform you read before you send. |
 | **0.5.1** | [`v0.5.1`](docs/releases/v0.5.1.md) | Written the morning after a real 61-minute outage in which detection worked perfectly and nobody was told. `ingress_unreachable` now reaches existing installs, and the alert says that nothing will act on it. |
 | **0.5.0** | [`v0.5.0`](docs/releases/v0.5.0.md) | `automation` replicated by default, with a migration. The restore stopped overriding `initial_state`. The domain picker started saying which domains rebuild themselves. |

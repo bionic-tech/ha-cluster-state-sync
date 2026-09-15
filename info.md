@@ -105,5 +105,6 @@ anything, read it first.
 
 ---
 
-**Licence:** AGPL-3.0 · **Requires:** Home Assistant 2026.6.4+, Docker, and a
+**Licence:** AGPL-3.0 · **Requires:** Home Assistant **2026.6.4 or newer**
+(verified against 2026.6.4, 2026.7.4, 2026.8.3 and 2026.9.2), Docker, and a
 Redis-compatible store both machines can reach.

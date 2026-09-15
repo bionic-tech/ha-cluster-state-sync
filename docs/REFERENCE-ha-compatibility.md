@@ -124,7 +124,8 @@ Assistant at all.
 
 | Thing | Value | Why |
 |---|---|---|
-| `hacs.json` `homeassistant` | 2026.6.4 | The version the suite actually runs against |
+| `hacs.json` `homeassistant` | 2026.6.4 | The **minimum**, which is a promise about every release above it — not only the pinned one |
+| Verified range | 2026.6.4 → 2026.9.2 | Latest patch of every minor in between, each a full suite run: 2026.6.4, 2026.7.4, 2026.8.3, 2026.9.2 |
 | `manifest.json` `requirements` | `redis>=5.0.0,<7` | Upper bound so a major bump cannot arrive unannounced |
 | Python | ≥ 3.14 | Home Assistant's own floor, not ours |
 
