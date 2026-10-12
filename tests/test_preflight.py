@@ -297,30 +297,71 @@ def test_a_dry_run_reports_and_changes_nothing(
     assert (storage / "core.config_entries").read_text() == before
 
 
-def test_apply_disables_the_absent_entries_and_backs_up_first(
-    storage: Path, tmp_path: Path
-) -> None:
-    """A promotion edits config entries. It does not get to do that unbacked."""
+def test_apply_records_the_absent_entries_and_edits_nothing(storage: Path, tmp_path: Path) -> None:
+    """🚨 `--apply` detects and records. It no longer disables anything.
+
+    The remedy was dropped in favour of the detection, because
+    `disabled_by = "integration"` is not a member of `ConfigEntryDisabler`
+    (which has only `user`), so Home Assistant rejected it and the disable had
+    never once taken effect. Measured against the alternative: `setup_retry`
+    backs off to a 600s cap and never gives up — 91 retries over 11.6 hours
+    with zero terminal failures on 2026-10-02 — so not disabling costs a log
+    line every ten minutes, while disabling costs a blind that never opens.
+
+    Asserted byte-for-byte rather than field-by-field: a rewrite that happened
+    to produce the same disables is still a rewrite of the file the go-bag
+    mirrors wholesale.
+    """
+    import custom_components.cluster_state_sync.scripts.ha_device_preflight as m
+
+    before = (storage / "core.config_entries").read_text()
+
     main(["--storage", str(storage), "--by-id", str(_by_id_dir(tmp_path)), "--apply"])
 
-    payload = json.loads((storage / "core.config_entries").read_text())
-    disabled = [e for e in payload["data"]["entries"] if e.get("disabled_by")]
-    assert {e["entry_id"] for e in disabled} == {"local", "office"}
-    assert list(storage.glob("core.config_entries.bak-preflight-*"))
+    assert (storage / "core.config_entries").read_text() == before, (
+        "--apply edited core.config_entries; it must only record"
+    )
+    assert not list(storage.glob("core.config_entries.bak-preflight-*")), (
+        "a backup was written for an edit that no longer happens"
+    )
+    # The detection half is what was kept, so it must still be there.
+    assert (storage / m.PREFLIGHT_MARKER_NAME).exists(), "the marker is all that remains"
 
 
-def test_applying_twice_is_a_no_op_the_second_time(
+def test_applying_twice_reports_the_same_entries_both_times(
     storage: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Keepalived can fire notify_master more than once."""
+    """The promoter can fire notify_master more than once.
+
+    🚨 **This test used to assert the second run said "Nothing to disable", and
+    that was the bug wearing a passing test.** The first run wrote
+    `disabled_by = "integration"` into `core.config_entries`; the second run
+    read that back, concluded the work was done, and went quiet. But
+    `"integration"` is not a member of `ConfigEntryDisabler`, so Home Assistant
+    ignored it and the entries stayed enabled — the script was confirming
+    success by re-reading the value it had written rather than by observing any
+    effect. *Exists is not works*, with the check and the write on the same side
+    of the glass.
+
+    Now nothing is written, so there is nothing to misread: the condition is
+    still true on the second run, and a still-true condition gets reported
+    again. Repetitive is the correct behaviour here — the entries really do
+    still reference absent hardware.
+    """
     argv = ["--storage", str(storage), "--by-id", str(_by_id_dir(tmp_path)), "--apply"]
+    before = (storage / "core.config_entries").read_text()
     main(argv)
     capsys.readouterr()
 
     rc = main(argv)
 
     assert rc == 0
-    assert "Nothing to disable" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "2 config entr(ies) reference absent hardware" in out, (
+        "the second run went quiet about a condition that is still true"
+    )
+    assert "Nothing to disable" not in out
+    assert (storage / "core.config_entries").read_text() == before
 
 
 def test_it_says_so_when_every_device_is_present(
@@ -403,8 +444,13 @@ def test_apply_proceeds_when_the_container_is_stopped(
     )
 
     assert rc == 0
+    # A stopped container is still a node that must report what it found; the
+    # recording half is exactly what survived dropping the remedy.
+    assert (storage / m.PREFLIGHT_MARKER_NAME).exists()
     payload = json.loads((storage / "core.config_entries").read_text())
-    assert any(e.get("disabled_by") for e in payload["data"]["entries"])
+    assert not any(e.get("disabled_by") for e in payload["data"]["entries"]), (
+        "nothing may be disabled, container stopped or not"
+    )
 
 
 def test_a_dry_run_is_allowed_even_while_home_assistant_runs(
@@ -430,17 +476,17 @@ def test_a_dry_run_is_allowed_even_while_home_assistant_runs(
     )
 
 
-def test_backups_do_not_accumulate_without_bound(
-    storage: Path, tmp_path: Path, monkeypatch
-) -> None:
-    """Adversarial review 2026-08-27, finding 6.
+def test_repeated_applies_never_write_a_backup(storage: Path, tmp_path: Path, monkeypatch) -> None:
+    """Adversarial review 2026-08-27, finding 6 — now closed by construction.
 
-    Every `--apply` writes a timestamped backup into `.storage` — which, when
-    fileset replication is enabled, is the directory it mirrors wholesale to
-    the standby. Left unbounded, every promotion adds a file to something that
-    gets copied across the network for the life of the cluster.
+    The original fault: every `--apply` wrote a timestamped backup into
+    `.storage`, which is the directory fileset replication mirrors wholesale,
+    so every promotion added a file copied across the network for the life of
+    the cluster. It was bounded by pruning to `KEEP_BACKUPS`.
 
-    Keep enough to recover from a bad promotion; do not keep a museum.
+    Dropping the remedy removed the edit, and an edit that does not happen
+    needs no backup and no pruning. This asserts the stronger property the
+    pruning test was approximating: **zero**, not bounded.
     """
     import custom_components.cluster_state_sync.scripts.ha_device_preflight as m
 
@@ -454,16 +500,10 @@ def test_backups_do_not_accumulate_without_bound(
         "ha",
         "--apply",
     ]
+    before = (storage / "core.config_entries").read_text()
 
-    for i in range(8):
-        # Re-arm: undo the disables so each pass has something to write.
-        payload = json.loads((storage / "core.config_entries").read_text())
-        for e in payload["data"]["entries"]:
-            e["disabled_by"] = None
-        (storage / "core.config_entries").write_text(json.dumps(payload))
-        monkeypatch.setattr(m, "_stamp", lambda i=i: f"2026010{i}T000000")
+    for _ in range(8):
         main(argv)
 
-    backups = sorted(storage.glob("core.config_entries.bak-preflight-*"))
-    assert len(backups) <= m.KEEP_BACKUPS, f"{len(backups)} backups kept"
-    assert backups, "pruning must not remove every backup"
+    assert not list(storage.glob("core.config_entries.bak-preflight-*"))
+    assert (storage / "core.config_entries").read_text() == before

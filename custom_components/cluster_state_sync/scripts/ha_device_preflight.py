@@ -51,7 +51,6 @@ _LOCAL_PREFIXES = ("/dev/",)
 # without turning `.storage` into an archive — and when fileset replication is
 # enabled, `.storage` is the directory it mirrors wholesale, so every file kept
 # here also travels across the network for the life of the cluster.
-KEEP_BACKUPS = 5
 
 #: Where the pre-flight leaves a record of what it switched off.
 #:
@@ -202,39 +201,40 @@ def plan_preflight(storage_dir: Path, present: set[str]) -> Plan:
 
 
 def _stamp() -> str:
-    """Local wall-clock stamp for a backup filename. Separated so it can be pinned."""
+    """Local wall-clock stamp for the marker. Separated so it can be pinned."""
     from datetime import datetime
 
     return datetime.now().strftime("%Y%m%dT%H%M%S")  # noqa: DTZ005 — a filename, not a fact
 
 
-def _prune_backups(storage_dir: Path, keep: int = KEEP_BACKUPS) -> None:
-    """Keep the newest `keep` backups; remove the rest.
+def record_plan(storage_dir: Path, plan: Plan) -> None:
+    """Record what references absent hardware. Disable nothing.
 
-    Sorted by name, which is safe because the names are fixed-width timestamps.
-    Deleting is best-effort: a backup that cannot be removed is untidy, whereas
-    a promotion that aborts over it is an outage.
+    🚨 **This used to write `disabled_by = "integration"`, and that value is not
+    a member of `ConfigEntryDisabler`** -- which has exactly one member, `user`.
+    Home Assistant rejected it, so the remedy this script existed for had never
+    once taken effect. It shipped inert from the first release through v0.6.0.
+
+    **The remedy is dropped rather than corrected, and the detection kept.** Three
+    measurements decided it:
+
+    * `setup_retry` never gives up. Measured 2026-10-02 on node-a: 91 retry
+      lines, exponential backoff to a 600s cap, 54 retries at the cap, 11.6
+      hours elapsed, and **zero** terminal-failure lines. So nothing needed
+      rescuing; the entry would have recovered unaided.
+    * The thing that actually blocked recovery was a different layer. A
+      container's `/dev` is a snapshot taken at container start, so a device
+      re-attached at 08:34 did not exist inside a container started the previous
+      evening -- `[Errno 2]` for a path the host opened fine. This script was a
+      workaround for the wrong layer.
+    * The costs are not comparable. Not disabling costs one log line every ten
+      minutes. Disabling costs a blind that never opens, with no error anywhere.
+
+    So the file is left untouched: no rewrite, and therefore no backup to take.
+    The marker is still written, because knowing *which* entries reference
+    absent hardware is what let an operator understand an 11-hour outage in
+    minutes -- and that was always the valuable half.
     """
-    backups = sorted(storage_dir.glob("core.config_entries.bak-preflight-*"))
-    for stale in backups[:-keep] if keep else backups:
-        try:
-            stale.unlink()
-        except OSError:  # noqa: PERF203 — best effort, per file
-            pass
-
-
-def apply_plan(storage_dir: Path, plan: Plan) -> None:
-    """Write the disables, after taking a timestamped backup beside the file."""
-    target = storage_dir / "core.config_entries"
-    payload = json.loads(target.read_text())
-    (storage_dir / f"core.config_entries.bak-preflight-{_stamp()}").write_text(target.read_text())
-    _prune_backups(storage_dir)
-
-    doomed = set(plan.to_disable)
-    for entry in payload["data"]["entries"]:
-        if entry["entry_id"] in doomed:
-            entry["disabled_by"] = "integration"
-    target.write_text(json.dumps(payload, indent=2))
     _write_marker(storage_dir, plan)
 
 
@@ -349,7 +349,7 @@ def main(argv: list[str] | None = None) -> int:
         #
         # `_write_marker` already removes it for an empty plan and its docstring
         # promises that happens on every apply -- but this early return meant a
-        # clean run never reached `apply_plan`, so the promise was never kept.
+        # clean run never reached `record_plan`, so the promise was never kept.
         #
         # The marker that outlives its problem is not usually this node's own.
         # The go-bag carries `.storage` wholesale, so a promotion installs the
@@ -369,12 +369,23 @@ def main(argv: list[str] | None = None) -> int:
         out.write(f"  {domain:14} {Path(dev).name[:52]:52} ({eid})\n")
 
     if not args.apply:
-        out.write("\nDry run — nothing written. Re-run with --apply to disable these.\n")
+        out.write("\nDry run — nothing recorded. Re-run with --apply to record these.\n")
         return 0
 
-    apply_plan(args.storage, plan)
-    out.write(f"\nDisabled {len(plan.to_disable)}. Backup written beside core.config_entries.\n")
-    out.write("Home Assistant can now start without them failing at setup.\n")
+    record_plan(args.storage, plan)
+    out.write(f"\nRecorded {len(plan.to_disable)}. Nothing was disabled and nothing was edited.\n")
+    out.write(
+        "Home Assistant will start, and these entries will fail setup and retry "
+        "with exponential backoff to a 600s cap, indefinitely and without giving "
+        "up. That is survivable: if the hardware returns, the entry recovers on "
+        "its next retry.\n"
+    )
+    out.write(
+        "🚨 If the device is present on the HOST but Home Assistant still cannot "
+        "open it, the container's /dev is a snapshot taken at container start and "
+        "will not show a device attached since. Restarting the container is the "
+        "only thing that fixes that.\n"
+    )
     return 0
 
 

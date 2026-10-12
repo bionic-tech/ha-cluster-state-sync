@@ -64,7 +64,16 @@ jobs:
     env:
       CLUSTER_SYNC_TEST_VALKEY: "127.0.0.1:6379"
     steps:
+      # `fetch-tags` because `test_replay_history.py` asserts the replay covers
+      # every tag in the repository, and a default shallow checkout has none.
+      # That test deliberately refuses to pass vacuously (`assert from_git`),
+      # which is right -- so the fix belongs here, in the thing that was lying
+      # about the repository's contents, and NOT in the assertion. Weakening it
+      # would turn a real gate into a decoration.
       - uses: actions/checkout@v4
+        with:
+          fetch-tags: true
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}

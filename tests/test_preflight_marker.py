@@ -92,29 +92,37 @@ def test_the_preflight_records_what_it_switched_off(tmp_path: pathlib.Path) -> N
 
 
 def test_applying_the_plan_writes_the_marker(tmp_path: pathlib.Path) -> None:
-    """🚨 Through `apply_plan`, not by calling `_write_marker` directly.
+    """🚨 Through `record_plan`, not by calling `_write_marker` directly.
 
     A test that calls the writer itself passes even when nothing calls the
     writer — which is precisely what a mutation check found here: removing the
-    call from `apply_plan` left the direct test green. The wiring is the part
+    call from `record_plan` left the direct test green. The wiring is the part
     that can rot.
     """
-    from custom_components.cluster_state_sync.scripts.ha_device_preflight import apply_plan
+    from custom_components.cluster_state_sync.scripts.ha_device_preflight import record_plan
 
     (tmp_path / "core.config_entries").write_text(
         json.dumps({"data": {"entries": [{"entry_id": "e1", "domain": "rfxtrx"}]}})
     )
-    apply_plan(
+    before = (tmp_path / "core.config_entries").read_text()
+    record_plan(
         tmp_path,
         Plan(to_disable=["e1"], details=[("e1", "rfxtrx", "/dev/x")], present_count=0),
     )
 
     assert (tmp_path / PREFLIGHT_MARKER_NAME).exists(), (
-        "apply_plan disabled an entry and left no record — the node comes up "
-        "missing hardware and nothing says so"
+        "record_plan found an entry referencing absent hardware and left no record "
+        "— the node comes up missing hardware and nothing says so"
     )
-    entries = json.loads((tmp_path / "core.config_entries").read_text())["data"]["entries"]
-    assert entries[0]["disabled_by"] == "integration", "the entry was not actually disabled"
+    # 🚨 The disable is GONE on purpose. `disabled_by = "integration"` is not a
+    # member of `ConfigEntryDisabler` (only `user` is), so Home Assistant
+    # rejected it and this remedy never once worked. It is not corrected to
+    # `user`, because a disable that DID work would stop a blind opening with
+    # no error anywhere, whereas leaving the entry alone costs one log line per
+    # retry interval against a `setup_retry` loop that never gives up.
+    assert (tmp_path / "core.config_entries").read_text() == before, (
+        "record_plan edited core.config_entries; it must only record"
+    )
 
 
 def test_a_promotion_that_disabled_nothing_removes_the_marker(tmp_path: pathlib.Path) -> None:
@@ -240,7 +248,7 @@ def test_a_clean_preflight_clears_a_marker_left_by_the_peer(
     node-b's promotion six hours earlier. Its own pre-flight had said
     "Every referenced device is present. Nothing to disable" -- and then
     returned without touching the marker, because `_write_marker` is reached
-    through `apply_plan`, which a clean run never calls.
+    through `record_plan`, which a clean run never calls.
 
     An alarm that is wrong often enough stops being read at all, which costs
     you the time it is right.
@@ -252,17 +260,33 @@ def test_a_clean_preflight_clears_a_marker_left_by_the_peer(
 
     storage = _storage_with(
         tmp_path,
-        [{"entry_id": "abc", "domain": "rfxtrx", "disabled_by": None,
-          "data": {"device": str(device)}}],
+        [
+            {
+                "entry_id": "abc",
+                "domain": "rfxtrx",
+                "disabled_by": None,
+                "data": {"device": str(device)},
+            }
+        ],
     )
 
     # The peer's marker, arriving via the go-bag.
     stale = storage / PREFLIGHT_MARKER_NAME
     stale.write_text(
-        json.dumps({"disabled_at": "20260918T104916", "present_count": 6,
-                    "untouched_count": 149,
-                    "disabled": [{"entry_id": "other", "domain": "rfxtrx",
-                                  "device": "/dev/serial/by-id/usb-RADIO_peer-if00-port0"}]}),
+        json.dumps(
+            {
+                "disabled_at": "20260918T104916",
+                "present_count": 6,
+                "untouched_count": 149,
+                "disabled": [
+                    {
+                        "entry_id": "other",
+                        "domain": "rfxtrx",
+                        "device": "/dev/serial/by-id/usb-RADIO_peer-if00-port0",
+                    }
+                ],
+            }
+        ),
         encoding="utf-8",
     )
     assert stale.exists()
@@ -287,8 +311,14 @@ def test_a_dry_run_never_touches_the_marker(tmp_path: pathlib.Path) -> None:
 
     storage = _storage_with(
         tmp_path,
-        [{"entry_id": "abc", "domain": "rfxtrx", "disabled_by": None,
-          "data": {"device": str(device)}}],
+        [
+            {
+                "entry_id": "abc",
+                "domain": "rfxtrx",
+                "disabled_by": None,
+                "data": {"device": str(device)},
+            }
+        ],
     )
     marker = storage / PREFLIGHT_MARKER_NAME
     marker.write_text(json.dumps({"disabled_at": "x", "disabled": []}), encoding="utf-8")
