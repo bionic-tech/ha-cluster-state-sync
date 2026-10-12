@@ -362,10 +362,49 @@ class ValkeyClient:
             raise RespError(f"MGET returned {len(reply)} values for {len(keys)} keys")
         return reply
 
+    def time(self) -> tuple[int, int]:
+        """The SERVER's clock, as (seconds, microseconds).
+
+        Both nodes compare themselves to this third party rather than to each
+        other: two clocks cannot be compared directly without a round trip
+        whose latency they cannot separate from the skew they are measuring.
+        The difference of the two offsets is the skew, and most of the round
+        trip cancels because it appears in both with the same sign.
+
+        Mirrors what `backend.register_node` already does from inside Home
+        Assistant. The promoter needs it because on a COLD standby Home
+        Assistant is stopped, so the promoter is the only process that can
+        report that node's clock at all.
+        """
+        reply = self._command("TIME")
+        if not isinstance(reply, list) or len(reply) != 2:
+            raise RespError(f"TIME did not return a two-element array: {reply!r}")
+        try:
+            return int(reply[0]), int(reply[1])
+        except (TypeError, ValueError) as err:
+            raise RespError(f"TIME returned non-numeric values: {reply!r}") from err
+
+    def delete(self, key: str) -> int:
+        """DEL one key. Returns how many were removed -- 0 or 1.
+
+        Added for the cluster-wide maintenance hold, which is the one piece of
+        shared state an operator must be able to REMOVE from a bare host. The
+        lease is never deleted this way: it has an owner, so it is released
+        through an identity-checked Lua script instead (see `lease.py`). This
+        key deliberately has no owner, so a plain DEL is the whole story.
+
+        An absent key returning 0 is success, not an error -- `cluster-hold.sh
+        off` may have run already, and two routes to the same outcome must not
+        disagree about whether it worked.
+        """
+        reply = self._command("DEL", key)
+        return int(reply) if isinstance(reply, int) else 0
+
     def set(self, key: str, value: str, *, ex: int | None = None) -> None:
         """SET, with an optional expiry in seconds.
 
-        The only write this client performs. It exists for one purpose: a
+        One of two writes this client performs (see `delete`). It exists for
+        one purpose: a
         follower whose Home Assistant is stopped has no other way to report
         that it could not apply the statistics window -- no logbook, no
         repairs panel, no entity. It leaves a status line in Valkey and the

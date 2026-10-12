@@ -72,6 +72,7 @@ from .const import (
     DOCKER_HOST,
     DOCKER_MACVLAN,
     HA_START_COMPOSE,
+    INTEGRATION_VERSION,
     LEASE_TTL_SECONDS,
     MAX_STATISTICS_INTERVAL_MINUTES,
     MIN_STATISTICS_INTERVAL_MINUTES,
@@ -2045,6 +2046,11 @@ def _promoter_sh(cfg: dict[str, Any]) -> str:
     # like the other volatile promoter state: an explanation from a previous
     # boot would be a claim nobody checked (ADR-008 §3).
     grace_reason_file = "/run/cluster-sync/grace-reason"
+    # Emitted for a COLD deployment only. See the comment beside the flag in
+    # the command below for why a warm standby must never receive it.
+    reconcile_flag = (
+        "" if cfg.get(CONF_TOPOLOGY_MODEL) == TOPOLOGY_WARM else "    --reconcile-backup \\\n"
+    )
     # The container the adaptive grace inspects. Empty disables it and falls
     # back to the flat ceiling, which is right wherever docker cannot answer.
     container = str(cfg.get(CONF_HA_CONTAINER) or "")
@@ -2151,8 +2157,23 @@ def _promoter_sh(cfg: dict[str, Any]) -> str:
         f"    --handover-file {shlex.quote(handover_file)} \\\n"
         f"    --probe-grace {PROMOTER_PROBE_GRACE_SECONDS} \\\n"
         f"    --base-grace {PROMOTER_BASE_GRACE_SECONDS} \\\n"
+        # Stamped so the running integration can tell whether the HOST side
+        # matches it. HACS updates the integration and not the bundle, and the
+        # two disagreeing is the difference between a hold that binds the peer
+        # and one that only appears to. Inferring it from the heartbeat's shape
+        # worked but told us only "old"; this says WHICH version.
+        f"    --bundle-version {shlex.quote(INTEGRATION_VERSION)} \\\n"
         f"    --ha-container {shlex.quote(container)} \\\n"
         f"    --grace-reason-file {shlex.quote(grace_reason_file)} \\\n"
+        # COLD ONLY, and the condition is the whole safety of it. On a cold
+        # standby Home Assistant is supposed to be stopped, so BACKUP with a
+        # serving container means a demotion did not happen and there are two
+        # live instances. On a WARM standby the very same reading is correct
+        # and expected -- that is what warm means -- so emitting this there
+        # would stop the standby's Home Assistant on every tick and turn the
+        # fix into the outage. Read from the deployment's own topology, never
+        # inferred at runtime.
+        f"{reconcile_flag}"
         "    $NO_PROBE_FLAG \\\n"
         # Forwarded so `install.sh` can run this same wrapper with `--adopt`
         # and inherit every connection flag above, rather than restating the
@@ -2897,43 +2918,91 @@ def _hold_script(cfg: dict[str, Any]) -> str:
     """
     hold_file = shlex.quote(_host_path(cfg, f"{CONTAINER_CONFIG_DIR}/{HOLD_FILENAME}"))
     return f"""{SHEBANG}{STRICT}
-# Cluster State Sync -- suspend or resume failover on THIS node.
+# Cluster State Sync -- suspend or resume failover across the CLUSTER.
 #
 #   ./cluster-hold.sh on  "upgrading the integration"   # suspend
 #   ./cluster-hold.sh off                               # resume
 #   ./cluster-hold.sh status
 #
-# While the hold is on, this node renews a lease it already holds but never
-# takes a free one, never promotes, and never demotes -- so a planned restart
-# does not become a failover. `force-master` still overrides it.
+# While the hold is on, a node renews a lease it already holds but never takes
+# a free one, never promotes, and never demotes -- so a planned restart does
+# not become a failover. `force-master` still overrides it.
 #
-# 🚨 Set it on BOTH nodes before planned work, and remember to clear it. A
-# forgotten hold is a cluster that has silently stopped failing over.
+# Two halves, and BOTH are set here:
+#
+#   * the local flag file, which keeps working when the store does not;
+#   * the cluster-wide key, which is what reaches the PEER.
+#
+# 🚨 The second half is why this is no longer "set it on both nodes". It used
+# to be, and in the cold model that instruction could not be followed: only one
+# node runs Home Assistant, so there is only one dashboard, and a hold set from
+# it left the standby's promoter free to promote. It did. See GOTCHAS 29.
+#
+# A forgotten hold is still a cluster that has silently stopped failing over,
+# and it is now forgotten on every node at once. `status` says who set it.
 
 HOLD={hold_file}
+PROMOTER="$(dirname "$0")/cluster-promoter.sh"
 
 case "${{1:-status}}" in
     on)
-        printf '%s\\n' "${{2:-set $(date -Is) by $(id -un)}}" > "$HOLD"
+        REASON="${{2:-set $(date -Is) by $(id -un)}}"
+        printf '%s\\n' "$REASON" > "$HOLD"
         echo "hold ON  -> $HOLD"
-        echo "  failover is now SUSPENDED on this node. Clear it with: $0 off"
+        # The cluster-wide half. A failure here is LOUD and non-zero: an
+        # operator told the hold is set, who then reboots a box, gets the
+        # exact accident this exists to prevent.
+        if "$PROMOTER" --set-hold "$REASON"; then
+            echo "  failover is now SUSPENDED on EVERY node. Clear it with: $0 off"
+        else
+            echo "  🚨 the LOCAL hold is set, but it could NOT be published to the" >&2
+            echo "     cluster. The peer is NOT held and may still promote. Set the" >&2
+            echo "     hold on the peer by hand, or fix the store, before rebooting." >&2
+            exit 1
+        fi
         ;;
     off)
         if [[ -f "$HOLD" ]]; then
             rm -f "$HOLD"
             echo "hold OFF -> removed $HOLD"
-            echo "  failover is live again on this node."
         else
-            echo "hold OFF -> $HOLD was not set; nothing to do"
+            echo "hold OFF -> $HOLD was not set"
+        fi
+        if "$PROMOTER" --clear-hold; then
+            # 🚨 Say ONLY what was actually cleared. This used to print
+            # "failover is live again on every node", which it cannot know: a
+            # LOCAL flag lives on a filesystem this node cannot reach, so
+            # clearing from the peer leaves the other node still suspended
+            # while telling the operator it is live. That is the original
+            # one-sided-hold bug with the sign flipped -- believing failover
+            # is armed when it is not is the worse direction of the two.
+            echo "  cleared: the cluster-wide hold, and this node's local flag."
+            echo "  🚨 A LOCAL flag on the PEER can only be removed ON the peer."
+            echo "     Check there with: $0 status"
+        else
+            echo "  🚨 the cluster-wide hold could NOT be cleared; the peer may" >&2
+            echo "     still be holding. Clear it there too." >&2
+            exit 1
         fi
         ;;
     status)
+        RC=0
         if [[ -f "$HOLD" ]]; then
-            echo "hold ON  -> $HOLD"
+            echo "hold ON  (local)   -> $HOLD"
             echo "  reason: $(cat "$HOLD" 2>/dev/null || echo '(unreadable)')"
-            exit 1
+            RC=1
+        else
+            echo "hold off (local)   -> $HOLD absent"
         fi
-        echo "hold off -> $HOLD absent; failover is live"
+        # Reported separately, never merged: "held somewhere" is the answer
+        # that hid the bug. Which half is set decides where you go to clear it.
+        if CLUSTER="$("$PROMOTER" --show-hold 2>/dev/null)" && [[ -n "$CLUSTER" ]]; then
+            echo "hold ON  (cluster) -> $CLUSTER"
+            RC=1
+        else
+            echo "hold off (cluster) -> no cluster-wide hold"
+        fi
+        exit "$RC"
         ;;
     *)
         echo "usage: $0 [on [reason] | off | status]" >&2
@@ -2985,6 +3054,30 @@ def _install_script(cfg: dict[str, Any], filenames: list[str]) -> str:
     file_count = len(payload)
     probe_url = shlex.quote(_promoter_ha_url(cfg))
     holddown = int(PROMOTER_RELEASE_HOLDDOWN_SECONDS)
+
+    # 🚨 A silent Home Assistant is a FAULT on a warm node and the CORRECT
+    # STATE on a cold standby, so the same reading cannot carry the same
+    # verdict.
+    #
+    # This refused to install on a cold standby (2026-09-20), which is the one
+    # place a bundle most needs installing: the standby's Home Assistant is
+    # deliberately stopped, so the probe can never answer, so the pre-flight
+    # could never pass. The check was written for the warm model and made the
+    # cold model uninstallable -- the same shape as the one-sided hold
+    # (GOTCHAS 29), where a mechanism assumed both nodes were running.
+    #
+    # It stays FATAL on warm, where the promoter really would demote: D3's
+    # branch requires `previous == "MASTER"`, which a warm node reaches and a
+    # cold standby does not. Downgraded to a note on cold, where the same
+    # branch is unreachable -- so the outage it warns about cannot occur.
+    cold = cfg.get(CONF_TOPOLOGY_MODEL) != TOPOLOGY_WARM
+    probe_verdict = "note" if cold else "fail"
+    probe_lead = (
+        "EXPECTED ON A COLD STANDBY, where Home Assistant is deliberately "
+        "stopped -- the promoter only probes once it is MASTER. Continuing. "
+        if cold
+        else ""
+    )
     units = [n for n in filenames if n.endswith((".service", ".timer"))]
     timers = sorted(n for n in units if n.endswith(".timer"))
     secrets = sorted(n for n in filenames if n in SECRET_FILENAMES)
@@ -3146,7 +3239,7 @@ ok "config directory holds .storage: {config_path}"
 # -- only a refused connection, a DNS failure or a timeout reads as dead.
 if command -v curl >/dev/null 2>&1; then
     if ! curl -s -o /dev/null --max-time 5 {probe_url}; then
-        fail "the D3 probe target {probe_url} does not answer from this host.
+        {probe_verdict} "{probe_lead}the D3 probe target {probe_url} does not answer from this host.
     The promoter would read that as a dead Home Assistant, release the lease and
     run notify_backup.sh -- which stops the container -- for {holddown}s at a
     time. Check the container's network mode: with a published port rather than

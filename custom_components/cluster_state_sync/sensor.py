@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from datetime import UTC, datetime
 import fnmatch
 from typing import Any
@@ -22,7 +21,6 @@ from . import StateMirror
 from .const import (
     CLOCK_SKEW_CRITICAL_SECONDS,
     CLOCK_SKEW_WARN_SECONDS,
-    CONF_RADIO_WATCH,
     DATA_CLUSTER_VIEW,
     DATA_CONFIG,
     DATA_COORDINATOR,
@@ -32,24 +30,13 @@ from .const import (
     DATA_STATISTICS,
     DATA_STATS,
     MAX_ATTRIBUTE_BYTES,
+    watch_patterns,
 )
 from .coordinator import BackendHealthCoordinator, ClusterViewCoordinator, SyncStats
 from .entity import ClusterSyncDiagnosticEntity, ClusterViewEntity, MirrorBackedEntity
 from .fileset import FilesetPublisher
 from .includes import scan as scan_includes
 from .scope import replication_scope
-
-
-def watch_patterns(data: Mapping[str, Any]) -> list[str]:
-    """The radio-liveness globs, with the blanks removed.
-
-    The wizard field accepts free text, so a stray empty entry is ordinary. An
-    empty glob matches nothing, and a watch list of nothing but blanks would
-    create a sensor that reports `unknown` forever while looking configured --
-    so blanks are dropped here, and a list that is only blanks turns the
-    feature off rather than half-on.
-    """
-    return [p.strip() for p in (data.get(CONF_RADIO_WATCH) or []) if p and p.strip()]
 
 
 async def async_setup_entry(
@@ -338,6 +325,33 @@ class FilesetAgeSensor(ClusterSyncDiagnosticEntity, SensorEntity):
 
         return None
 
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Which kind of "unknown" this is, when it is unknown.
+
+        🚨 A blank age meant two opposite things: "this publisher has not run
+        yet since it started" and "publishing is refused and the standby's
+        go-bag is rotting". An operator cannot act on a reading that means
+        both, and the second is an outage in waiting.
+        """
+        # `last_result` is None until the FIRST publish completes, which is
+        # exactly the state this attribute exists to describe — so reaching
+        # through it unguarded crashed the entity at the one moment it was
+        # most needed. Caught by the suite immediately.
+        result = self._publisher.last_result if self._publisher else None
+        skipped = result.skipped_reason if result else None
+        if skipped:
+            status = f"refused:{skipped}"
+        elif self._marker is not None:
+            status = "from_boot_marker"
+        elif self._publisher is None:
+            status = "not_configured"
+        elif self._publisher.last_success_at is None:
+            status = "awaiting_first_publish"
+        else:
+            status = "publishing"
+        return {"status": status}
+
     def _seconds_since_marker_written(self) -> float:
         """How long ago the marker itself was written, so the reported age
         keeps climbing instead of freezing at the value captured at boot."""
@@ -489,9 +503,13 @@ class ClusterMembersSensor(ClusterViewEntity, SensorEntity):
     @property
     def native_value(self) -> int | None:
         view = self.coordinator.data
-        if view is None or not view.members:
+        if view is None:
             return None
-        return len(view.members)
+        # Counts a node seen by EITHER route. `len(members)` alone reported 1
+        # on a healthy two-node cold cluster and 1 on a broken one, because the
+        # registry is written by the integration and the standby's is stopped.
+        count = view.node_count
+        return count or None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -499,9 +517,23 @@ class ClusterMembersSensor(ClusterViewEntity, SensorEntity):
         if view is None:
             return {}
         return {
-            "node_ids": sorted(view.members),
+            "node_ids": sorted(set(view.members) | set(view.promoters)),
+            # Which route each node was seen by. A node visible only via its
+            # promoter is a COLD STANDBY reporting correctly, not a fault --
+            # and one visible by neither is simply absent.
+            "seen_via": {
+                node: (
+                    "integration+promoter"
+                    if node in view.members and node in view.promoters
+                    else "integration"
+                    if node in view.members
+                    else "promoter"
+                )
+                for node in sorted(set(view.members) | set(view.promoters))
+            },
             "clock_offsets_s": {
-                node: m.get("offset_s") for node, m in sorted(view.members.items())
+                node: (view.members.get(node) or view.promoters.get(node) or {}).get("offset_s")
+                for node in sorted(set(view.members) | set(view.promoters))
             },
         }
 

@@ -91,3 +91,43 @@ def test_the_deadline_is_long_enough_and_short_enough() -> None:
         "at or past the promoter's probe grace, an automatic hold would start "
         "adding to the time a genuine crash takes to fail over"
     )
+
+
+def test_the_hold_is_never_touched_on_the_event_loop() -> None:
+    """🚨 A real install logged this at every restart, with a link to our issues.
+
+    `hold.py` does file I/O — `is_file`, `read_text`, `unlink` — on whatever
+    `/config` happens to be, which on the fleet this was built for is a spinning
+    disk. Home Assistant detects a blocking call on the event loop and warns,
+    inviting the user to open a bug report against this repository.
+
+    `binary_sensor.py` already reads the flag through an executor and its
+    docstring explains why. Two call sites in `__init__.py` did not, which is
+    the more embarrassing kind of defect: the rule was known, written down, and
+    not applied.
+
+    Structural rather than behavioural because the failure is a warning in
+    somebody else's log, not an exception we could assert on.
+    """
+    import pathlib
+    import re
+
+    source = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / "custom_components"
+        / "cluster_state_sync"
+        / "__init__.py"
+    ).read_text(encoding="utf-8")
+
+    bare = [
+        line.strip()
+        for line in source.splitlines()
+        if re.search(r"(?<!executor_job, )\b(set_auto_hold|clear_auto_hold|read_hold)\(", line)
+        and "async_add_executor_job" not in line
+        and not line.strip().startswith(("#", "from", "import"))
+    ]
+    assert not bare, (
+        "these call hold.py directly on the event loop:\n  "
+        + "\n  ".join(bare)
+        + "\n\nWrap them: await hass.async_add_executor_job(fn, hass.config.path())"
+    )

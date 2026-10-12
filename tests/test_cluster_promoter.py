@@ -53,6 +53,25 @@ class FakeClient:
         self.holds = holds
         self.calls: list[tuple[str, list[str], list[str]]] = []
         self.heartbeats: list[tuple[str, list[str], list[str]]] = []
+        # The plain key/value half of the store, which the cluster-wide
+        # maintenance hold lives in.
+        #
+        # 🚨 Present even though most tests here never set a hold. Without a
+        # `get`, `_read_cluster_hold`'s call raised AttributeError, its
+        # `except Exception` swallowed it, and every test in this file
+        # exercised "no cluster hold" through a crash rather than through a
+        # real miss -- the unfaithful-fake shape that has bitten this suite
+        # before. A hold set on the store must be visible here.
+        self.store: dict[str, str] = {}
+
+    def get(self, key: str) -> str | None:
+        return self.store.get(key)
+
+    def set(self, key: str, value: str, *, ex: int | None = None) -> None:
+        self.store[key] = value
+
+    def delete(self, key: str) -> int:
+        return 1 if self.store.pop(key, None) is not None else 0
 
     def eval(self, script: str, keys: list[str], args: list[str]) -> int:
         if "promoters:" in (keys[0] if keys else ""):

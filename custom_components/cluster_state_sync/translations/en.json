@@ -238,6 +238,10 @@
     "devices_disabled": {
       "title": "Promoted without {count} device(s)",
       "description": "This node started with **{count} config entry(s) switched off** because their hardware is not attached here: {detail}\n\nThat is deliberate. A node missing a radio is more use than one whose integrations fail at setup and stay failed until somebody restarts it by hand — so the promotion pre-flight disables them and lets the node come up.\n\n**But whatever those devices do is not happening.** If this node is expected to have that hardware, check the device path: it usually embeds the unit's serial number, so a *different* physical device on this machine will not match the path the other node wrote. A stable `udev` symlink pointing at whichever unit is present on each host is the usual answer.\n\nRe-enable the entries under **Settings → Devices & services** once the hardware is there. This message clears itself on the next promotion that finds everything."
+    },
+    "bundle_version_mismatch": {
+      "title": "The host bundle is older than the integration",
+      "description": "The host bundle on {nodes} was generated from a different version of this integration, which is now {version}. HACS updates the integration and not the host bundle, so they drift apart on an ordinary upgrade.\n\nWhile they differ, a cluster-wide maintenance hold set here is NOT read by the promoter on {nodes} — it will promote straight through a hold you have set. That is the failure this version exists to fix.\n\nRegenerate the bundle from the options flow and re-run install.sh on {nodes}."
     }
   },
   "options": {
@@ -416,6 +420,7 @@
         "statistics_not_seeded": "Statistics have never been seeded",
         "statistics_stalled": "Statistics replication has stalled",
         "ingress_unreachable": "Nobody can get in — your Home Assistant address stopped answering",
+        "radio_silent": "The radios have gone quiet — Home Assistant is fine, the radios are not",
         "devices_disabled": "Promoted with hardware missing, so entries were switched off"
       }
     }

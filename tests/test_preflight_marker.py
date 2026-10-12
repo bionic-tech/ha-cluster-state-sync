@@ -201,3 +201,97 @@ def test_the_condition_is_pushed_by_default() -> None:
     from custom_components.cluster_state_sync.const import DEFAULT_NOTIFY_CONDITIONS
 
     assert NOTIFY_DEVICES_DISABLED in DEFAULT_NOTIFY_CONDITIONS
+
+
+# --------------------------------------------------------------------------
+# A clean pre-flight must clear the PREVIOUS marker (GOTCHAS 31)
+# --------------------------------------------------------------------------
+
+
+def _storage_with(tmp_path: pathlib.Path, entries: list[dict]) -> pathlib.Path:
+    storage = tmp_path / ".storage"
+    storage.mkdir()
+    (storage / "core.config_entries").write_text(
+        json.dumps({"data": {"entries": entries}}), encoding="utf-8"
+    )
+    return storage
+
+
+def _run_preflight(storage: pathlib.Path, by_id: pathlib.Path, apply: bool) -> int:
+    from custom_components.cluster_state_sync.scripts.ha_device_preflight import main
+
+    argv = ["--storage", str(storage), "--by-id", str(by_id)]
+    if apply:
+        argv.append("--apply")
+    return main(argv)
+
+
+def test_a_clean_preflight_clears_a_marker_left_by_the_peer(
+    tmp_path: pathlib.Path,
+) -> None:
+    """🚨 The marker that outlives its problem is usually not this node's own.
+
+    The go-bag carries `.storage` wholesale, so a promotion installs the
+    PEER's marker along with everything else, and the promoted node then
+    reports the peer's missing radios as its own.
+
+    Observed on the reference pair 2026-09-20: node-a held all five devices
+    with every config entry enabled, and raised `devices_disabled` describing
+    node-b's promotion six hours earlier. Its own pre-flight had said
+    "Every referenced device is present. Nothing to disable" -- and then
+    returned without touching the marker, because `_write_marker` is reached
+    through `apply_plan`, which a clean run never calls.
+
+    An alarm that is wrong often enough stops being read at all, which costs
+    you the time it is right.
+    """
+    by_id = tmp_path / "by-id"
+    by_id.mkdir()
+    device = by_id / "usb-RADIO_present-if00-port0"
+    device.write_text("")  # present, so there is nothing to disable
+
+    storage = _storage_with(
+        tmp_path,
+        [{"entry_id": "abc", "domain": "rfxtrx", "disabled_by": None,
+          "data": {"device": str(device)}}],
+    )
+
+    # The peer's marker, arriving via the go-bag.
+    stale = storage / PREFLIGHT_MARKER_NAME
+    stale.write_text(
+        json.dumps({"disabled_at": "20260918T104916", "present_count": 6,
+                    "untouched_count": 149,
+                    "disabled": [{"entry_id": "other", "domain": "rfxtrx",
+                                  "device": "/dev/serial/by-id/usb-RADIO_peer-if00-port0"}]}),
+        encoding="utf-8",
+    )
+    assert stale.exists()
+
+    assert _run_preflight(storage, by_id, apply=True) == 0
+    assert not stale.exists(), (
+        "a clean pre-flight left the peer's marker standing; this node will "
+        "report the peer's missing radios as its own"
+    )
+
+
+def test_a_dry_run_never_touches_the_marker(tmp_path: pathlib.Path) -> None:
+    """A dry run changes nothing, the marker included.
+
+    Without the `--apply` guard, merely *inspecting* a node would clear a
+    genuine record of a degraded promotion.
+    """
+    by_id = tmp_path / "by-id"
+    by_id.mkdir()
+    device = by_id / "usb-RADIO_present-if00-port0"
+    device.write_text("")
+
+    storage = _storage_with(
+        tmp_path,
+        [{"entry_id": "abc", "domain": "rfxtrx", "disabled_by": None,
+          "data": {"device": str(device)}}],
+    )
+    marker = storage / PREFLIGHT_MARKER_NAME
+    marker.write_text(json.dumps({"disabled_at": "x", "disabled": []}), encoding="utf-8")
+
+    assert _run_preflight(storage, by_id, apply=False) == 0
+    assert marker.exists(), "a dry run removed the marker"

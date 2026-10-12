@@ -176,11 +176,35 @@ async def test_migrating_twice_changes_nothing_the_second_time(hass: HomeAssista
 
 
 def test_the_legacy_notify_set_is_frozen_history_too() -> None:
-    """One condition apart, and that difference is the whole migration."""
-    assert set(DEFAULT_NOTIFY_CONDITIONS) - LEGACY_DEFAULT_NOTIFY_CONDITIONS == {
-        "ingress_unreachable"
-    }
+    """The legacy set only ever GROWS out of, never back into, the default.
+
+    It was one condition apart when `ingress_unreachable` was added; it is two
+    apart since `radio_silent`. The number is not the invariant — these are:
+
+    * **the legacy set is a subset of the default**, so the migration only ever
+      adds. A condition disappearing from the default while entries still
+      carry it would silence an alert somebody is relying on, with no record.
+    * **it is frozen.** It records what shipped, once. If it ever tracked
+      `DEFAULT_NOTIFY_CONDITIONS` the delta would be permanently empty and the
+      migration would silently stop restoring anything — a guard that cannot
+      fail, which is this project's most-repeated fault.
+    """
     assert LEGACY_DEFAULT_NOTIFY_CONDITIONS - set(DEFAULT_NOTIFY_CONDITIONS) == set()
+    assert set(DEFAULT_NOTIFY_CONDITIONS) - LEGACY_DEFAULT_NOTIFY_CONDITIONS == {
+        "ingress_unreachable",
+        "radio_silent",
+    }
+    # Frozen means frozen: the six that actually shipped, named.
+    assert LEGACY_DEFAULT_NOTIFY_CONDITIONS == frozenset(
+        {
+            "promoted",
+            "restored_nothing",
+            "devices_disabled",
+            "recovered",
+            "backend_lost",
+            "fileset_degraded",
+        }
+    )
 
 
 async def test_untouched_alert_conditions_gain_ingress_unreachable(hass: HomeAssistant) -> None:

@@ -85,6 +85,20 @@ class BackendHealthCoordinator(DataUpdateCoordinator[bool]):
         )
         self._backend = backend
 
+    @property
+    def backend(self) -> ClusterBackend:
+        """The backend this coordinator polls.
+
+        Public because entities on this coordinator need shared state that is
+        not part of the health reading -- the cluster-wide maintenance hold,
+        specifically. Exposed as a property rather than left to callers
+        reaching for `_backend`: a `getattr(coordinator, "backend", None)`
+        against a private attribute answers None forever, and the entity that
+        depended on it would report "not held" for a held cluster without ever
+        failing.
+        """
+        return self._backend
+
     async def _async_update_data(self) -> bool:
         # Deliberately does not raise UpdateFailed on a down backend: "the
         # backend is down" is the reading we want to publish, not an error that
@@ -115,6 +129,20 @@ class ClusterView:
     #: Empty when the store cannot answer, which the entities render as
     #: unknown rather than as a cluster of zero nodes.
     members: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: Every node whose PROMOTER is beating, with whatever it reported. On a
+    #: cold standby this is the only evidence the node exists at all — its
+    #: Home Assistant is stopped, so it never reaches `members`.
+    promoters: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    @property
+    def node_count(self) -> int:
+        """Nodes this cluster can see, by ANY route.
+
+        🚨 `len(members)` alone read 1 on a healthy two-node cold cluster and 1
+        on a broken one — the registry is written by the integration, and the
+        standby's is deliberately stopped. ADR-009 recorded that exact defect.
+        """
+        return len(set(self.members) | set(self.promoters))
 
     @property
     def clock_skew(self) -> float | None:
@@ -127,14 +155,20 @@ class ClusterView:
         None below two members: skew is a property of a pair, and a single
         node reporting 0 would claim agreement it has not established.
         """
-        offsets = [
-            m["offset_s"]
-            for m in self.members.values()
-            if isinstance(m.get("offset_s"), (int, float))
-        ]
-        if len(offsets) < 2:
+        seen: dict[str, float] = {}
+        # Promoters first, integrations second: on a COLD standby only the
+        # promoter reports at all, and on the leader both do. Keyed by node so
+        # a node reporting through both routes is counted once, and the
+        # integration's reading wins — it is measured from the same process
+        # that does the mirroring.
+        for source in (self.promoters, self.members):
+            for node, m in source.items():
+                offset = m.get("offset_s")
+                if isinstance(offset, (int, float)):
+                    seen[node] = float(offset)
+        if len(seen) < 2:
             return None
-        return max(offsets) - min(offsets)
+        return max(seen.values()) - min(seen.values())
 
     @property
     def snapshot_age(self) -> float | None:
@@ -178,6 +212,9 @@ class ClusterViewCoordinator(DataUpdateCoordinator[ClusterView]):
         await self._backend.register_node(self._node_id)
         leader, meta = await self._backend.read_cluster_view()
         members = await self._backend.read_members()
+        # The promoter's view, which is the ONLY view of a cold standby: its
+        # Home Assistant is stopped, so it never reaches `read_members`.
+        promoters = await self._backend.read_promoters()
         return ClusterView(
             leader=leader,
             snapshot_source=meta.get("source_node") or None,
@@ -186,6 +223,7 @@ class ClusterViewCoordinator(DataUpdateCoordinator[ClusterView]):
             if isinstance(meta.get("entry_count"), int)
             else None,
             members=members,
+            promoters=promoters,
         )
 
 

@@ -3530,3 +3530,92 @@ def test_the_promoter_timer_is_not_slowed_down_to_fix_logging() -> None:
     from custom_components.cluster_state_sync.bundle import _promoter_timer
 
     assert "OnUnitActiveSec=10s" in _promoter_timer()
+
+
+def _topology_cfg(model: str) -> dict:
+    """A minimal config that emits install.sh, for the topology assertions below."""
+    return {
+        "ha_container": "homeassistant",
+        "ha_config_path": "/config",
+        "redis_host": "valkey.lan",
+        "redis_port": 6379,
+        "redis_db": 2,
+        "cluster_namespace": "prod",
+        "cluster_secret": "s" * 44,
+        "node_id": "node-a",
+        "peer_host": "peer.lan",
+        "leadership_source": "lease",
+        "fileset_enabled": True,
+        "topology_model": model,
+    }
+
+
+def test_install_refuses_a_silent_home_assistant_on_a_warm_node() -> None:
+    """Warm: the probe failing really does mean the promoter would demote.
+
+    D3's release branch requires `previous == "MASTER"`, which a warm node
+    reaches. Installing there with an unreachable Home Assistant arms an
+    outage, so the pre-flight must stay fatal.
+    """
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    sh = build_bundle(_topology_cfg("warm"))["install.sh"]
+    line = next(x for x in sh.splitlines() if "does not answer from this host" in x)
+    assert line.strip().startswith("fail "), line
+
+
+def test_install_does_not_refuse_a_cold_standby_for_being_a_cold_standby() -> None:
+    """🚨 Cold: a silent Home Assistant is the CORRECT state, not a fault.
+
+    Found on 2026-09-20 trying to install 0.6.0 on node-b. The pre-flight
+    probed `http://127.0.0.1:8123/`, which on a cold standby can never answer
+    -- Home Assistant there is deliberately stopped -- so `install.sh` refused
+    on the one node that most needed the bundle. The check had been written
+    for the warm model and made the cold model uninstallable.
+
+    Same shape as GOTCHAS 29: a mechanism that assumed both nodes were
+    running, on a topology whose whole point is that one of them is not.
+
+    The outage it warns about cannot occur here, and that is why this is safe
+    rather than merely convenient: D3's branch requires `previous ==
+    "MASTER"`, which a cold standby never is.
+    """
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    sh = build_bundle(_topology_cfg("cold"))["install.sh"]
+    line = next(x for x in sh.splitlines() if "does not answer from this host" in x)
+    assert not line.strip().startswith("fail "), line
+    assert line.strip().startswith("note "), line
+    # And it must say WHY it is continuing, or the operator reads a warning
+    # they cannot evaluate.
+    assert "EXPECTED ON A COLD STANDBY" in sh
+
+
+def test_clearing_a_hold_never_claims_the_peer_is_live() -> None:
+    """🚨 A message may not assert a fact the code did not establish.
+
+    `cluster-hold.sh off` clears the cluster-wide key and THIS node's local
+    flag. It cannot clear a local flag on the peer — that file lives on a
+    filesystem this node cannot reach. It used to print "failover is live
+    again on every node" regardless, which is the original one-sided-hold bug
+    with the sign flipped: believing failover is ARMED when it is suspended is
+    the worse direction, because nothing will tell you until it fails to fail
+    over.
+
+    Observed on the reference pair 2026-09-20, clearing from node-b a hold
+    that node-a had set: the cluster key went, node-a stayed locally
+    held, and the operator was told every node was live.
+    """
+    from custom_components.cluster_state_sync.bundle import build_bundle
+
+    sh = build_bundle(_topology_cfg("cold"))["cluster-hold.sh"]
+
+    # Only what the script SAYS, not what it explains. The comment above the
+    # fix quotes the old wording deliberately, and a blunt substring check
+    # matches that quote -- passing or failing for the wrong reason.
+    spoken = [
+        line for line in sh.splitlines()
+        if line.strip().startswith("echo ") and "live again on every node" in line
+    ]
+    assert not spoken, spoken
+    assert "can only be removed ON the peer" in sh

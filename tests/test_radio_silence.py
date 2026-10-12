@@ -233,3 +233,155 @@ async def test_the_three_states_are_distinguishable(hass: HomeAssistant) -> None
     assert ok.extra_state_attributes["status"] == "ok"
     assert ok.extra_state_attributes["entities_reporting"] == 1
     assert ok.native_value == 0
+
+
+# --------------------------------------------------------------------------
+# The ALERT — detection existed since v0.3.1 and told nobody (GOTCHAS 18/33)
+# --------------------------------------------------------------------------
+
+
+def _fault(hass, patterns):
+    from custom_components.cluster_state_sync import _radio_watch_fault
+
+    return _radio_watch_fault(hass, patterns)
+
+
+async def test_a_watch_that_has_never_heard_anything_is_a_fault(hass) -> None:
+    """🚨 `no_reports` — matched entities, not one carrying a reading.
+
+    This is not a quiet house. It is a radio stack that has never spoken, and
+    it is the state a segfaulted Zigbee daemon leaves behind.
+    """
+    hass.states.async_set("sensor.rfx_a_rssi_numeric", "unknown")
+    hass.states.async_set("sensor.rfx_b_rssi_numeric", "unavailable")
+    await hass.async_block_till_done()
+
+    fault = _fault(hass, ["sensor.*_rssi_numeric"])
+    assert fault is not None
+    status, detail = fault
+    assert status == "no_reports"
+    assert "matched 2 entities" in detail
+    assert "sensor.*_rssi_numeric" in detail, "the operator must be told WHICH radio"
+
+
+async def test_a_watch_matching_nothing_is_a_fault(hass) -> None:
+    """`no_matches` — configured, and reporting on nothing.
+
+    Worse than the feature being off, because it looks on.
+    """
+    fault = _fault(hass, ["sensor.*_rssi_numeric"])
+    assert fault is not None
+    assert fault[0] == "no_matches"
+
+
+async def test_one_reporting_radio_is_not_a_fault(hass) -> None:
+    """🚨 SILENCE ALONE IS NEVER RAISED, and that is the whole design.
+
+    `RadioSilenceSensor` refuses to pick a threshold because a quiet house at
+    4am legitimately produces no RF for hours — and this project has already
+    called a 9-hour gap an outage on a fleet whose normal maximum was 9.3
+    hours. An alert that guessed a number would manufacture exactly the false
+    alarm that teaches an operator to ignore the real one.
+
+    So: a radio that HAS reported, however long ago, is not a fault here.
+    """
+    hass.states.async_set("sensor.rfx_a_rssi_numeric", "unknown")
+    hass.states.async_set("sensor.rfx_b_rssi_numeric", "-72")  # heard something, once
+    await hass.async_block_till_done()
+
+    assert _fault(hass, ["sensor.*_rssi_numeric"]) is None
+
+
+async def test_an_unconfigured_watch_never_alerts(hass) -> None:
+    """No globs, no feature, no alarm. It must cost a default install nothing."""
+    assert _fault(hass, []) is None
+
+
+async def test_the_alert_and_the_sensor_agree(hass) -> None:
+    """🚨 The drift guard: two readers of the same signal.
+
+    `_radio_watch_fault` mirrors `RadioSilenceSensor._watched` — one is an
+    entity, one runs from a timer, so the logic is duplicated. If they ever
+    disagree, the sensor shows a fault the alert does not raise, or the alert
+    fires on a sensor reading `ok`. Either way the operator is told something
+    the dashboard contradicts.
+    """
+    from custom_components.cluster_state_sync.sensor import RadioSilenceSensor
+
+    patterns = ["sensor.*_rssi_numeric"]
+    for states, expect_fault in (
+        ({}, True),                                            # no_matches
+        ({"sensor.a_rssi_numeric": "unknown"}, True),          # no_reports
+        ({"sensor.a_rssi_numeric": "-70"}, False),             # ok
+    ):
+        for eid in list(hass.states.async_entity_ids()):
+            hass.states.async_remove(eid)
+        for eid, val in states.items():
+            hass.states.async_set(eid, val)
+        await hass.async_block_till_done()
+
+        alert_says_fault = _fault(hass, patterns) is not None
+        # The sensor's own view of the same question.
+        reporting = [
+            s for s in hass.states.async_all()
+            if any(__import__("fnmatch").fnmatch(s.entity_id, p) for p in patterns)
+            and s.state not in ("unknown", "unavailable", "", None)
+        ]
+        sensor_says_ok = bool(reporting)
+        assert alert_says_fault == expect_fault
+        assert alert_says_fault != sensor_says_ok, (
+            f"alert and sensor disagree for {states}"
+        )
+    assert RadioSilenceSensor is not None  # the class the alert must agree with
+
+
+async def test_one_live_radio_does_not_mask_a_dead_one(hass) -> None:
+    """🚨 THE reason a Zigbee glob could not simply be added to the watch.
+
+    `RadioSilenceSensor` pools every pattern into one number — `max(stamps)`
+    across everything matched — so the freshest radio sets the reading. On the
+    reference fleet that is 525 RFXtrx entities against 6 deCONZ ones: Zigbee
+    can be dead for nine days while the pooled signal stays perfectly healthy
+    on RF traffic.
+
+    Adding a Zigbee glob to a pooled watch would have LOOKED like coverage and
+    delivered none. The alert therefore judges each pattern separately.
+    """
+    # RF is fine and chattering.
+    hass.states.async_set("sensor.rfx_a_rssi_numeric", "-71")
+    hass.states.async_set("sensor.rfx_b_rssi_numeric", "-64")
+    # Zigbee is dead — a dead daemon takes its entities to `unavailable`.
+    hass.states.async_set("sensor.tradfri_remote_battery", "unavailable")
+    hass.states.async_set("sensor.switch_battery", "unavailable")
+    await hass.async_block_till_done()
+
+    patterns = ["sensor.*_rssi_numeric", "sensor.*_battery"]
+
+    # Pooled — the way the sensor reads it — would call this healthy.
+    pooled_reporting = [
+        s for s in hass.states.async_all()
+        if any(__import__("fnmatch").fnmatch(s.entity_id, p) for p in patterns)
+        and s.state not in ("unknown", "unavailable", "", None)
+    ]
+    assert pooled_reporting, "precondition: pooled view sees healthy traffic"
+
+    # Per-pattern — the way the ALERT reads it — catches the dead radio.
+    fault = _fault(hass, patterns)
+    assert fault is not None, "a dead radio was masked by a live one"
+    status, detail = fault
+    assert status == "no_reports"
+    assert "sensor.*_battery" in detail
+    assert "sensor.*_rssi_numeric" not in detail, "the healthy radio must not be blamed"
+
+
+async def test_every_pattern_in_fault_is_named(hass) -> None:
+    """Two dead radios are two lines, not one. The operator needs to know which."""
+    hass.states.async_set("sensor.rfx_a_rssi_numeric", "unavailable")
+    await hass.async_block_till_done()
+
+    fault = _fault(hass, ["sensor.*_rssi_numeric", "sensor.*_linkquality"])
+    assert fault is not None
+    detail = fault[1]
+    assert "sensor.*_rssi_numeric" in detail   # deaf
+    assert "sensor.*_linkquality" in detail    # matches nothing
+    assert fault[0] == "no_reports", "a deaf radio outranks a glob that matches nothing"

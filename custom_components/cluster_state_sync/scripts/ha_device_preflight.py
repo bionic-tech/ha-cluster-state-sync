@@ -344,6 +344,24 @@ def main(argv: list[str] | None = None) -> int:
     plan = plan_preflight(args.storage, present)
     if not plan.to_disable:
         out.write("\nEvery referenced device is present. Nothing to disable.\n")
+        # 🚨 Clear the marker on the way out, or a clean pre-flight leaves the
+        # PREVIOUS one standing.
+        #
+        # `_write_marker` already removes it for an empty plan and its docstring
+        # promises that happens on every apply -- but this early return meant a
+        # clean run never reached `apply_plan`, so the promise was never kept.
+        #
+        # The marker that outlives its problem is not usually this node's own.
+        # The go-bag carries `.storage` wholesale, so a promotion installs the
+        # PEER's marker, and this node then reports the peer's missing radios
+        # as its own. Observed on the reference pair 2026-09-20: node-a held
+        # all five devices with every entry enabled and raised
+        # `devices_disabled` describing node-b's promotion six hours
+        # earlier (GOTCHAS 31).
+        #
+        # Guarded on `--apply`: a dry run must change nothing, marker included.
+        if args.apply:
+            _write_marker(args.storage, plan)
         return 0
 
     out.write(f"\n{len(plan.to_disable)} config entr(ies) reference absent hardware:\n")

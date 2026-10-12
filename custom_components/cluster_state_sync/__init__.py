@@ -35,10 +35,11 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+import fnmatch
 import json
 import logging
 import pathlib
-from typing import Any
+from typing import Any, Final
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
@@ -48,6 +49,8 @@ from homeassistant.const import (
     RESTART_EXIT_CODE,
     STATE_OFF,
     STATE_ON,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
     Platform,
 )
 from homeassistant.core import (
@@ -152,6 +155,7 @@ from .const import (
     DEGRADED_MARKER_NAME,
     DOMAIN,
     FINAL_FLUSH_TIMEOUT,
+    INTEGRATION_VERSION,
     LEGACY_DEFAULT_INCLUDE_DOMAINS,
     LEGACY_DEFAULT_NOTIFY_CONDITIONS,
     MAX_ATTRIBUTE_BYTES,
@@ -166,6 +170,7 @@ from .const import (
     NOTIFY_DEVICES_DISABLED,
     NOTIFY_FILESET_DEGRADED,
     NOTIFY_INGRESS_UNREACHABLE,
+    NOTIFY_RADIO_SILENT,
     NOTIFY_RESTORED_NOTHING,
     NOTIFY_STATISTICS_GAP,
     NOTIFY_STATISTICS_NOT_SEEDED,
@@ -178,6 +183,7 @@ from .const import (
     SERVICE_CLEAR_DEGRADED,
     SERVICE_FLUSH_SNAPSHOT,
     STALE_SNAPSHOT_FRACTION,
+    watch_patterns,
 )
 from .coordinator import BackendHealthCoordinator, ClusterViewCoordinator, SyncStats
 from .crypto import (
@@ -188,7 +194,15 @@ from .crypto import (
 )
 from .fileset import FilesetPublisher
 from .gating import ServiceGate
-from .hold import AUTO_HOLD_SECONDS, clear_auto_hold, read_hold, set_auto_hold
+from .hold import (
+    AUTO_HOLD_MARKER,
+    AUTO_HOLD_SECONDS,
+    auto_hold_body,
+    clear_auto_hold,
+    hold_origin,
+    read_hold,
+    set_auto_hold,
+)
 from .ingress import (
     INGRESS_FAILURES_BEFORE_ALARM,
     INGRESS_PROBE_INTERVAL,
@@ -621,6 +635,24 @@ async def _setup_fileset_replication(
                 )
             )
 
+            # 🚨 One publish shortly after start, so the age gauge is a NUMBER
+            # rather than `unknown` for the first whole interval.
+            #
+            # `last_success_at` lives in this publisher's memory, so every
+            # restart and every options save reset it — and the panel then read
+            # "Config fileset: unknown" on a leader whose go-bag in the store
+            # was perfectly current. Worse, that blank is indistinguishable
+            # from "publishing is broken", which is the absence-and-failure
+            # signal this project treats as a defect in its own right.
+            #
+            # DELAYED, not immediate: a scan of several thousand files
+            # competing with Home Assistant's own startup would trade a
+            # cosmetic gap for a slower boot. Leader-gated by
+            # `_scheduled_fileset` itself, so a standby still does nothing.
+            runtime[DATA_UNSUB].append(
+                async_call_later(hass, FILESET_FIRST_PUBLISH_DELAY, _scheduled_fileset)
+            )
+
     runtime[DATA_FILESET] = publisher
 
 
@@ -832,6 +864,70 @@ async def _setup_degraded_alarm(
         ir.async_delete_issue(hass, DOMAIN, "fileset_degraded")
 
 
+async def _setup_bundle_check(
+    hass: HomeAssistant, runtime: dict[str, Any], backend: ClusterBackend
+) -> None:
+    """Raise a repair when the HOST bundle and this integration disagree.
+
+    🚨 HACS updates the integration and NOT the host bundle, so the default
+    upgrade path leaves them mismatched. A 0.6.0 integration against a 0.5.x
+    promoter publishes a cluster-wide hold that no promoter reads: the hold
+    appears set and binds nothing, which is the accident of GOTCHAS 29
+    recreated by its own fix.
+
+    A repair rather than a log line. This needs somebody to run `install.sh`,
+    it does not resolve on its own, and a message that scrolls past is how the
+    mismatch survives long enough to matter.
+    """
+
+    async def _check(_now: datetime) -> None:
+        promoters = await backend.read_promoters()
+        stale = {
+            node
+            for node, entry in promoters.items()
+            if entry.get("legacy_bundle")
+            or (
+                entry.get("bundle_version")
+                and INTEGRATION_VERSION
+                and entry["bundle_version"] != INTEGRATION_VERSION
+            )
+        }
+        if not stale:
+            ir.async_delete_issue(hass, DOMAIN, "bundle_version_mismatch")
+            return
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            "bundle_version_mismatch",
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="bundle_version_mismatch",
+            translation_placeholders={
+                "nodes": ", ".join(sorted(stale)),
+                "version": INTEGRATION_VERSION or "unknown",
+            },
+        )
+
+    async def _guarded(now: datetime) -> None:
+        try:
+            await _check(now)
+        except Exception:  # noqa: BLE001 — see _guarded_ingress_probe
+            _LOGGER.exception("Bundle version check failed; will retry next interval")
+
+    runtime[DATA_UNSUB].append(
+        async_track_time_interval(
+            hass,
+            _guarded,
+            timedelta(seconds=BUNDLE_CHECK_INTERVAL),
+            name=f"{DOMAIN}_bundle_check",
+            cancel_on_shutdown=True,
+        )
+    )
+    # Once shortly after start too, so a mismatch is reported on the upgrade
+    # that caused it rather than up to an hour later.
+    runtime[DATA_UNSUB].append(async_call_later(hass, FILESET_FIRST_PUBLISH_DELAY, _guarded))
+
+
 async def _setup_ingress_probe(
     hass: HomeAssistant,
     cfg: dict[str, Any],
@@ -954,6 +1050,64 @@ async def _setup_ingress_probe(
             cancel_on_shutdown=True,
         )
     )
+
+    async def _scheduled_radio_check(_now: datetime) -> None:
+        """Alert when the radio watch is deaf or watching nothing.
+
+        🚨 **Leader-gated, and that is not an optimisation.** A cold standby has
+        no radios at all -- its Home Assistant is stopped, and even running it
+        would match nothing -- so an ungated check would alarm continuously on
+        the node where silence is the correct state. The ingress probe is gated
+        for the same reason and it is the same mistake either way.
+        """
+        if not await leadership.async_is_leader():
+            return
+        alerts_router: AlertRouter | None = runtime.get(DATA_ALERTS)
+        if alerts_router is None:
+            return
+        fault = _radio_watch_fault(hass, watch_patterns(cfg))
+        if fault is None:
+            await alerts_router.async_clear(
+                NOTIFY_RADIO_SILENT,
+                "Radios are being heard again",
+                "The radio watch is reporting usable values.",
+            )
+            return
+        status, detail = fault
+        await alerts_router.async_raise(
+            NOTIFY_RADIO_SILENT,
+            "The radios have gone quiet and nothing has failed over",
+            (
+                f"{detail}\n\n"
+                "NOTHING WILL FAIL OVER FOR THIS, by design: promoting because a "
+                "radio died would move the house onto a node whose radios may be "
+                "no better, and on this topology the standby has none at all.\n\n"
+                "Home Assistant can be perfectly healthy while every radio behind "
+                "it is dead -- a Zigbee daemon on this project segfaulted and "
+                "stayed dead for nine days while every check stayed green. Check "
+                "the radio daemon itself (is the container running? did its USB "
+                "device come back after the last reboot?), not Home Assistant.\n\n"
+                f"Watch status: {status}."
+            ),
+        )
+
+    async def _guarded_radio_check(now: datetime) -> None:
+        """Same guard, same reason as `_guarded_ingress_probe` above."""
+        try:
+            await _scheduled_radio_check(now)
+        except Exception:  # noqa: BLE001 -- see _guarded_ingress_probe's docstring
+            _LOGGER.exception("Radio watch check failed unexpectedly; will retry next interval")
+
+    if watch_patterns(cfg):
+        runtime[DATA_UNSUB].append(
+            async_track_time_interval(
+                hass,
+                _guarded_radio_check,
+                timedelta(seconds=RADIO_CHECK_INTERVAL),
+                name=f"{DOMAIN}_radio_check",
+                cancel_on_shutdown=True,
+            )
+        )
     # Not probed here, on purpose. Setup runs before Home Assistant has
     # finished starting, so its own HTTP is not yet serving and a proxy in
     # front of it would legitimately answer 502 -- an alarm raised by the
@@ -1139,13 +1293,22 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 notify_migrated.append(label)
 
         if notify_migrated:
+            # Names what it ACTUALLY added rather than a hardcoded condition.
+            # `DEFAULT_NOTIFY_CONDITIONS` has grown twice now, and a message
+            # that keeps announcing the first addition would be describing a
+            # migration that no longer matches what it performed -- the class
+            # of message ADR-008 forbids, asserting a fact the code did not
+            # establish.
+            added = ", ".join(
+                sorted(set(DEFAULT_NOTIFY_CONDITIONS) - LEGACY_DEFAULT_NOTIFY_CONDITIONS)
+            )
             _LOGGER.info(
-                "Migrating config entry to v%d: added `ingress_unreachable` to "
-                "the alert conditions in %s. Without it the cluster notices that "
-                "nobody can reach the house and says nothing -- it shows a card "
-                "here and sends no push. Untick it in the options flow if that "
-                "is not what you want.",
+                "Migrating config entry to v%d: added %s to the alert conditions "
+                "in %s. Without them the cluster notices something and says "
+                "nothing -- it shows a card here and sends no push. Untick any "
+                "of them in the options flow if that is not what you want.",
                 CONFIG_ENTRY_VERSION,
+                added,
                 " and ".join(notify_migrated),
             )
         else:
@@ -1483,6 +1646,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await _surface_preflight_disables(hass, runtime)
 
     await _setup_ingress_probe(hass, cfg, runtime, leadership)
+    await _setup_bundle_check(hass, runtime, backend)
 
     # 4. On stop, write a final snapshot — the gift the dying node leaves the
     #    standby. AR-0016: this is the *only* shutdown flush path. v0.1 had two
@@ -1542,20 +1706,42 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
         if leading and hass.exit_code == RESTART_EXIT_CODE:
-            if set_auto_hold(hass.config.path()):
+            # In an executor: this writes a file on whatever `/config` happens
+            # to be, and Home Assistant flags blocking I/O on the event loop
+            # with a link inviting a bug report. `binary_sensor.py` already
+            # reads the same flag this way and says so in its docstring; these
+            # two call sites simply missed it, and a real install logged the
+            # warning at every restart.
+            body = auto_hold_body(AUTO_HOLD_SECONDS, node_id)
+            if await hass.async_add_executor_job(
+                set_auto_hold, hass.config.path(), AUTO_HOLD_SECONDS, node_id
+            ):
+                # Publish the IDENTICAL bytes, with a key TTL matching the
+                # `expires:` line inside them. Re-rendering here would give the
+                # two halves two different deadlines, and the half that
+                # outlived the other would hold a cluster nobody meant to hold.
+                #
+                # The TTL is the belt to `expires:`'s braces: if this node never
+                # comes back, the key lapses on the server without anyone
+                # having to be alive to clear it.
+                published = await backend.publish_cluster_hold(body, ttl_seconds=AUTO_HOLD_SECONDS)
                 _LOGGER.info(
                     "Home Assistant is restarting: holding failover for %ds so this "
                     "does not look like a dead node. The hold expires on its own if "
                     "Home Assistant does not come back, so a genuine crash still "
-                    "fails over.",
+                    "fails over.%s",
                     AUTO_HOLD_SECONDS,
+                    ""
+                    if published
+                    else " NOTE: it could not be published cluster-wide, so the peer "
+                    "is not held and may promote while this node restarts.",
                 )
 
         # Hand the lease back on the way out so the peer promotes immediately
         # rather than waiting out the TTL -- unless the operator has said this
         # is planned work rather than a departure, or we have just said so
         # ourselves on the line above.
-        if not await _hold_blocks_release(hass, hass.config.path(), "shutdown"):
+        if not await _hold_blocks_release(hass, hass.config.path(), "shutdown", backend):
             await _release_leadership(backend, node_id)
 
     runtime[DATA_UNSUB].append(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _on_stop))
@@ -1658,7 +1844,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # We are back, so the hold we set on the way out has done its job. Only
     # ours is removed -- `clear_auto_hold` checks for our marker, because a
     # hold set by a person while we were down is theirs to clear.
-    if clear_auto_hold(hass.config.path()):
+    cleared_local = await hass.async_add_executor_job(clear_auto_hold, hass.config.path())
+    cleared_cluster = await _clear_auto_hold_cluster_wide(backend)
+    if cleared_local or cleared_cluster:
         _LOGGER.info(
             "Cleared the automatic maintenance hold set when Home Assistant restarted; "
             "failover is live again."
@@ -1674,7 +1862,124 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return True
 
 
-async def _hold_blocks_release(hass: HomeAssistant, config_dir: str, why: str) -> bool:
+#: How often the radio watch is evaluated for an alertable fault. Five minutes,
+#: not the ingress probe's cadence: this reads `hass.states` rather than making
+#: a request, but nothing about a deaf radio changes in seconds, and a check
+#: that runs oftener than the thing it watches can change is just noise.
+RADIO_CHECK_INTERVAL: Final = 300
+
+#: How long after setup the first fileset publish runs. Long enough to stay out
+#: of Home Assistant's startup, short enough that the age gauge is real well
+#: inside the first ordinary interval.
+FILESET_FIRST_PUBLISH_DELAY: Final = 20
+
+#: How often the host bundle's version is compared against this integration's.
+#: Hourly: it only changes when somebody installs something, and a mismatch is
+#: a standing condition rather than an event.
+BUNDLE_CHECK_INTERVAL: Final = 3600
+
+
+def _radio_watch_fault(hass: HomeAssistant, patterns: list[str]) -> tuple[str, str] | None:
+    """`(status, detail)` when ANY watched radio is in an unambiguous fault.
+
+    🚨 **Each pattern is judged on its own, and that is the whole point.**
+
+    `RadioSilenceSensor` pools every pattern into one number -- `max(stamps)`
+    across everything matched -- so the freshest radio in the house sets the
+    reading. On the reference fleet that is 525 RFXtrx entities against 6
+    deCONZ ones: Zigbee can be stone dead for nine days while the pooled signal
+    stays perfectly healthy on RF traffic. Adding a Zigbee glob to a pooled
+    watch would have looked like coverage and delivered none.
+
+    So a watch of `["sensor.*_rssi_numeric", "sensor.*_zigbee_*"]` is two
+    questions, not one, and either going quiet is a fault.
+
+    **Never on silence alone.** The sensor deliberately refuses to pick a
+    threshold and it is right to: a quiet house at 4am legitimately produces no
+    RF for hours, and this project has already called a 9-hour gap an outage on
+    a fleet whose normal maximum was 9.3 hours. Guessing a number manufactures
+    exactly the false alarm that teaches an operator to ignore the real one.
+
+    Only the two states that need no threshold to interpret:
+
+    * **deaf** -- the pattern matched entities and not one carries a usable
+      value. A dead radio daemon takes its integration's entities to
+      `unavailable`, which is precisely this.
+    * **watching nothing** -- the pattern matches no entity at all. It reads as
+      configured and reports on nothing, which is worse than off.
+
+    Mirrors `RadioSilenceSensor._watched` per pattern; `test_the_alert_and_the_
+    sensor_agree` pins them together.
+    """
+    if not patterns:
+        return None
+    faults: list[tuple[str, str]] = []
+    for pattern in patterns:
+        matched = 0
+        reporting = 0
+        for state in hass.states.async_all():
+            if not fnmatch.fnmatch(state.entity_id, pattern):
+                continue
+            matched += 1
+            if state.state not in (None, "", STATE_UNKNOWN, STATE_UNAVAILABLE):
+                reporting += 1
+        if reporting:
+            continue
+        if matched:
+            faults.append(
+                (
+                    "no_reports",
+                    f"`{pattern}` matched {matched} entit"
+                    f"{'y' if matched == 1 else 'ies'} and not one has a usable "
+                    f"value — that radio is not being heard.",
+                )
+            )
+        else:
+            faults.append(
+                (
+                    "no_matches",
+                    f"`{pattern}` matches no entity at all, so it is reporting on "
+                    "nothing while looking configured.",
+                )
+            )
+    if not faults:
+        return None
+    # `no_reports` first: a deaf radio is an outage, a glob matching nothing is
+    # a configuration error. Both are worth raising; they are not equally urgent.
+    faults.sort(key=lambda f: f[0] != "no_reports")
+    status = faults[0][0]
+    return status, "\n".join(detail for _, detail in faults)
+
+
+async def _clear_auto_hold_cluster_wide(backend: ClusterBackend) -> bool:
+    """Remove a cluster-wide hold this integration set, and only one it set.
+
+    🚨 The marker check is the safety, exactly as it is in `clear_auto_hold`
+    for the local file — and it matters more here, because this key binds the
+    PEER. Clearing an operator's cluster-wide hold on our way up would resume
+    failover on a node they are still working on, and they would have no
+    reason to suspect it: they set the hold on one machine and a different
+    machine removed it.
+
+    A hold with no marker is somebody's, so it stays. Every failure answers
+    False and leaves the key alone, which errs toward a hold outliving its
+    purpose rather than one vanishing mid-maintenance.
+    """
+    try:
+        text = await backend.read_cluster_hold()
+    except Exception:  # noqa: BLE001 — a backend that cannot answer clears nothing
+        return False
+    if text is None or AUTO_HOLD_MARKER not in text:
+        return False
+    return await backend.clear_cluster_hold()
+
+
+async def _hold_blocks_release(
+    hass: HomeAssistant,
+    config_dir: str,
+    why: str,
+    backend: ClusterBackend | None = None,
+) -> bool:
     """Should this shutdown keep the lease rather than hand it back?
 
     Handing the lease back on a clean stop is right for a shutdown and wrong
@@ -1686,11 +1991,25 @@ async def _hold_blocks_release(hass: HomeAssistant, config_dir: str, why: str) -
     happens in milliseconds, long before any promoter tick could intervene, so
     a hold that suspended the promoter but not this would still hand the
     cluster away on every restart.
+
+    🚨 **Both halves, for exactly that reason.** A hold the PEER raised binds
+    this node too, and this is the behaviour that fires first and fastest. A
+    version of this that consulted only the local file would hand the lease
+    away in milliseconds during maintenance somebody had correctly declared --
+    the same one-sided failure as GOTCHAS 29, reopened at the one point where
+    no promoter tick is fast enough to catch it.
     """
     # Executor, not the loop: this is blocking file I/O and Home Assistant
     # flags it as such. Cheap, but shutdown is exactly when the loop is
     # busiest.
     held, raw = await hass.async_add_executor_job(read_hold, config_dir)
+    if not held and backend is not None:
+        try:
+            shared = await backend.read_cluster_hold()
+        except Exception:  # noqa: BLE001 — an unreachable backend is not a hold
+            shared = None
+        if shared is not None:
+            held, raw = True, f"cluster-wide, set by {hold_origin(shared) or 'an unnamed node'}"
     if not held:
         return False
     reason = raw or "no reason given"
@@ -1826,7 +2145,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             # node_id, so keeping the lease is not a lie: this node is still
             # the leader and is about to prove it by renewing.
             _LOGGER.debug("Reloading on an options change; keeping the lease")
-        elif not await _hold_blocks_release(hass, hass.config.path(), "reload"):
+        elif not await _hold_blocks_release(hass, hass.config.path(), "reload", backend):
             await _release_leadership(backend, node_id)
         await backend.close()
     return True

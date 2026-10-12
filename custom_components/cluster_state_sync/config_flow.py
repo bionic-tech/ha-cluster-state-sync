@@ -942,6 +942,19 @@ def _alerts_schema(d: dict[str, Any], hass: HomeAssistant) -> vol.Schema:
                     mode=SelectSelectorMode.DROPDOWN,
                 )
             ),
+            # 🚨 Here, and not only in the wizard, because `radio_silent` is
+            # unconfigurable without it. The alert was shipped in 0.6.1 with
+            # its watch reachable ONLY from the wizard -- so an existing
+            # install could tick the condition and had no way to say what
+            # counts as a radio. A control whose input cannot be reached is
+            # not a control.
+            #
+            # It sits on the ALERTS page rather than its own: what to watch
+            # and who to tell are one decision, and separating them is how
+            # somebody ticks the alert and never sets the watch.
+            vol.Optional(CONF_RADIO_WATCH, default=d.get(CONF_RADIO_WATCH) or []): SelectSelector(
+                SelectSelectorConfig(options=[], multiple=True, custom_value=True)
+            ),
         }
     )
 

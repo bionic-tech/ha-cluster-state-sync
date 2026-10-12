@@ -55,6 +55,59 @@ def hold_path(config_dir: str) -> pathlib.Path:
     return pathlib.Path(config_dir) / HOLD_FILENAME
 
 
+#: Structured lines inside a hold's text. Everything that is not one of these
+#: is the human reason.
+#:
+#: There is ONE text format, used by the local file and by the cluster-wide key
+#: alike, so that a hold reads the same wherever it is found and there is only
+#: one parser to keep honest. `cluster_promoter.py` mirrors this parsing rather
+#: than importing it (ADR-005); `test_hold_format_agreement.py` fails if the two
+#: ever disagree.
+ORIGIN_PREFIX = "origin:"
+EXPIRES_PREFIX = "expires:"
+
+
+def hold_body(reason: str, *, origin: str | None = None, expires: str | None = None) -> str:
+    """Render a hold's text. The only place this format is written.
+
+    `origin` is the node that raised the hold. It is not decoration: a
+    cluster-wide hold is visible on a node that did not set it, and "who do I
+    go to in order to clear this" is the first question the operator asks.
+    """
+    lines = [reason.strip()] if reason.strip() else []
+    if origin:
+        lines.append(f"{ORIGIN_PREFIX} {origin}")
+    if expires:
+        lines.append(f"{EXPIRES_PREFIX} {expires}")
+    return "\n".join(lines) + "\n"
+
+
+def hold_origin(text: str) -> str | None:
+    """Which node raised this hold, or None if it did not say.
+
+    None is expected, not exceptional: a hold set by `touch`, or by any version
+    before the cluster-wide key existed, carries no origin. Callers say
+    "unknown", never guess.
+    """
+    for line in text.splitlines():
+        if line.strip().startswith(ORIGIN_PREFIX):
+            return line.strip()[len(ORIGIN_PREFIX) :].strip() or None
+    return None
+
+
+def hold_deadline(text: str) -> str | None:
+    """The `expires:` value as written, or None for a hold that never expires.
+
+    Returned as text rather than a datetime because the promoter logs it back
+    verbatim, and because a malformed deadline must survive to be reported
+    rather than being turned into an exception here.
+    """
+    for line in text.splitlines():
+        if line.strip().startswith(EXPIRES_PREFIX):
+            return line.strip()[len(EXPIRES_PREFIX) :].strip() or None
+    return None
+
+
 def is_held(config_dir: str) -> bool:
     """Is maintenance mode on?
 
@@ -80,6 +133,21 @@ def read_hold(config_dir: str) -> tuple[bool, str]:
     return is_held(config_dir), hold_reason(config_dir)
 
 
+def reason_of(text: str) -> str:
+    """The human half of a hold's text, with the structured lines removed.
+
+    Split out from `hold_reason` so the cluster-wide key -- which is not a file
+    -- gets the same treatment. Without this the switch's `reason` attribute
+    would read "set from the Home Assistant dashboard origin: node-a", which is
+    the machinery leaking into the one field a person actually reads.
+    """
+    return "\n".join(
+        line
+        for line in text.splitlines()
+        if not line.strip().startswith((ORIGIN_PREFIX, EXPIRES_PREFIX))
+    ).strip()
+
+
 def hold_reason(config_dir: str) -> str:
     """Whatever the operator wrote in the flag file, for the log and the sensor.
 
@@ -88,7 +156,19 @@ def hold_reason(config_dir: str) -> str:
     days later can explain itself, not as a requirement.
     """
     try:
-        return hold_path(config_dir).read_text(encoding="utf-8", errors="replace").strip()
+        return reason_of(hold_path(config_dir).read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return ""
+
+
+def hold_text(config_dir: str) -> str:
+    """The flag file's raw text, structured lines included.
+
+    `hold_reason` deliberately strips those; callers that need the origin --
+    the binary sensor, which reports who raised a hold -- need them kept.
+    """
+    try:
+        return hold_path(config_dir).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
 
@@ -100,7 +180,7 @@ def hold_reason(config_dir: str) -> str:
 UI_HOLD_REASON = "set from the Home Assistant dashboard"
 
 
-def set_hold(config_dir: str, reason: str = UI_HOLD_REASON) -> None:
+def set_hold(config_dir: str, reason: str = UI_HOLD_REASON, origin: str | None = None) -> None:
     """Raise the maintenance hold. Raises OSError if it cannot be written.
 
     Unlike the readers above, this does NOT fail soft. A hold that silently
@@ -111,10 +191,16 @@ def set_hold(config_dir: str, reason: str = UI_HOLD_REASON) -> None:
 
     Written whole, then renamed, so a promoter tick that reads the file while
     it is being written cannot see a partial reason.
+
+    🚨 **This writes the LOCAL half only.** The cluster-wide half is the
+    caller's to publish, because it needs a backend and this module is
+    deliberately stdlib-only. Setting the local file without publishing is
+    exactly the one-sided hold of GOTCHAS 29 -- see `async_set_hold` in
+    `__init__.py`, which is the pairing every caller should use.
     """
     target = hold_path(config_dir)
     tmp = target.with_suffix(f".tmp{os.getpid()}")
-    tmp.write_text(f"{reason}\n", encoding="utf-8")
+    tmp.write_text(hold_body(reason, origin=origin), encoding="utf-8")
     tmp.replace(target)
 
 
@@ -156,7 +242,25 @@ AUTO_HOLD_MARKER = "cluster_state_sync:auto-hold"
 AUTO_HOLD_SECONDS = 300
 
 
-def set_auto_hold(config_dir: str, seconds: int = AUTO_HOLD_SECONDS) -> bool:
+def auto_hold_body(seconds: int = AUTO_HOLD_SECONDS, origin: str | None = None) -> str:
+    """The text an automatic hold carries, rendered once for both halves.
+
+    Returned rather than written so the caller can publish the identical bytes
+    to the cluster-wide key. Two renderings of "the same" auto-hold is how the
+    local file and the shared key end up disagreeing about when it expires.
+    """
+    deadline = datetime.now(UTC) + timedelta(seconds=seconds)
+    return hold_body(
+        f"{AUTO_HOLD_MARKER}\n"
+        "Home Assistant is restarting; failover is held until it returns.",
+        origin=origin,
+        expires=deadline.isoformat(),
+    )
+
+
+def set_auto_hold(
+    config_dir: str, seconds: int = AUTO_HOLD_SECONDS, origin: str | None = None
+) -> bool:
     """Hold failover across a restart this integration is about to perform.
 
     Returns True if a hold was written. Returns False, and writes nothing, when
@@ -168,13 +272,7 @@ def set_auto_hold(config_dir: str, seconds: int = AUTO_HOLD_SECONDS) -> bool:
         path = hold_path(config_dir)
         if path.is_file():
             return False
-        deadline = datetime.now(UTC) + timedelta(seconds=seconds)
-        path.write_text(
-            f"{AUTO_HOLD_MARKER}\n"
-            f"Home Assistant is restarting; failover is held until it returns.\n"
-            f"expires: {deadline.isoformat()}\n",
-            encoding="utf-8",
-        )
+        path.write_text(auto_hold_body(seconds, origin), encoding="utf-8")
     except OSError:
         # Never fatal, and silent like the rest of this module. Failing to set
         # the hold means a restart behaves as it did before this existed, which

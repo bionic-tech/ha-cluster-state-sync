@@ -9,6 +9,7 @@ note itself.
 
 | Version | Tag | What it was for |
 |---|---|---|
+| **0.6.0** | [`v0.6.0`](docs/releases/v0.6.0.md) | The 2026-09-18 incident: an operator set the maintenance hold before rebooting the leader, exactly as documented, and the house moved anyway. The hold could not reach the peer, and `BACKUP` did not mean stopped. Both fixed, along with six defects found while testing the fix — including a reconcile that shipped as **dead code** while every test passed. 🚨 **Upgrade the integration and the host bundle together.** |
 | **0.5.3** | [`v0.5.3`](docs/releases/v0.5.3.md) | Verified against every Home Assistant release it claims to support — 2026.6.4 through 2026.9.2, each a full suite run — and now says so. Found that 2026.9 swapped `voluptuous` for `probatio` under the same import name, which no symbol check and no breaking-changes section would show you. |
 | **0.5.2** | [`v0.5.2`](docs/releases/v0.5.2.md) | Two defects in the machinery that reports defects: a reload re-announced every alert that was still true, and the TLS context was built on the event loop. Plus the promoter drowning its own journal, and a diagnostics platform you read before you send. |
 | **0.5.1** | [`v0.5.1`](docs/releases/v0.5.1.md) | Written the morning after a real 61-minute outage in which detection worked perfectly and nobody was told. `ingress_unreachable` now reaches existing installs, and the alert says that nothing will act on it. |

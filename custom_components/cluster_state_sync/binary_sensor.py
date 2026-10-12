@@ -22,7 +22,7 @@ from .const import (
 from .coordinator import BackendHealthCoordinator, ClusterViewCoordinator
 from .entity import ClusterSyncDiagnosticEntity, ClusterViewEntity
 from .fileset import FilesetPublisher
-from .hold import hold_path, read_hold
+from .hold import hold_origin, hold_path, hold_text, read_hold, reason_of
 from .ingress import IngressProbe
 
 
@@ -218,6 +218,8 @@ class MaintenanceHoldBinarySensor(ClusterSyncDiagnosticEntity, BinarySensorEntit
         self._config_dir = config_dir
         self._held = False
         self._reason = ""
+        self._scope = "none"
+        self._origin = ""
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
@@ -235,10 +237,40 @@ class MaintenanceHoldBinarySensor(ClusterSyncDiagnosticEntity, BinarySensorEntit
         super()._handle_coordinator_update()
 
     async def _async_refresh_hold(self) -> None:
+        """Read both halves — the local flag and the cluster-wide key.
+
+        The cluster half is read through the coordinator's backend rather than
+        a second connection. A node can be held by a hold it did not set, and
+        before 0.6.0 this entity could not see that at all: it reported a
+        healthy cluster while the peer sat suspended.
+        """
+        local_text = await self.hass.async_add_executor_job(hold_text, self._config_dir)
         held, reason = await self.hass.async_add_executor_job(read_hold, self._config_dir)
-        if (held, reason) != (self._held, self._reason):
-            self._held, self._reason = held, reason
+        shared = await self._async_cluster_hold()
+
+        if shared is not None:
+            held, reason = True, reason_of(shared)
+            scope, origin = "cluster", (hold_origin(shared) or "unknown")
+        elif held:
+            scope, origin = "local", (hold_origin(local_text) or "unknown")
+        else:
+            scope, origin = "none", ""
+
+        if (held, reason, scope, origin) != (self._held, self._reason, self._scope, self._origin):
+            self._held, self._reason, self._scope, self._origin = held, reason, scope, origin
             self.async_write_ha_state()
+
+    async def _async_cluster_hold(self) -> str | None:
+        """The cluster-wide hold, or None — never raising.
+
+        A diagnostic that raised here would take the coordinator update with
+        it, so a backend blip would stop this entity reporting the very state
+        it exists to report.
+        """
+        try:
+            return await self.coordinator.backend.read_cluster_hold()
+        except Exception:  # noqa: BLE001 — a diagnostic never breaks the poll
+            return None
 
     @property
     def is_on(self) -> bool:
@@ -254,6 +286,11 @@ class MaintenanceHoldBinarySensor(ClusterSyncDiagnosticEntity, BinarySensorEntit
     def extra_state_attributes(self) -> dict[str, str | None]:
         return {
             "reason": (self._reason or "no reason given") if self._held else None,
+            # Scope answers "does this bind the peer too", which is the
+            # question a one-sided hold silently answered wrong. `set_by`
+            # answers "where do I go to clear it".
+            "scope": self._scope if self._held else None,
+            "set_by": (self._origin or "unknown") if self._held else None,
             "flag_file": str(hold_path(self._config_dir)),
         }
 

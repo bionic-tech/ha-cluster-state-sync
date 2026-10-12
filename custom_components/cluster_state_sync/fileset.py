@@ -260,7 +260,23 @@ def scan(
     for rel, path in _candidates(root, extra_paths):
         if is_excluded(rel, exclusions):
             continue
-        stat = path.stat()
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            # 🚨 The config directory is live, and Home Assistant writes to it
+            # while we walk it. It saves `.storage` atomically -- write
+            # `tmpXXXXXXXX`, then rename over the target -- so a file listed a
+            # moment ago can be gone by the time we stat it.
+            #
+            # This aborted the entire publish. Observed on the live pair on
+            # 2026-09-11 and 2026-09-15, each time on a `.storage/tmp*` that
+            # Home Assistant had already renamed away. The go-bag simply was
+            # not republished that interval.
+            #
+            # A file that no longer exists cannot be part of the fileset, so
+            # skipping it is not a compromise -- it is the correct answer. The
+            # next scan sees whatever the rename produced.
+            continue
         total += stat.st_size
         if max_bytes is not None and total > max_bytes:
             raise FilesetTooLarge(f"fileset exceeds {max_bytes} bytes at {rel}; nothing published")

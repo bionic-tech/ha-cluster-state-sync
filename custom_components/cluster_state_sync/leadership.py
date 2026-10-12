@@ -111,11 +111,30 @@ class LeadershipMonitor:
             return False
         return state.state.lower() in _TRUTHY_STATES
 
+    async def async_is_held(self) -> bool:
+        """Is failover suspended here — by this node, or by the cluster?
+
+        Either half is enough, and that asymmetry is the fix for GOTCHAS 29.
+        The local file alone could not express a hold set on the peer, and in
+        the cold model the peer is where the only running dashboard is. The
+        shared key alone would stop working the moment the backend did, taking
+        the hold down with it -- during exactly the backend maintenance a hold
+        is most wanted for.
+
+        Neither read raises. `read_hold` answers None on any failure, and a
+        node that cannot reach the backend cannot take the lease either, so
+        failing toward "not held" here can never promote anything.
+        """
+        local = self._config_dir is not None and await self._hass.async_add_executor_job(
+            is_held, self._config_dir
+        )
+        if local:
+            return True
+        return await self._backend.read_cluster_hold() is not None
+
     async def _from_lease(self) -> bool:
         try:
-            held = self._config_dir is not None and await self._hass.async_add_executor_job(
-                is_held, self._config_dir
-            )
+            held = await self.async_is_held()
             if held:
                 # Maintenance hold: renew what we hold, never take what is
                 # free. A standby that claims the lease here is the failover

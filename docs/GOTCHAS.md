@@ -1134,3 +1134,406 @@ Order matters, and getting it backwards leaves the cluster with no eligible node
 
 Related: §the hold exists for exactly this, and ADR-006 on why the lease — not a
 second election — decides who is leader.
+
+## 29. 🚨 A held node that reboots returns as a second live instance
+
+**Looked like:** a clean planned reboot. The hold was set from the dashboard,
+the promoter acknowledged it every 10 seconds, node-b promoted on cue, and
+node-a came back. Both then answered on `:8123` for four hours.
+
+**Actually:** observed 2026-09-18. Every step is correct behaviour, and the
+hold is the thing that makes it unrecoverable:
+
+```
+09:05:16  hold written on node-a from the dashboard
+          → the promoter's held branch runs RENEW_ONLY, then `return 0`
+          → it never reaches decide(), so it never demotes, so
+            notify_backup.sh never runs, so `docker stop` never runs
+10:48     node-a reboots. Renewal stops. The lease lapses at its 30s TTL.
+10:49:16  node-b (no hold) finds it free, takes it, promotes
+10:51:27  node-a boots → /run is tmpfs → systemd-tmpfiles writes BACKUP
+10:53:40  Docker's `unless-stopped` restarts homeassistant — nothing had ever
+          explicitly stopped it, so the policy correctly restores it
+10:53:41+ the promoter resumes, still held: previous="BACKUP",
+          holds_lease=False → decide() returns None → no transition
+```
+
+**The hold did not merely fail to stop the container — it prevented the
+demotion that would have.** §28 reaches two live instances through a leader
+restart; this reaches the same place through a *hold plus a reboot*, and unlike
+§28 it cannot self-heal.
+
+🚨 **Removing the hold does not stop the returned node's Home Assistant.**
+`decide()` acts on a *change*, and after the reboot there is none left to make:
+`/run/cluster-sync/vrrp-state` is tmpfs, `cluster-sync-tmpfiles.conf` resets it
+to `BACKUP` at boot, and so the promoter believes the node had already demoted.
+The state file and the container have diverged, and nothing reconciles them.
+`BACKUP-but-running` is a third state in a check that only has two.
+
+**The hold is per-node, and only the shell path says so.** `cluster-hold.sh`
+carries the warning — *"🚨 Set it on BOTH nodes before planned work"* — but the
+panel switch does not, `binary_sensor.maintenance_hold` has no description, and
+the two paths are not the same file:
+
+| node | hold path |
+|---|---|
+| node-a | `/mnt/docker_data/homeassistant/`**`config/`**`.cluster_sync_hold` |
+| node-b | `/mnt/docker_data/homeassistant/.cluster_sync_hold` |
+
+The promoter then prints fleet-wide phrasing for a node-local fact — *"Failover
+is SUSPENDED until it is removed"* — when it is suspended on **that node only**.
+`hold.py` and §6 both say the hold suspends four behaviours "at once", and the
+fourth is *the standby's promoter refusing a free lease*, which a file on the
+leader cannot reach.
+
+**Radio custody then splits, silently.** `post-stop.d/90-virtualhere-release.sh`
+runs only on an orderly demotion, so the returned node's VirtualHere client is
+never stopped. Both clients run with byte-identical `[AutoShare]` rules and
+custody divides between them — observed here as the ConBee II migrating *back*
+to the returned node at 12:36, hours after the live node claimed it at
+10:49:16. Neither node reports this.
+
+**What the hold does still protect.** The returned node reads as a *follower*:
+`leadership.py` routes a held node through `renew_leadership` rather than
+`acquire_leadership`, and the snapshot flush is leader-gated, so it does not
+publish over the live node's go-bag. Its fileset pull writes only to
+`.cluster_sync_staged/`. The damage is confined to radios and automations —
+`gate_automations` defaults to off by design, so both instances run their
+automation engines. *(Inferred from configuration and a live `200`; neither
+logbook was read.)*
+
+**Rule (corrected 2026-09-18, and the correction matters):** the original rule
+here said *"set the hold on both nodes"*. **That instruction could not be
+followed.** In the cold model only one node runs Home Assistant — the standby's
+is deliberately stopped — so the dashboard the operator reaches is the only one
+in existence, and there is no second switch to press. The only route to the
+peer was `cluster-hold.sh` on the host, which is the host-side path this
+project pushes work away from. Blaming the operator for a one-sided hold was
+blaming them for the mechanism.
+
+**Fixed in 0.6.0:** the hold now has two halves — the local file, which keeps
+working when the store does not, and a key in the shared store, which reaches
+the peer. Either suspends failover; setting or clearing from either node does
+both. The promoter names the scope and the origin: *"CLUSTER-WIDE maintenance
+hold, set by node-a"* rather than the old node-local message that read as a
+cluster-wide guarantee it could not give.
+
+🚨 **Both nodes must be on 0.6.0 or later.** A node on an older version neither
+publishes nor reads the shared key, so a mixed pair silently behaves exactly as
+described above.
+
+**The second half, also fixed in 0.6.0 — the reconcile.** A node that rebooted
+under a hold came back with its container running and its state file reset to
+`BACKUP`, and the promoter had no transition to act on, so nothing ever stopped
+it. `decide()` acts on a *change*; there was none left to make. The promoter now
+detects `BACKUP`-but-serving and runs the demotion that never happened —
+expressed as a transition into `BACKUP` so it goes through `notify_backup.sh`
+and its post-stop hooks, rather than a second, separately-maintained way to
+demote.
+
+🚨 **Cold deployments only, and the condition is the whole safety of it.** On a
+warm standby a running Home Assistant is the *correct* state — that is what warm
+means — so firing there would stop the standby's house on every tick and turn
+the fix into the outage. `bundle.py` emits `--reconcile-backup` from the
+deployment's own topology; the promoter never infers it.
+
+Three more conditions, each load-bearing: the lease must not be ours (a node
+taking the lease this tick is *promoting*, and its container should be running);
+the state file must be older than 180s (`notify_backup.sh` writes `BACKUP`
+*before* `docker stop -t 120`, so a demotion in flight looks identical for two
+minutes); and an unanswerable `docker inspect` is never treated as a fault.
+
+**The escape hatch is the hold.** To run Home Assistant on a standby
+deliberately, set the hold — the held branch returns long before the reconcile
+is reached.
+
+### The failback from this state, which §28's four steps do not cover
+
+§28 assumes the demoted node released and its Home Assistant is down. Neither
+holds here: there is no `release-holddown` on either node, because the hold
+prevented the release that writes it — and the returned node's container is
+**running**, which makes `cluster-fileset-swap.sh` refuse (§7) and mark
+`container_running`. Promoting it in that state is a degraded promotion onto
+its own stale `.storage`, discarding everything the live node has done since.
+
+So stop Home Assistant *before* promoting it, not after:
+
+1. `docker stop` on the returned node — the demotion that never ran. This is
+   what reconciles the state file with reality and closes the double-firing
+   window.
+2. Stop its `virtualhereclient.service`, so it releases the devices it has
+   re-claimed.
+3. Clear the hold on it, and confirm the peer has none.
+4. **Current leader:** write a reason into `<config>/.cluster_sync_handover_request`.
+   Its next tick releases the lease, stops HA there, and consumes the request.
+5. The target takes the free lease on its next tick and now swaps cleanly.
+6. **`--adopt` on the node that handed over**, per §28 step 4, or its own
+   hold-down leaves the cluster with no standby.
+
+Stopping at steps 1–2 is a legitimate resting place: it ends the split and
+leaves the cluster on the current leader, at the cost of any node-local
+capability until you do fail back (§18d, and the Local RFXTRX in §28).
+
+Related: §28 is the same destination by a different route; §6 for the four
+behaviours the hold suspends; §7 for why the swap refuses under a live process;
+§17 and §18c for radios re-claimed onto the wrong node.
+
+## 30. 🚨 `install.sh` refused to install on a cold standby, for being a cold standby
+
+**Looked like:** the bundle would not install on node-b. Pre-flight, hard fail:
+
+```
+!!! the D3 probe target http://127.0.0.1:8123/ does not answer from this host.
+    The promoter would read that as a dead Home Assistant, release the lease and
+    run notify_backup.sh -- which stops the container -- for 900s at a time.
+```
+
+**Actually:** found 2026-09-20, deploying 0.6.0. Every word of that message is
+true on a **warm** node and inapplicable on a **cold** one. A cold standby's
+Home Assistant is *deliberately stopped* — that is what cold means — so the
+probe can never answer, so the pre-flight could never pass, on the one node
+that most needs the bundle installed.
+
+The outage it warns about cannot occur there either: D3's release branch
+requires `previous == "MASTER"`, which a warm node reaches and a cold standby
+never does. So the check was not merely inconvenient, it was **guarding against
+a branch that is unreachable in that topology**.
+
+🚩 **Same shape as §29.** A mechanism written for the model where both nodes
+run Home Assistant, applied to the model whose entire premise is that one of
+them does not. The hold could not reach the peer for the same reason this could
+not install on it.
+
+**Rule:** a reading that is a FAULT in one topology and the CORRECT STATE in
+another cannot carry the same verdict. The check now stays fatal on warm and
+becomes a note on cold, and the note says *why* it is continuing — a warning
+the operator cannot evaluate is worse than no warning.
+
+⭐ **The near-miss is the lesson.** The first instinct was to edit the `fail`
+out of the staged copy and carry on with the deploy. That would have shipped a
+working cluster and left the bug in the generator for the next person, who
+would have hit it with no context. Fixing the generator cost twenty minutes and
+a test; the workaround would have cost somebody an evening.
+
+## 31. 🚨 A node reported the PEER's missing radios as its own, for six hours
+
+**Looked like:** `devices_disabled — Promoted without 2 device(s)` on node-a,
+which held all five transceivers with every config entry enabled.
+
+**Actually:** found 2026-09-20. The alarm was describing **node-b**, six
+hours earlier.
+
+```
+/config/.storage/.cluster_sync_preflight.json
+  disabled_at: 20260918T104916   <- node-b's promotion
+  file mtime:  2026-09-18 14:32:38   <- node-a's fileset swap
+  lists:       A1K33YZ, 07VYAMCJ     <- absent on tiger2, PRESENT on tiger1
+```
+
+**The go-bag carries `.storage` wholesale**, marker included. So a promotion
+installs the peer's record of the peer's hardware, and the promoted node reads
+it as local truth.
+
+🚩 **The clearing logic existed and was correct.** `_write_marker` removes the
+file for an empty plan, and its docstring promises exactly this:
+
+> Written on EVERY apply, including one that disabled nothing -- the file is
+> then removed. Otherwise a marker from a previous promotion outlives the
+> problem and the operator is told about radios that came back, which is the
+> quickest way to make somebody stop reading the alert.
+
+**It was never reached.** `_write_marker` is called from `apply_plan`, and
+`main()` returns early on the clean path:
+
+```python
+if not plan.to_disable:
+    out.write("Every referenced device is present. Nothing to disable.\n")
+    return 0          # <- never reaches apply_plan, so never clears the marker
+```
+
+node-a's own pre-flight printed that exact line at 14:33:04 and left the
+peer's marker standing.
+
+**Rule:** a promise in a docstring is not a guarantee in the code. This one was
+written, correct, tested in isolation — and unreachable on the path that
+mattered. ⭐ **When a function documents "on every X", check the callers reach
+it on every X**, because the early return that skips it reads like an
+optimisation rather than a bug.
+
+Related: §29 and §30 are the same family — state or assumptions belonging to one
+node applied on the other. Here the go-bag is the carrier.
+
+## 32. 🚨 The reconcile shipped as dead code, and 1,442 green tests said otherwise
+
+**Looked like:** nothing. `--reconcile-backup` was armed on both nodes, the
+code was deployed, the flag was passed, the promoter ran clean and silent every
+ten seconds. Exactly what a healthy cluster looks like.
+
+**Actually:** found 2026-09-22 by deliberately creating the fault on node-b —
+starting Home Assistant on a node reading BACKUP — and watching the promoter do
+nothing at all.
+
+`_docker_inspector` does not return raw `docker inspect` JSON. It shells out
+with a `--format` template and returns a **flat** dict:
+
+```python
+{"Restarting": bool, "Running": bool, "ExitCode": int | None, "StartedAtEpoch": float}
+```
+
+`_backup_is_serving` read it as nested:
+
+```python
+return bool((info.get("State") or {}).get("Running"))   # -> bool(None) -> False, ALWAYS
+```
+
+So the branch whose entire job is to stop a second live Home Assistant could
+never fire. It shipped that way and ran in production for two days.
+
+🚩 **The tests passed because the fake agreed with the bug.**
+
+```python
+def _inspect(running):
+    return lambda: {"State": {"Running": running}}   # the shape the CODE expected
+```
+
+The fake was written from the same wrong assumption as the code, so it
+confirmed it. This is §8 exactly — *an unfaithful fake made a new guard a
+no-op* — in the one branch where the consequence is the four-hour outage of
+§29.
+
+⭐ **The "verify it bites" check did not catch it either, and that is the part
+worth internalising.** The fix was reverted at the CALL SITE to prove the test
+failed without it. Both states were consistent with a reader that never worked,
+so the test failed for the right reason and the wrong cause. **Proving a test
+fails without your change does not prove it tests reality** — only that it
+tests your change.
+
+**Rule:** where a fake stands in for a parser, pin them together with a contract
+test that drives the REAL parser into the REAL consumer. `test_the_fake_
+inspector_matches_the_real_one` feeds a canned `docker inspect --format` line
+through `_docker_inspector` and asserts `_backup_is_serving` sees a running
+container. Three tests now fail against the shipped bug; none did before.
+
+**And the larger rule, which this project already knew:** AR-0040 was 305 green
+tests hiding a restore that had never worked. This is the same lesson at 1,442.
+⭐ **A suite cannot audit its own assumptions. Only hardware can.** The
+controlled fault on a live standby cost ninety seconds and found what the whole
+suite could not.
+
+Related: §8 (unfaithful fake), §29 (the outage this branch exists to prevent).
+
+## 33. 🚨 One live radio hides every dead one, because the watch pools them
+
+**Looked like:** a healthy radio-silence sensor. Rising and falling normally,
+reporting fresh readings, status `ok`.
+
+**Actually:** found 2026-09-22, deciding where to point the new radio-silence
+alert after deCONZ had been dead nine days (§32's sibling).
+
+`RadioSilenceSensor` answers one question across every configured glob:
+
+```python
+return max(0, int(now - max(stamps)))      # max() across ALL matched entities
+```
+
+So the **freshest** radio in the house sets the number. On this fleet the watch
+is `sensor.*_rssi_numeric` — **525 RFXtrx entities against 6 deCONZ ones.** RF
+traffic alone keeps that reading healthy indefinitely.
+
+🚩 **So the obvious remedy was worse than the gap.** The instinct after the
+deCONZ outage was "add a Zigbee glob to `radio_watch`". That would have pooled
+six Zigbee entities in with five hundred RF ones, produced a sensor that reads
+`ok` while Zigbee is stone dead, and — because the watch now *mentions* Zigbee —
+looked like coverage to anyone auditing the configuration afterwards.
+
+**A blind spot with a label on it is worse than a blind spot.**
+
+**Rule:** where a signal aggregates independent sources, the aggregate cannot
+report any single source failing. `_radio_watch_fault` therefore judges **each
+pattern separately** and names the one in fault:
+
+```
+`sensor.*_battery` matched 2 entities and not one has a usable value
+ — that radio is not being heard.
+```
+
+The sensor still pools, deliberately — it is one number on a dashboard and that
+is what it is for. The *alert* is the thing that has to distinguish, because it
+is the thing that wakes somebody.
+
+⭐ **The general shape:** this is standard #3 — *an empty field is not a zero
+value* — one layer up. A pooled maximum is not a statement about any member of
+the pool, and reading it as one is how a dead radio passes a green check for
+nine days.
+
+Related: §18 (the livelocked daemon the sensor was built for), §32 (the alert
+that could not fire), and the dead-radio entry in the roadmap's known gaps.
+
+## 34. 🚨 The cold standby had no voice, so three readouts said "unknown" forever
+
+**Looked like:** a cluster status panel with three blanks on a perfectly healthy
+pair — `Members seen 1`, `Clock skew unknown`, `Config fileset unknown`. Noticed
+by the owner asking whether that was *supposed* to be like that.
+
+**Actually:** found 2026-09-23. One root cause behind the first two, and a
+second of the same family behind the third.
+
+### The registry is written by the integration, and the standby's is stopped
+
+`cluster_members` and `clock_skew` both read `nodes:*`, refreshed by
+`backend.register_node` — which runs **inside Home Assistant**. On a cold
+standby Home Assistant is deliberately stopped, so that node never registers,
+never appears, and:
+
+* `Members seen` reads **1 on a healthy two-node cold cluster and 1 on a broken
+  one** — absence and failure sharing a signal, standard #4;
+* `clock_skew` needs two offsets and can therefore **never** be computed on a
+  cold deployment. It was not transiently unknown; it was unknowable.
+
+🚩 **ADR-009 had already recorded both facts, and named the fix.** It added the
+promoter heartbeat in 2026-09-08 precisely because *"the promoter is the only
+process running, so it is the only possible reporter"* — and wrote:
+
+> `cluster_members` reads 1 on a *healthy* two-node cold cluster and would read
+> 1 on a broken one too.
+
+**Nothing ever read the heartbeat.** `read_promoter_nodes()` had exactly one
+caller — the *statistics-stalled* alert, asking a different question. So the
+answer sat in the store, refreshed every ten seconds by both nodes, for two
+weeks, and no surface consulted it.
+
+⭐ **A signal written and never read is not observability, it is exhaust.** The
+ADR's chosen mitigation was "harden and make it visible"; it made it *written*.
+The distance between those two words is the whole defect.
+
+**Rule:** the promoter now carries its clock offset in the heartbeat it already
+writes — measured the same way `register_node` does, around a `TIME` call — and
+`node_count` counts a node seen by **either** route. A node reporting through
+both is counted once.
+
+⚠️ **And the reader tolerates the old payload.** Promoters before this wrote a
+bare timestamp; newer ones write JSON. During a rolling upgrade one node writes
+each, and a reader that understood only the new shape would report the
+un-upgraded node as *absent* — turning an upgrade into an apparent node loss, at
+the moment an operator can least tell the difference.
+
+### The fileset age meant two opposite things
+
+`last_success_at` lives in the publisher's memory, so a restart or an options
+save reset it and the panel read `unknown` on a leader whose go-bag was
+perfectly current — and would read exactly the same if publishing had stopped
+dead. Two opposite meanings, one blank.
+
+Now: one publish twenty seconds after setup (delayed, so a scan of several
+thousand files does not compete with Home Assistant's boot), and a `status`
+attribute that distinguishes `awaiting_first_publish` from `refused:too_large`.
+
+⭐ **The measurement that nearly fooled me.** The follower's staged
+`status.json` carries a *fresh* timestamp every minute — which proves the
+follower pulled, not that the leader published. I read it as proof the leader
+was publishing and had to be corrected by watching the generation counter
+actually advance. **A fresh timestamp on the consumer says nothing about the
+producer.**
+
+Related: §32 and §33, both the same week, both signals that existed and reported
+to nobody.

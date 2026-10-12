@@ -21,6 +21,47 @@ way in.** This guide is about that half.
 
 ---
 
+## The panel will not load behind an auth proxy
+
+**Symptom:** everything in Home Assistant works, and opening the cluster panel
+gives *"Unable to load custom panel from .../cluster_status_panel.js"*.
+
+**Cause:** the panel's JavaScript is served from its own path,
+`/cluster_state_sync_panel/`, and an authenticating reverse proxy will challenge
+it unless that path is on its unauthenticated allowlist. Home Assistant's own
+assets usually are — `/static/`, `/manifest.json`, `/auth/` — because whoever
+set the proxy up added them. This path was not on anybody's list.
+
+The frontend itself keeps working, which is what makes it confusing: Home
+Assistant authenticates its API and websocket with its own token, while the
+panel script is an ordinary subresource fetch. The proxy answers that fetch with
+a redirect to a login page, the browser's module loader gets HTML where it
+expected JavaScript, and Home Assistant reports the panel as unloadable.
+
+**It is usually intermittent, and that is the giveaway.** Proxy sessions are
+often short — an hour is common — so the panel loads right after you sign in and
+stops later, while the rest of Home Assistant carries on.
+
+**Confirm it in one command.** From the Home Assistant host:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' \
+  http://127.0.0.1:8123/cluster_state_sync_panel/cluster_status_panel.js
+```
+
+`200` means Home Assistant is serving the file and the problem is in front of
+it. Then try the same path through your public hostname: a `302` to your
+identity provider is the answer.
+
+**Fix:** add `/cluster_state_sync_panel/` to the proxy's unauthenticated paths,
+alongside `/static/`. In Authentik that is *Unauthenticated Paths* on the proxy
+provider; Traefik, Caddy and nginx all have an equivalent.
+
+The file is user-interface code and holds no secrets — it reads state through
+Home Assistant's own authenticated API, so serving it the way `/static/` is
+served grants nothing extra.
+
+
 ## The one thing to understand
 
 If you take nothing else from this page:

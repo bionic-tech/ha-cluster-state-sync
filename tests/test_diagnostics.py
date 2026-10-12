@@ -431,9 +431,22 @@ async def test_fileset_age_climbs_after_a_publish_with_no_marker(
     # Move the recorded success backwards instead. That is deterministic, and
     # it tests the property more directly: the sensor reports elapsed time
     # since a timestamp, not a constant.
+    # Read the sensor DIRECTLY after backdating, rather than advancing time
+    # again. Advancing crosses the publish interval — and, since 0.6.0, the
+    # one-shot initial publish too — either of which republishes and resets
+    # `last_success_at`, wiping the backdating this assertion depends on.
+    #
+    # The property under test is "elapsed time since a recorded timestamp, not
+    # a constant", and reading the value is a more direct test of it than
+    # dead-reckoning across two scheduler advances. The old form failed
+    # intermittently on jitter alone; this cannot.
     publisher.last_success_at -= timedelta(seconds=120)
-    await advance(hass, seconds=61)
-    second = float(hass.states.get(age_id).state)
+    sensor = next(
+        e
+        for e in hass.data["entity_components"]["sensor"].entities
+        if e.entity_id == age_id
+    )
+    second = float(sensor.native_value)
     assert second > first + 100, (first, second)
 
 

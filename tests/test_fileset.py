@@ -753,3 +753,60 @@ def test_an_unparseable_config_still_publishes_the_floor(tmp_path) -> None:
 
     names = {rel for rel, _ in _candidates(tmp_path)}
     assert "automations.yaml" in names
+
+
+def test_a_file_that_vanishes_mid_scan_does_not_abort_the_publish(tmp_path) -> None:
+    """🚨 Observed twice on the live pair, and it killed the whole publish.
+
+    Home Assistant saves `.storage` atomically: write `tmpXXXXXXXX`, rename over
+    the target. The scan lists a directory, and by the time it stats an entry
+    Home Assistant has already renamed it away:
+
+        FileNotFoundError: '/config/.storage/tmppnylc13b'
+
+    One transient file meant the go-bag was not republished that interval. A
+    file that no longer exists cannot be part of the fileset, so skipping it is
+    the correct answer rather than a concession.
+    """
+    from custom_components.cluster_state_sync.fileset import scan
+
+    (tmp_path / ".storage").mkdir()
+    keep = tmp_path / ".storage" / "core.config_entries"
+    keep.write_text("{}", encoding="utf-8")
+    ghost = tmp_path / ".storage" / "vanishes"
+    ghost.write_text("x", encoding="utf-8")
+
+    real_stat = pathlib.Path.stat
+
+    def stat_but_the_ghost_is_gone(self, *args, **kwargs):
+        if self.name == "vanishes":
+            raise FileNotFoundError(2, "No such file or directory", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    with patch.object(pathlib.Path, "stat", stat_but_the_ghost_is_gone):
+        result = scan(tmp_path, secret=SECRET, exclusions=[])
+
+    names = {rel for rel in result.entries}
+    assert any("core.config_entries" in n for n in names), "the surviving file must publish"
+    assert not any("vanishes" in n for n in names), "the vanished file must not"
+
+
+def test_there_is_no_blanket_tmp_exclusion() -> None:
+    """🚨 The obvious second fix for the vanishing-file race is a trap.
+
+    Home Assistant's atomic writes are `.storage/tmpXXXXXXXX`, so excluding
+    `tmp*` looks like belt and braces. It is not: `is_excluded` matches ANY
+    component of the path, so `tmp*` would also drop a user's
+    `custom_components/tmpl_helper/` — silently, from the go-bag, and they would
+    find out at a promotion.
+
+    A glob cannot say "only directly inside .storage", and the
+    `FileNotFoundError` catch in `scan` already handles the race completely and
+    generally. Adding the pattern would trade a solved problem for an unsolved
+    one, so this asserts it stays absent.
+    """
+    from custom_components.cluster_state_sync.const import DEFAULT_FILESET_EXCLUSIONS
+    from custom_components.cluster_state_sync.fileset import is_excluded
+
+    assert "tmp*" not in DEFAULT_FILESET_EXCLUSIONS
+    assert not is_excluded("custom_components/tmpl_helper/__init__.py", DEFAULT_FILESET_EXCLUSIONS)

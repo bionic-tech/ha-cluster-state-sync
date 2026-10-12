@@ -51,6 +51,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
+import json
 import os
 import pathlib
 import subprocess
@@ -291,15 +292,59 @@ def decide(*, holds_lease: bool, previous: str) -> str | None:
 HEARTBEAT_SCRIPT = "return redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])"
 
 
-def _beat(client: Any, key: str, ttl_ms: int) -> None:
+def _beat(
+    client: Any, key: str, ttl_ms: int, node_id: str = "", bundle_version: str = ""
+) -> None:
     """Best effort, always. A failed heartbeat must never change a decision.
 
     Deliberately swallows everything: this is an observability signal, and a
     promoter that skipped a promotion because it could not write a diagnostic
     would be a far worse bug than a missing diagnostic.
+
+    **Now carries this node's clock offset against the store**, because on a
+    COLD standby the promoter is the only process running -- Home Assistant is
+    deliberately stopped there, so `backend.register_node` never runs and that
+    node never appears in the registry at all. The consequence was that
+    `cluster_members` read 1 on a healthy two-node cold cluster and 1 on a
+    broken one, and clock skew -- which needs two offsets -- could never be
+    computed. ADR-009 named the promoter as "the only possible reporter" and
+    then reported only liveness.
+
+    Offset measured exactly as `backend.register_node` does: around a `TIME`
+    call, taking the midpoint of the two local readings, so the error is
+    bounded by half the round trip rather than all of it. Both nodes compare
+    themselves to the same third party; the difference of the offsets is the
+    skew.
+
+    A store too old to answer `TIME`, or any failure measuring it, still
+    writes a heartbeat -- liveness without an offset is strictly better than
+    no heartbeat, and the reader treats a missing offset as unknown rather
+    than as zero.
     """
+    payload: str
     try:
-        client.eval(HEARTBEAT_SCRIPT, [key], [str(int(time.time())), str(ttl_ms)])
+        before = time.time()
+        seconds, micros = client.time()
+        after = time.time()
+        server = float(seconds) + float(micros) / 1_000_000
+        payload = json.dumps(
+            {
+                "node_id": node_id,
+                "offset_s": round((before + after) / 2 - server, 3),
+                "bundle_version": bundle_version,
+                "at": datetime.now(UTC).isoformat(),
+            }
+        )
+    except Exception:  # noqa: BLE001 - an unmeasurable clock is not a dead node
+        payload = json.dumps(
+            {
+                "node_id": node_id,
+                "bundle_version": bundle_version,
+                "at": datetime.now(UTC).isoformat(),
+            }
+        )
+    try:
+        client.eval(HEARTBEAT_SCRIPT, [key], [payload, str(ttl_ms)])
     except Exception:  # noqa: BLE001 - see docstring
         pass
 
@@ -393,6 +438,94 @@ def _probe_ha(url: str, timeout: float) -> bool:
     return True
 
 
+#: How long after becoming BACKUP a still-running container is none of our
+#: business.
+#:
+#: `notify_backup.sh` writes BACKUP *first* and only then runs
+#: `docker stop -t 120`, so for up to two minutes a demotion in progress looks
+#: exactly like the fault below. 180s clears that with margin. Measured from
+#: the state file's mtime, not this process's start, so restarting the promoter
+#: cannot reset the clock -- the same discipline `_recently_touched`'s other
+#: two callers use.
+BACKUP_SERVING_GRACE_SECONDS = 180.0
+
+
+def _backup_is_serving(
+    *,
+    previous: str,
+    holds_lease: bool,
+    reconcile: bool,
+    inspect_container: Callable[[], dict[str, Any] | None] | None,
+    state_path: pathlib.Path,
+    grace: float = BACKUP_SERVING_GRACE_SECONDS,
+) -> bool:
+    """Is this node calling itself BACKUP while still serving Home Assistant?
+
+    🚨 **The state nothing could see, and the second half of GOTCHAS 29.**
+
+    `decide()` acts on a *change*. After a reboot under a maintenance hold the
+    state file is reset to `BACKUP` by `systemd-tmpfiles` (it lives on tmpfs)
+    while `unless-stopped` brings the container back -- so `previous` is
+    `BACKUP`, the lease is the peer's, and there is no change left to act on.
+    The demotion that would have run `docker stop` never ran, and clearing the
+    hold does not help, because clearing a hold does not create a transition.
+    Two live instances, indefinitely, with every check green.
+
+    `BACKUP`-but-serving is a third state in a check that only ever had two.
+
+    **Four conditions, and every one of them is load-bearing:**
+
+    * `reconcile` -- **cold topology only.** In the warm model a standby runs
+      Home Assistant continuously; that is what warm *means*. Firing here would
+      stop the standby's house on every warm install, turning a fix into the
+      outage. This flag is set by `bundle.py` from the deployment's own
+      topology, never inferred.
+    * `previous == "BACKUP"` -- we already believe we are the standby.
+    * `not holds_lease` -- we are not the leader and not about to become one.
+      Checked after the lease call, never before: a node that is taking the
+      lease this tick is promoting, and its container *should* be running.
+    * the state file is not fresh -- `notify_backup.sh` writes BACKUP before
+      `docker stop -t 120`, so a demotion in flight is indistinguishable from
+      this fault for up to two minutes. The grace is what tells them apart.
+
+    An operator who wants Home Assistant up on the standby deliberately has the
+    maintenance hold, which returns long before this is reached. That is the
+    escape hatch, and it is the one they already know.
+    """
+    if not reconcile or previous != "BACKUP" or holds_lease:
+        return False
+    if inspect_container is None:
+        # No Docker, no such container, bare metal, Core. Absence of an answer
+        # is not evidence of a fault -- ADR-006 makes the same call about
+        # `inspect` returning None, and inventing a demotion from a question we
+        # could not ask is how a fix becomes an outage.
+        return False
+    if _recently_touched(state_path, grace):
+        return False
+    try:
+        info = inspect_container()
+    except Exception:  # noqa: BLE001 -- an unanswerable question is not a fault
+        return False
+    if not info:
+        return False
+    # 🚨 FLAT, not nested. `_docker_inspector` shells out with a `--format`
+    # template and hands back {"Restarting", "Running", "ExitCode",
+    # "StartedAtEpoch"} -- it is NOT raw `docker inspect` JSON, so there is no
+    # "State" wrapper. `container_is_returning` reads it the same way.
+    #
+    # This was written as `(info.get("State") or {}).get("Running")`, which
+    # evaluates to bool(None) -- FALSE, always. The reconcile was dead code and
+    # shipped that way (2026-09-20 → 22). Every unit test passed, because the
+    # test's fake returned the nested shape the code expected rather than the
+    # shape the real inspector produces: the unfaithful-fake failure of
+    # GOTCHAS 8, in the one branch whose whole job is to stop a second live
+    # Home Assistant.
+    #
+    # Only a run on real hardware found it. See `test_the_fake_inspector_
+    # matches the real one` -- a contract test now pins the two together.
+    return info.get("Running") is True
+
+
 def _recently_touched(path: pathlib.Path, window_seconds: float) -> bool:
     """True until `window_seconds` after `path`'s mtime.
 
@@ -453,7 +586,39 @@ def _require_identity(value: str, flag: str) -> str:
 AUTO_HOLD_MARKER = "cluster_state_sync:auto-hold"
 
 
-def _hold_is_expired(hold_path: pathlib.Path) -> tuple[bool, str | None]:
+def _hold_key(namespace: str) -> str:
+    """Mirrors `const.hold_key` -- the CLUSTER-WIDE maintenance hold.
+
+    Repeated rather than imported for the same reason `_leader_key` is
+    (ADR-005): this file is emitted as standalone text onto a host with no
+    `custom_components` on its path, and `const.py` imports voluptuous.
+
+    🚨 **This node is the reason the key exists.** On a cold standby the
+    promoter is the ONLY part of this system running -- Home Assistant is
+    deliberately stopped -- so a hold raised on the peer's dashboard can reach
+    this node by no other route. Before this key, it could not, and the
+    standby promoted straight through a hold the operator had correctly set
+    (GOTCHAS 29).
+
+    `test_promoter_keys.py` fails if this and `const.hold_key` diverge.
+    """
+    return f"ha:cluster_state_sync:{namespace}:hold"
+
+
+def _hold_origin(text: str) -> str | None:
+    """Which node raised this hold, mirroring `hold.hold_origin`.
+
+    None when it did not say -- a hold set by `touch`, or by any version from
+    before the origin line existed. Callers report "unknown" rather than
+    naming a node they are guessing at.
+    """
+    for line in text.splitlines():
+        if line.strip().lower().startswith("origin:"):
+            return line.strip()[len("origin:") :].strip() or None
+    return None
+
+
+def _text_is_expired(text: str) -> tuple[bool, str | None]:
     """Has a self-expiring hold outlived its deadline?
 
     🚨 The expiry has to live HERE, not in the integration that set it.
@@ -471,11 +636,11 @@ def _hold_is_expired(hold_path: pathlib.Path) -> tuple[bool, str | None]:
     An unparseable or absent deadline is treated as NO expiry, deliberately.
     Guessing that a malformed hold has lapsed would resume failover during
     exactly the maintenance somebody asked us to sit out.
+
+    Takes text, not a path, so the local file and the cluster-wide key are
+    judged by ONE parser. Two would drift, and the half that drifted would be
+    the half nobody was watching.
     """
-    try:
-        text = hold_path.read_text(encoding="utf-8")
-    except OSError:
-        return False, None
     for line in text.splitlines():
         if not line.lower().startswith("expires:"):
             continue
@@ -489,6 +654,37 @@ def _hold_is_expired(hold_path: pathlib.Path) -> tuple[bool, str | None]:
         now = datetime.now(UTC)
         return now > deadline, stamp
     return False, None
+
+
+def _hold_is_expired(hold_path: pathlib.Path) -> tuple[bool, str | None]:
+    """`_text_is_expired` for the local flag file. Unreadable reads as no expiry."""
+    try:
+        return _text_is_expired(hold_path.read_text(encoding="utf-8"))
+    except OSError:
+        return False, None
+
+
+def _read_cluster_hold(client: Any, namespace: str) -> str | None:
+    """The cluster-wide hold's text, or None.
+
+    Swallows every backend failure and answers None, matching `hold.py`'s
+    posture: a hold that switches itself on because a read failed is a cluster
+    that has quietly stopped failing over.
+
+    Safe here for a reason worth stating plainly -- a promoter that cannot
+    reach Valkey cannot take the lease either, because the lease lives in the
+    same place. So failing toward "not held" can never promote anything; it
+    can only fail to suspend a promotion that was already impossible.
+    """
+    try:
+        value = client.get(_hold_key(namespace))
+    except Exception:  # noqa: BLE001 -- see the docstring; never a decision
+        return None
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def _holddown_path(state_path: pathlib.Path) -> pathlib.Path:
@@ -633,6 +829,8 @@ def run(
     heartbeat_ttl_ms: int = 60_000,
     inspect_container: Callable[[], dict[str, Any] | None] | None = None,
     grace_reason_path: pathlib.Path | None = None,
+    reconcile_backup: bool = False,
+    bundle_version: str = "",
 ) -> int:
     """One tick: take or renew the lease, and act only on a change of it.
 
@@ -674,12 +872,23 @@ def run(
         # heartbeat that only fires on the happy path would go quiet for the
         # very states an operator most needs to see -- a held-down node, a node
         # in maintenance hold, a node whose probe is failing.
-        _beat(client, _promoter_key(namespace, node_id), heartbeat_ttl_ms)
+        _beat(
+            client,
+            _promoter_key(namespace, node_id),
+            heartbeat_ttl_ms,
+            node_id,
+            bundle_version,
+        )
         holddown = holddown_path if holddown_path is not None else _holddown_path(state_path)
 
-        held = hold_path is not None and hold_path.is_file()
-        if held:
-            assert hold_path is not None  # narrowed by `held`
+        # Either half suspends failover here, and the asymmetry is the point:
+        # in the cold model only ONE node is running Home Assistant, so the
+        # dashboard the operator reaches is necessarily the only one there is.
+        # A hold set from it must bind the peer -- and the peer's promoter, the
+        # only thing running there, is the reader that has to see it.
+        local_held = hold_path is not None and hold_path.is_file()
+        if local_held:
+            assert hold_path is not None  # narrowed by `local_held`
             expired, deadline = _hold_is_expired(hold_path)
             if expired:
                 # Say it plainly. A hold that lapses silently looks identical
@@ -692,7 +901,26 @@ def run(
                     "live again.",
                     file=sys.stderr,
                 )
-                held = False
+                local_held = False
+
+        cluster_text = _read_cluster_hold(client, namespace)
+        cluster_held = cluster_text is not None
+        if cluster_held:
+            assert cluster_text is not None  # narrowed by `cluster_held`
+            expired, deadline = _text_is_expired(cluster_text)
+            if expired:
+                # The key carries a TTL too, so this is the belt to that
+                # braces: it catches a deadline that has passed while the TTL
+                # has not, which is what a clock skew between the node that
+                # set it and this one looks like.
+                print(
+                    f"cluster promoter: the CLUSTER-WIDE maintenance hold expired at "
+                    f"{deadline} and is being ignored.",
+                    file=sys.stderr,
+                )
+                cluster_held = False
+
+        held = local_held or cluster_held
         if held and not force_path.exists():
             # Maintenance hold (hold.py). Renew what we have, never take what
             # is free, and never demote. Two branches collapse into one here
@@ -707,10 +935,37 @@ def run(
             # An override that the hold could veto would be no override.
             result = client.eval(RENEW_ONLY_SCRIPT, [key], [node_id, lease_ttl_ms(ttl)])
             holds_lease = bool(result)
+            # Say WHERE the hold came from, and how far it reaches. The old
+            # message said "Failover is SUSPENDED" for what was only ever a
+            # node-local fact, which read as a cluster-wide guarantee it could
+            # not give -- and an operator who believed it rebooted the leader
+            # (GOTCHAS 29). Scope first, then origin, then where to clear it.
+            if cluster_held:
+                origin = _hold_origin(cluster_text or "") or "an unnamed node"
+                whose = "by this node" if origin == node_id else f"by {origin}"
+                scope = (
+                    f"CLUSTER-WIDE maintenance hold, set {whose} -- failover is "
+                    f"suspended on EVERY node until it is cleared"
+                )
+            else:
+                # Names the GAP, not the scope. The previous wording -- "the peer
+                # is unaffected and may still promote" -- was accurate and was
+                # read as reassurance by an operator working at speed
+                # (homelab-32, 2026-10-02), who took "LOCAL" as a statement about
+                # blast radius rather than about coverage.
+                #
+                # So say the condition and the timescale instead of the category.
+                # "May still promote" is a possibility; "the lease lapses in Ns
+                # and the peer takes it" is a mechanism somebody can act on.
+                scope = (
+                    f"LOCAL maintenance hold ({hold_path}) -- this node is held, the "
+                    f"PEER IS NOT. Nothing stops it promoting if this node's promoter "
+                    f"stops: the lease would lapse {ttl}s later and the peer would take "
+                    f"it. Use cluster-hold.sh for a hold that binds both"
+                )
             print(
-                f"cluster promoter: maintenance hold set ({hold_path}) -- "
-                f"{'renewed' if holds_lease else 'not holding'} the lease, "
-                f"taking no action. Failover is SUSPENDED until it is removed.",
+                f"cluster promoter: {scope}. "
+                f"{'Renewed' if holds_lease else 'Not holding'} the lease, taking no action.",
             )
             if decide(holds_lease=holds_lease, previous=previous) is not None:
                 # Deliberately not acted on. Say so, because a hold that
@@ -920,7 +1175,29 @@ def run(
 
         new_state = decide(holds_lease=holds_lease, previous=previous)
         if new_state is None:
-            return 0
+            if not _backup_is_serving(
+                previous=previous,
+                holds_lease=holds_lease,
+                reconcile=reconcile_backup,
+                inspect_container=inspect_container,
+                state_path=state_path,
+            ):
+                return 0
+            # Force the demotion that never ran. Deliberately expressed as a
+            # transition into BACKUP rather than a bespoke `docker stop`: it
+            # then goes through the same tested path as every other demotion
+            # -- notify_backup.sh, its post-stop hooks releasing the radios,
+            # and the verification below that the state actually landed. A
+            # second way to demote is a second thing to keep correct.
+            print(
+                "cluster promoter: this node reads BACKUP but Home Assistant is still "
+                "SERVING, and the lease belongs elsewhere. A demotion did not happen -- "
+                "typically a reboot under a maintenance hold, where the state file is "
+                "reset on tmpfs while `unless-stopped` restores the container. Running "
+                "the demotion now to stop a second live instance.",
+                file=sys.stderr,
+            )
+            new_state = "BACKUP"
 
         # The lease call above must always happen before this, never after.
         # Checking (or requiring) the state directory first would let a live
@@ -964,6 +1241,88 @@ def run(
     except (ValkeyError, OSError) as err:
         print(f"cluster promoter: {err}", file=sys.stderr)
         return 1
+
+
+def set_cluster_hold(
+    client: ValkeyClient,
+    *,
+    namespace: str,
+    node_id: str,
+    reason: str,
+) -> int:
+    """Raise the cluster-wide hold. Non-zero if it did not land.
+
+    🚨 **Reports failure loudly and exits non-zero.** Every other backend call
+    in this file degrades quietly, because a missed heartbeat costs a
+    diagnostic. This one is the opposite: an operator who is told the hold is
+    set, and then reboots the leader, has been handed the exact accident the
+    hold exists to prevent. `cluster-hold.sh` checks this exit code.
+
+    No TTL: a hold raised by a person is indefinite by design, and only a
+    person clears it. The integration's automatic holds carry their own
+    `expires:` line and a matching key TTL -- set from there, not here.
+    """
+    body = f"{reason.strip()}\norigin: {node_id}\n" if reason.strip() else f"origin: {node_id}\n"
+    try:
+        client.set(_hold_key(namespace), body)
+    except Exception as err:  # noqa: BLE001 -- reported, not swallowed
+        print(
+            f"cluster promoter: could NOT raise the cluster-wide hold ({err}). "
+            "Failover is still live on every node. Fix the store, or set the "
+            "local hold on both nodes by hand before doing anything.",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"cluster promoter: CLUSTER-WIDE maintenance hold raised by {node_id}. "
+        "Failover is suspended on every node until it is cleared."
+    )
+    return 0
+
+
+def clear_cluster_hold(client: ValkeyClient, *, namespace: str) -> int:
+    """Drop the cluster-wide hold, whichever node raised it.
+
+    Deliberately not identity-checked, unlike the lease's release: the hold is
+    a property of the cluster rather than a claim by one node, and an operator
+    at the one running dashboard must be able to release a hold the peer set.
+    """
+    try:
+        client.delete(_hold_key(namespace))
+    except Exception as err:  # noqa: BLE001 -- reported, not swallowed
+        print(
+            f"cluster promoter: could NOT clear the cluster-wide hold ({err}). "
+            "Failover may still be suspended on every node.",
+            file=sys.stderr,
+        )
+        return 1
+    print("cluster promoter: cluster-wide maintenance hold cleared. Failover is live again.")
+    return 0
+
+
+def show_cluster_hold(client: ValkeyClient, *, namespace: str) -> int:
+    """Print the cluster-wide hold, or nothing. Always exits 0.
+
+    Nothing, not "none": `cluster-hold.sh status` tests the output for
+    emptiness, and a node that cannot reach the store must not print a word
+    that reads like a held cluster. Exit 0 either way -- the *caller* decides
+    what a hold means for its own exit code, and conflating "no hold" with
+    "could not ask" is the absence-and-failure-share-a-signal fault.
+    """
+    try:
+        text = client.get(_hold_key(namespace))
+    except Exception:  # noqa: BLE001 -- silence here reads as "no hold", by design
+        return 0
+    if not text:
+        return 0
+    reason = " ".join(
+        line.strip()
+        for line in text.splitlines()
+        if not line.strip().lower().startswith(("origin:", "expires:"))
+    ).strip()
+    origin = _hold_origin(text) or "an unnamed node"
+    print(f"set by {origin}: {reason or 'no reason given'}")
+    return 0
 
 
 def adopt(
@@ -1178,6 +1537,42 @@ def main(argv: Sequence[str] | None = None) -> int:
         "exit, running no notify script -- what install.sh uses so arming "
         "the timer on a live cluster is not itself a promotion",
     )
+    parser.add_argument(
+        "--set-hold",
+        metavar="REASON",
+        help="raise the CLUSTER-WIDE maintenance hold and exit. This is what "
+        "`cluster-hold.sh on` calls: the hold must reach the peer, and this "
+        "is the only component on a bare host that can talk to the store",
+    )
+    parser.add_argument(
+        "--clear-hold",
+        action="store_true",
+        help="drop the CLUSTER-WIDE maintenance hold and exit. Clears it for "
+        "every node, whichever one raised it",
+    )
+    parser.add_argument(
+        "--reconcile-backup",
+        action="store_true",
+        help="COLD topology only: if this node reads BACKUP while Home "
+        "Assistant is still serving and the lease is elsewhere, run the "
+        "demotion that never happened. Never pass this on a warm standby, "
+        "where a running Home Assistant is the correct state -- bundle.py "
+        "sets it from the deployment's own topology",
+    )
+    parser.add_argument(
+        "--bundle-version",
+        default="",
+        help="the integration version this bundle was generated from. Published "
+        "in the heartbeat so a running integration can tell whether the host "
+        "side matches it — HACS updates one and not the other",
+    )
+    parser.add_argument(
+        "--show-hold",
+        action="store_true",
+        help="print the CLUSTER-WIDE hold's reason and origin, or nothing at "
+        "all when there is none, and exit. What `cluster-hold.sh status` "
+        "reports separately from the local flag",
+    )
     # There is deliberately no --password. See resp.PASSWORD_ENV:
     # argv is world readable through `ps`, so the password arrives in the
     # environment instead.
@@ -1226,6 +1621,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 node_id=node_id,
                 state_path=args.state_file,
             )
+        if args.set_hold is not None:
+            return set_cluster_hold(
+                client, namespace=namespace, node_id=node_id, reason=args.set_hold
+            )
+        if args.clear_hold:
+            return clear_cluster_hold(client, namespace=namespace)
+        if args.show_hold:
+            return show_cluster_hold(client, namespace=namespace)
         return run(
             client,
             namespace=namespace,
@@ -1244,6 +1647,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             base_grace=args.base_grace,
             inspect_container=(_docker_inspector(args.ha_container) if args.ha_container else None),
             grace_reason_path=args.grace_reason_file,
+            reconcile_backup=args.reconcile_backup,
+            bundle_version=args.bundle_version,
         )
     finally:
         # This runs from a systemd timer, forever. A socket leaked on every

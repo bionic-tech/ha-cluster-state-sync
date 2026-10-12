@@ -887,3 +887,43 @@ async def test_a_real_removal_still_releases_the_lease(hass: HomeAssistant) -> N
     assert backend.lease_holder is None, (
         "an orderly shutdown kept the lease and cost the peer a full TTL"
     )
+
+
+async def test_the_radio_watch_is_reachable_from_the_options_flow(hass) -> None:
+    """🚨 A control whose input cannot be reached is not a control.
+
+    `radio_silent` shipped in 0.6.1 with its watch (`radio_watch`) editable
+    ONLY from the wizard's container step. So an existing install could tick
+    the alert condition and had no way to say what counts as a radio — the
+    alert was live, configurable, and unusable.
+
+    Found by the owner opening the options flow and not finding what he had
+    been told to change.
+    """
+    from custom_components.cluster_state_sync.config_flow import _alerts_schema
+    from custom_components.cluster_state_sync.const import CONF_RADIO_WATCH
+
+    keys = {str(k.schema) for k in _alerts_schema({}, hass).schema}
+    assert CONF_RADIO_WATCH in keys, (
+        "radio_watch is not on the alerts page; the radio_silent alert cannot "
+        "be configured on an existing entry"
+    )
+
+
+async def test_every_options_step_schema_is_reachable_from_the_menu(hass) -> None:
+    """The options menu and the steps that exist must not drift apart.
+
+    A step with no menu entry is unreachable; a menu entry with no step is a
+    crash. Both have shipped in this project's history.
+    """
+    import pathlib
+    import re
+
+    from custom_components.cluster_state_sync import config_flow as cf
+
+    src = pathlib.Path(cf.__file__).read_text(encoding="utf-8")
+    menu = re.search(r'menu_options=\[([^\]]+)\]', src)
+    assert menu, "the options menu could not be found"
+    listed = {m.strip().strip('"\'') for m in menu.group(1).split(",") if m.strip()}
+    for name in listed:
+        assert f"async def async_step_{name}(" in src, f"menu offers {name} with no step"

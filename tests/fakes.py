@@ -32,6 +32,13 @@ class FakeBackend(ClusterBackend):
         self.fail_writes = False
         self.lease_holder: str | None = None
         self.lease_raises = False
+        # The cluster-wide maintenance hold. `cluster_hold_expires_at` is an
+        # absolute epoch second, mirroring the real key's PX: an automatic
+        # hold carries one, an operator's hold does not.
+        self.cluster_hold: str | None = None
+        self.cluster_hold_expires_at: float | None = None
+        self.hold_raises = False
+        self.hold_publish_fails = False
         # Cluster registry (node_key). `offset_s` is this fake node's clock
         # offset against the store; tests that care about skew set it
         # per-node, and the default of 0.0 means "agrees with the store".
@@ -53,6 +60,13 @@ class FakeBackend(ClusterBackend):
         # that cannot fail.
         self.statistics_status: bytes | None = None
         self.promoter_nodes: set[str] = set()
+        # What each promoter reported about itself. A node in `promoter_nodes`
+        # with no entry here models a promoter running the OLD payload shape
+        # (a bare timestamp) — present, offset unknown. Modelled rather than
+        # ignored: a reader that only understood the new shape would report an
+        # un-upgraded node as absent, turning a rolling upgrade into an
+        # apparent node loss.
+        self.promoter_payloads: dict[str, dict] = {}
 
     async def connect(self) -> None:
         self.connected = True
@@ -122,6 +136,66 @@ class FakeBackend(ClusterBackend):
     async def release_leadership(self, node_id: str) -> None:
         if self.lease_holder == node_id:
             self.lease_holder = None
+
+    async def read_promoters(self) -> dict[str, dict]:
+        """A node with no payload models a promoter on the OLD format.
+
+        🚨 It must carry `legacy_bundle`, exactly as the real backend sets it.
+        Without that the fake reports every promoter as current, and the guard
+        that stops a half-upgraded cluster claiming a cluster-wide hold is
+        exercised as a no-op — the unfaithful-fake failure of GOTCHAS 8, in the
+        guard written to stop GOTCHAS 29 recurring.
+        """
+        out: dict[str, dict] = {}
+        for n in self.promoter_nodes:
+            payload = self.promoter_payloads.get(n)
+            entry = {"node_id": n}
+            if payload is None:
+                entry["legacy_bundle"] = True
+            else:
+                entry.update(payload)
+            out[n] = entry
+        return out
+
+    async def publish_cluster_hold(self, text: str, ttl_seconds: int | None = None) -> bool:
+        """Model the cluster-wide hold, expiry included.
+
+        🚨 The TTL is stored rather than ignored, and `read_cluster_hold` honours it.
+        A fake that kept the text forever would make every "an automatic hold
+        lapses on its own" test pass without the expiry working at all -- the
+        omitted-field failure this suite has already been bitten by, in the
+        one place where the consequence is a cluster that never fails over.
+        """
+        if self.hold_raises:
+            raise ConnectionError("valkey is unreachable")
+        if self.hold_publish_fails:
+            return False
+        self.cluster_hold = text
+        self.cluster_hold_expires_at = (
+            None if ttl_seconds is None else datetime.now(UTC).timestamp() + ttl_seconds
+        )
+        return True
+
+    async def read_cluster_hold(self) -> str | None:
+        if self.hold_raises:
+            raise ConnectionError("valkey is unreachable")
+        if self.cluster_hold is None:
+            return None
+        if (
+            self.cluster_hold_expires_at is not None
+            and datetime.now(UTC).timestamp() >= self.cluster_hold_expires_at
+        ):
+            self.cluster_hold = None
+            self.cluster_hold_expires_at = None
+            return None
+        return self.cluster_hold
+
+    async def clear_cluster_hold(self) -> bool:
+        if self.hold_raises:
+            raise ConnectionError("valkey is unreachable")
+        self.cluster_hold = None
+        self.cluster_hold_expires_at = None
+        return True
 
     async def write_fileset(self, manifest: bytes, blobs: Mapping[str, bytes]) -> None:
         self.blobs.update(blobs)

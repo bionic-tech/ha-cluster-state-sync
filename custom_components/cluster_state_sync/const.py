@@ -2,12 +2,37 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+import pathlib
 import re
-from typing import Final
+from typing import Any, Final
 
 import voluptuous as vol
 
 DOMAIN: Final = "cluster_state_sync"
+
+
+def _own_version() -> str:
+    """This integration's version, from its own manifest.
+
+    Read here rather than hardcoded so it cannot drift from the manifest HACS
+    and Home Assistant both use. Falls back to an empty string: a version this
+    cannot establish must never be compared against, because "unknown" would
+    otherwise read as "different" and accuse a correct install of being stale.
+    """
+    try:
+        import json as _json
+
+        return str(
+            _json.loads(
+                (pathlib.Path(__file__).parent / "manifest.json").read_text(encoding="utf-8")
+            ).get("version", "")
+        )
+    except Exception:  # noqa: BLE001 — a diagnostic must never break setup
+        return ""
+
+
+INTEGRATION_VERSION: Final = _own_version()
 
 # Config flow keys
 CONF_REDIS_HOST: Final = "redis_host"
@@ -99,6 +124,23 @@ CONF_COMPOSE_ENV_FILE: Final = "compose_env_file"
 CONF_RADIO_WATCH: Final = "radio_watch"
 
 
+def watch_patterns(data: Mapping[str, Any]) -> list[str]:
+    """The radio-liveness globs, with the blanks removed.
+
+    The wizard field accepts free text, so a stray empty entry is ordinary. An
+    empty glob matches nothing, and a watch list of nothing but blanks would
+    create a sensor that reports `unknown` forever while looking configured --
+    so blanks are dropped here, and a list that is only blanks turns the
+    feature off rather than half-on.
+
+    Lives beside `CONF_RADIO_WATCH` rather than in `sensor.py` because both the
+    sensor and the alert in `__init__.py` need it, and `sensor.py` imports from
+    `__init__.py` -- so reading it from there is a circular import. Caught by
+    the suite the moment it was tried.
+    """
+    return [p.strip() for p in (data.get(CONF_RADIO_WATCH) or []) if p and p.strip()]
+
+
 # -- recorder history continuity (ADR-010) ---------------------------------
 #
 # Off by default. It writes a whole compacted copy of the history database on
@@ -166,12 +208,23 @@ NOTIFY_DEVICES_DISABLED: Final = "devices_disabled"
 #: AR-0060. The failover that worked and left nobody a way in.
 NOTIFY_INGRESS_UNREACHABLE: Final = "ingress_unreachable"
 
+#: The radio watch has stopped hearing anything, or is watching nothing at all.
+#:
+#: 🚨 Added because detection already existed and told nobody. `RadioSilenceSensor`
+#: has reported this since v0.3.1 -- and on 2026-09-09 a Zigbee daemon segfaulted
+#: and stayed dead NINE DAYS while the sensor sat there, visible to anyone who
+#: happened to look at it. Nobody looked. That is the same shape as the 61-minute
+#: ingress outage in LEGACY_DEFAULT_NOTIFY_CONDITIONS: the check worked perfectly
+#: and the operator was not told.
+NOTIFY_RADIO_SILENT: Final = "radio_silent"
+
 NOTIFY_CONDITIONS: Final = (
     NOTIFY_PROMOTED,
     NOTIFY_RECOVERED,
     NOTIFY_BACKEND_LOST,
     NOTIFY_FILESET_DEGRADED,
     NOTIFY_INGRESS_UNREACHABLE,
+    NOTIFY_RADIO_SILENT,
     NOTIFY_STATISTICS_SCHEMA,
     NOTIFY_STATISTICS_GAP,
     NOTIFY_STATISTICS_NOT_SEEDED,
@@ -205,6 +258,12 @@ DEFAULT_NOTIFY_CONDITIONS: Final = (
     # configure a front door a second trip through the options to be told
     # when it stops answering.
     NOTIFY_INGRESS_UNREACHABLE,
+    # Same argument as the ingress probe, and the same history: it cannot fire
+    # unless somebody configured `radio_watch`, so it costs a default install
+    # nothing. And it raises ONLY the two unambiguous states -- the watch is
+    # deaf, or it is watching nothing -- never on silence alone, which a quiet
+    # house legitimately produces for hours. See `_radio_watch_fault`.
+    NOTIFY_RADIO_SILENT,
 )
 
 #: The alert conditions as they shipped before `ingress_unreachable` was added
@@ -609,6 +668,31 @@ def promoter_key(namespace: str, node_id: str) -> str:
 def promoter_key_pattern(namespace: str) -> str:
     """Every promoter's heartbeat, for the scan that finds a quiet one."""
     return f"ha:cluster_state_sync:{namespace}:promoters:*"
+
+
+def hold_key(namespace: str) -> str:
+    """Return the key holding the CLUSTER-WIDE maintenance hold.
+
+    One key for the whole cluster, not one per node, because the thing being
+    expressed is a property of the cluster: work is happening, nobody should
+    fail over. Whichever node raises it, both must see it.
+
+    🚨 **This key exists because a per-node flag could not do the job in the
+    cold model.** There, only the leader's Home Assistant is running -- the
+    standby's is deliberately stopped -- so the dashboard the operator reaches
+    is, necessarily, the only one there is. A hold set from it could never
+    reach the peer, and the peer's promoter is precisely the thing that must
+    refuse a free lease. The operator did everything right and the cluster
+    failed over anyway (GOTCHAS 29, 2026-09-18).
+
+    So the reader that matters most is not an integration at all: it is the
+    standby's PROMOTER, which on a cold standby is the only part of this
+    system running. It mirrors this name in `cluster_promoter._hold_key`
+    rather than importing it (ADR-005 -- this module imports voluptuous, which
+    is not on a bare host), and `test_promoter_keys.py` fails if the two ever
+    disagree.
+    """
+    return f"ha:cluster_state_sync:{namespace}:hold"
 
 
 #: How long a promoter heartbeat survives without a refresh. The timer ticks

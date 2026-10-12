@@ -30,6 +30,7 @@ from .const import (
     SCHEMA_VERSION,
     fileset_blob_key,
     fileset_manifest_key,
+    hold_key,
     leader_key,
     meta_key,
     node_key,
@@ -278,6 +279,40 @@ class ClusterBackend(ABC):
         The maintenance hold's read of leadership: keep what we have across a
         planned restart, but do not claim a lease that has come free, because
         during maintenance "free" usually means the peer is mid-restart.
+        """
+
+    @abstractmethod
+    async def publish_cluster_hold(self, text: str, ttl_seconds: int | None = None) -> bool:
+        """Raise the CLUSTER-WIDE maintenance hold. True if it landed.
+
+        `ttl_seconds` for an automatic hold, so a node that dies mid-restart
+        does not leave the cluster held forever; None for an operator's hold,
+        which is indefinite by design.
+
+        Reports failure rather than swallowing it. Every other backend call
+        here degrades quietly because a missed snapshot costs freshness, but a
+        hold that silently failed to publish tells the operator failover is
+        suspended when it is not -- which is the accident, not a degradation.
+        """
+
+    @abstractmethod
+    async def read_cluster_hold(self) -> str | None:
+        """The cluster-wide hold's text, or None if there is none.
+
+        None on ANY failure, matching `hold.py`: a hold that switches itself on
+        because a read failed is a cluster that has quietly stopped failing
+        over. That is safe here for a reason worth stating -- a node that
+        cannot reach the backend cannot take the lease either, so an
+        unreadable hold can never cause a wrong promotion.
+        """
+
+    @abstractmethod
+    async def clear_cluster_hold(self) -> bool:
+        """Drop the cluster-wide hold. True if it is now gone.
+
+        Clearing is cluster-wide from either node, deliberately: the hold is a
+        property of the cluster, and an operator looking at the one running
+        dashboard must be able to release it from there.
         """
 
     @abstractmethod
@@ -849,6 +884,67 @@ class RedisBackend(ClusterBackend):
         except Exception:  # noqa: BLE001
             _LOGGER.debug("Could not release the cluster lease", exc_info=True)
 
+    async def publish_cluster_hold(self, text: str, ttl_seconds: int | None = None) -> bool:
+        """Raise the cluster-wide hold — see the base class.
+
+        A plain SET, not a take-or-renew: unlike the lease, the hold has no
+        owner to check. Whoever raises it raises it for everyone, and a second
+        node setting it over the first is not a conflict -- it is two operators
+        agreeing.
+        """
+        if self._client is None:
+            return False
+        try:
+            if ttl_seconds is None:
+                await self._client.set(hold_key(self._namespace), text)
+            else:
+                await self._client.set(
+                    hold_key(self._namespace), text, px=int(ttl_seconds * 1000)
+                )
+            return True
+        except Exception:  # noqa: BLE001 — never crash HA on backend failure
+            _LOGGER.warning(
+                "Could not publish the cluster-wide maintenance hold. Failover is NOT "
+                "suspended on the peer — set it there too, or fix the backend first",
+                exc_info=True,
+            )
+            return False
+
+    async def read_cluster_hold(self) -> str | None:
+        """The cluster-wide hold's text — see the base class.
+
+        `debug`, not `warning`: this is read on every poll, and a backend that
+        is down is already being reported by everything else here. A warning
+        per poll would bury the one line that matters.
+        """
+        if self._client is None:
+            return None
+        try:
+            return await self._client.get(hold_key(self._namespace))
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("Could not read the cluster-wide maintenance hold", exc_info=True)
+            return None
+
+    async def clear_cluster_hold(self) -> bool:
+        """Drop the cluster-wide hold — see the base class.
+
+        An absent key is success, the same way `hold.clear_hold` treats an
+        absent file: the host script and this may both have run, and two paths
+        to the same outcome must not disagree about it.
+        """
+        if self._client is None:
+            return False
+        try:
+            await self._client.delete(hold_key(self._namespace))
+            return True
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning(
+                "Could not clear the cluster-wide maintenance hold. Failover may still be "
+                "suspended on the peer",
+                exc_info=True,
+            )
+            return False
+
     async def write_fileset(self, manifest: bytes, blobs: Mapping[str, bytes]) -> None:
         """Blobs first, manifest last — see the base class.
 
@@ -981,6 +1077,74 @@ class RedisBackend(ClusterBackend):
         except Exception:  # noqa: BLE001 — never crash HA on backend failure
             _LOGGER.warning("Failed to read promoter heartbeats from Redis", exc_info=True)
             return set()
+
+
+    async def read_promoters(self) -> dict[str, dict[str, Any]]:
+        """Every beating promoter, with whatever it reported about itself.
+
+        🚨 **This is the only thing that can speak for a COLD standby.** Its
+        Home Assistant is deliberately stopped, so `register_node` never runs
+        there and the node is absent from `nodes:*` entirely — which made
+        `cluster_members` read 1 on a healthy two-node cold cluster and 1 on a
+        broken one, and made clock skew (a property of a pair) permanently
+        unknowable. ADR-009 identified the promoter as "the only possible
+        reporter"; this is the read that was missing.
+
+        Tolerates BOTH payload shapes, deliberately. Promoters before this
+        change wrote a bare unix timestamp; newer ones write JSON carrying
+        `offset_s`. During a rolling upgrade one node writes each, and a reader
+        that understood only the new shape would report the un-upgraded node as
+        absent — turning an upgrade into an apparent node loss.
+
+        An unparseable or offset-less entry still counts as PRESENT with no
+        offset. Liveness and clock agreement are different questions and a
+        missing answer to the second is not a "no" to the first.
+        """
+        if self._client is None:
+            return {}
+        found: dict[str, dict[str, Any]] = {}
+        try:
+            prefix = promoter_key(self._namespace, "")
+            keys = [
+                key
+                async for key in self._client.scan_iter(
+                    match=promoter_key_pattern(self._namespace), count=100
+                )
+            ]
+            for key in keys:
+                node = _ref_of(key, prefix)
+                entry: dict[str, Any] = {"node_id": node}
+                try:
+                    raw = await self._client.get(key)
+                except Exception:  # noqa: BLE001 — one unreadable key is not a dead cluster
+                    raw = None
+                parsed = None
+                if raw:
+                    try:
+                        parsed = json.loads(raw)
+                    except (TypeError, ValueError):
+                        parsed = None  # the old bare-timestamp format
+                if isinstance(parsed, dict):
+                    entry.update(parsed)
+                    entry["node_id"] = node
+                else:
+                    # 🚨 A promoter predating 0.6.0. It writes a bare timestamp
+                    # and — far more importantly — it does not READ the
+                    # cluster-wide hold key at all.
+                    #
+                    # This is how a partial upgrade becomes dangerous rather
+                    # than merely incomplete: HACS updates the integration and
+                    # NOT the host bundle, so a 0.6.0 switch would publish the
+                    # hold, report "failover is suspended on EVERY node", and
+                    # be ignored by every promoter. An operator told the
+                    # cluster is held when it is not is the exact accident of
+                    # GOTCHAS 29, recreated by its own fix.
+                    entry["legacy_bundle"] = True
+                found[node] = entry
+            return found
+        except Exception:  # noqa: BLE001 — never crash HA on backend failure
+            _LOGGER.warning("Failed to read promoter heartbeats from Redis", exc_info=True)
+            return {}
 
 
 def default_node_id() -> str:
