@@ -116,7 +116,11 @@ class StatisticsPublisher:
 
     async def async_publish(self) -> StatisticsResult:
         """Export, seal and publish one window."""
-        if not self._db.exists():
+        loop = asyncio.get_running_loop()
+        # A stat on the recorder database, which may sit on slow or stalled
+        # storage, so it goes to an executor like every other blocking call
+        # here. It ran on the event loop on every interval.
+        if not await loop.run_in_executor(None, self._db.exists):
             # A shared-database install, or a recorder that has not created
             # its file yet. Neither is an error, and neither is going to
             # change on the next pass, so this must not shout every interval.
@@ -129,7 +133,6 @@ class StatisticsPublisher:
             )
 
         started = time.monotonic()
-        loop = asyncio.get_running_loop()
         try:
             payload, body = await loop.run_in_executor(None, self._export)
         except SchemaMismatch as err:

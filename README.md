@@ -120,8 +120,8 @@ the answer to that specific problem — one holder, or none.
 ## Install
 
 Through HACS as a **custom repository**, category *Integration*, on **both**
-instances. It is deliberately not in the HACS default store, and only released
-versions are offered.
+instances. It is not in the HACS default catalog, and only released versions
+are offered.
 
 Then work through [the worked example](docs/EXAMPLE-two-node-install.md), which
 goes from two machines and a Valkey to a failover you have actually proven.

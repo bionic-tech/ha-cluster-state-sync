@@ -8,6 +8,7 @@ interesting failures live in the seam between them.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from datetime import UTC, datetime, timedelta
 import json
@@ -815,3 +816,46 @@ async def test_a_follower_silent_long_after_publishing_began_still_alarms(hass) 
     assert (
         ir.async_get(hass).async_get_issue("cluster_state_sync", "statistics_stalled") is not None
     ), "a follower silent for six hours of publishing did not alarm"
+
+
+async def test_the_recorder_stat_runs_off_the_event_loop(tmp_path: pathlib.Path) -> None:
+    """`Path.exists()` is disk I/O, and it ran on the loop on every interval.
+
+    Named by the HACS review of `hacs/default#12385`. The recorder database
+    lives wherever the operator's config directory lives, which on the
+    reference pair is removable storage -- so this stat is exactly the kind of
+    call that must not sit in front of the event loop.
+    """
+    on_loop: list[bool] = []
+
+    class _ProbedPath:
+        """Stands in for `self._db`, recording which thread stats it."""
+
+        def __init__(self, real: pathlib.Path) -> None:
+            self._real = real
+
+        def exists(self) -> bool:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                on_loop.append(False)
+            else:
+                on_loop.append(True)
+            return False
+
+        def __str__(self) -> str:
+            return str(self._real)
+
+    pub = StatisticsPublisher(
+        FakeBackend(),
+        config_dir=str(tmp_path),
+        secret=SECRET,
+        window_days=30,
+        max_bytes=64 * 1024 * 1024,
+    )
+    pub._db = _ProbedPath(tmp_path / RECORDER_DB_NAME)
+    result = await pub.async_publish()
+
+    assert result.skipped_reason == "no_sqlite_recorder"
+    assert on_loop, "the database was never stat-ed, so this test proves nothing"
+    assert not any(on_loop), "Path.exists() ran on the event loop"

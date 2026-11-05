@@ -509,19 +509,21 @@ async def _setup_recorder_snapshots(
 ) -> None:
     """Schedule the leader's consistent recorder copies, if opted in.
 
-    Extracted from `async_setup_entry` (AR-0050) without changing what it
-    does: the same opt-in guard, the same clamp, the same interval, the
-    same executor, in the same place in the sequence.
+    Extracted from `async_setup_entry` (AR-0050): the same opt-in guard, the
+    same clamp, the same interval, in the same place in the sequence. The one
+    deliberate change since is that the storage probe now runs in an executor
+    rather than on the event loop, and once rather than twice.
     """
     # 3a-bis. Recorder history continuity (ADR-010). Leader-only, for the same
     #         reason the flush is: only the leader's history is the house's
     #         history, and a follower snapshotting its own neutered instance
     #         would ship noise. Off unless the operator opted in.
     if cfg.get(CONF_RECORDER_SNAPSHOT_ENABLED, DEFAULT_RECORDER_SNAPSHOT_ENABLED):
-        snap_minutes = int(
-            cfg.get(CONF_RECORDER_SNAPSHOT_MINUTES)
-            or storage.inspect_path(hass.config.path()).default_minutes
-        )
+        # `inspect_path` stats the config directory and reads sysfs, so it
+        # must not run on the event loop. Probed once and reused for both the
+        # interval and the log line below; it used to run twice, on the loop.
+        facts = await hass.async_add_executor_job(storage.inspect_path, hass.config.path())
+        snap_minutes = int(cfg.get(CONF_RECORDER_SNAPSHOT_MINUTES) or facts.default_minutes)
         snap_minutes = max(
             MIN_RECORDER_SNAPSHOT_MINUTES, min(MAX_RECORDER_SNAPSHOT_MINUTES, snap_minutes)
         )
@@ -556,7 +558,7 @@ async def _setup_recorder_snapshots(
         _LOGGER.info(
             "Recorder history continuity on: a consistent copy every %d minutes (%s)",
             snap_minutes,
-            storage.inspect_path(hass.config.path()).describe(),
+            facts.describe(),
         )
 
 

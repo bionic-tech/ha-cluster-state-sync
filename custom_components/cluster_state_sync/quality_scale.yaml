@@ -36,7 +36,7 @@ rules:
   docs-high-level-description: done
   docs-installation-instructions:
     status: done
-    comment: A file copy, not HACS — the repository is private, and HACS cannot install from one.
+    comment: HACS as a custom repository, not the default catalog; a file copy also works.
   docs-removal-instructions:
     status: done
     comment: >-

@@ -69,12 +69,13 @@ dashboard.
 
 ## Phase B — put the integration on the standby
 
-The repository is private, so HACS cannot install it. It is a file copy.
+HACS installs it as a custom repository, not from the default catalog. A file
+copy also works, and is what the rest of this phase does.
 
 ```bash
 # on the standby host
 git clone git@github.com:bionic-tech/ha-cluster-state-sync.git /tmp/csr
-cd /tmp/csr && git checkout v0.2.0
+cd /tmp/csr && git checkout v0.6.1
 cp -r custom_components/cluster_state_sync /path/to/config/custom_components/
 chown -R <ha-uid>:<ha-gid> /path/to/config/custom_components/cluster_state_sync
 docker restart <ha-container>

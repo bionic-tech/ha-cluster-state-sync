@@ -79,6 +79,33 @@ restart, or briefly wedged, hands your house to the other machine for no reason.
 The cost of that trade is that one specific failure mode does not beat the
 2.5-minute budget, and saying the budget covers every failure would be untrue.
 
+## A slow shutdown can make a demotion report failure and skip the radio release
+
+The promoter gives a notify script **120 seconds**, and `notify_backup.sh` gives
+`docker stop` the same **120**. Those two numbers are equal, and that is a
+defect rather than a design.
+
+When Home Assistant takes its full stop timeout to exit, both expire in the same
+instant. The promoter abandons the script at the moment Docker force-kills the
+container, so a demotion that *did* complete is reported as failed — and the
+post-stop hooks, which are where a device claim is released for the peer to pick
+up, never run. The node is left marked degraded with its hardware still claimed.
+
+Measured on the reference pair: **once in 26 demotions**. It needs a shutdown
+slow enough to reach the ceiling, so it gets more likely as a recorder database
+grows, which is the thing that makes Home Assistant slow to stop.
+
+**If your radios follow a failover, this is the failure mode to know about.**
+Two signals tell you it happened, and neither is the promoter's own exit status:
+`journalctl -t cluster-sync` shows `post-stop hook … FAILED`, and the demotion is
+retried on the following tick.
+
+It is unfixed because every candidate fix is a trade rather than a patch: raising
+the notify timeout pushes the unit's start timeout past the 2.5-minute budget
+this project advertises, and lowering `docker stop` shortens the window Home
+Assistant gets to write `.storage` on its way down — and a force-killed instance
+loses whatever its registries held in memory.
+
 ## A node can be healthy to itself and unreachable to you
 
 The promoter checks Home Assistant at `127.0.0.1`. A node whose service network

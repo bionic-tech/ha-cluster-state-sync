@@ -14,12 +14,14 @@ tested path and the running path are not the same path.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import patch
 
 from homeassistant.core import HomeAssistant
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.cluster_state_sync import storage
 from custom_components.cluster_state_sync.const import (
     DATA_STATISTICS,
     DOMAIN,
@@ -296,3 +298,40 @@ async def test_an_interval_below_the_minimum_is_clamped_to_five_minutes(
         assert not publish.called, "a 1-minute interval was honoured rather than clamped"
         await _fire(hass, 6)
         assert publish.called
+
+
+async def test_the_storage_probe_runs_off_the_event_loop(hass: HomeAssistant) -> None:
+    """`inspect_path` stats a directory and reads sysfs, so it must not run here.
+
+    Named by the HACS review of `hacs/default#12385`. An executor is not
+    cosmetic on this integration: the promoter declares Home Assistant dead
+    when the loop stops answering inside 5s, so blocking the loop is a
+    failover concern and not only a style one.
+
+    The assertion is about the THREAD, not a call count -- a worker thread has
+    no running loop, so `get_running_loop()` raising is itself the evidence
+    that the call was handed off. It also pins the probe at one call, because
+    it used to run twice: once for the interval and once inside a log line.
+    """
+    on_loop: list[bool] = []
+
+    def _probe(path: str) -> storage.StorageFacts:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            on_loop.append(False)
+        else:
+            on_loop.append(True)
+        return storage.StorageFacts(False, "fake-model", None)
+
+    entry = _entry(recorder_snapshot_enabled=True)
+    # `new=` deliberately, NOT `side_effect=`. A Mock handed to
+    # `async_add_executor_job` is invoked on MainThread rather than in a worker
+    # (measured), so a Mock-patched probe reports "on the loop" even when the
+    # production code hands off correctly. A Mock cannot witness this at all.
+    with patch("custom_components.cluster_state_sync.storage.inspect_path", new=_probe):
+        assert await _setup(hass, entry)
+
+    assert on_loop, "inspect_path was never called, so this test proves nothing"
+    assert not any(on_loop), "inspect_path ran on the event loop"
+    assert len(on_loop) == 1, f"probed {len(on_loop)} times; once is enough"
